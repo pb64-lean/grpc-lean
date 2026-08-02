@@ -1,0 +1,126 @@
+"""Bazel module definition for the pure Lean gRPC service example.
+
+Lean owns the protobuf records, gRPC service registration, and server
+entrypoint. C++ is used only for the PostgreSQL repository FFI.
+"""
+
+module(
+    name = "grpc_service_example",
+    version = "0.1.0",
+)
+
+# ============================================================================
+# rules_lean - Lean 4 build rules
+# ============================================================================
+
+# Use local_path_override to reference the parent rules_lean
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../../../rules_lean",
+)
+
+# Configure Lean toolchain from Nixpkgs
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@grpc_lean_protobuf//:nixpkgs.nix",
+    nix_file_deps = ["@grpc_lean_protobuf//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains("@lean4_toolchain//:all")
+
+# ============================================================================
+# rules_lean_grpc - Lean 4 gRPC / proto codegen rules
+# ============================================================================
+
+bazel_dep(name = "rules_lean_grpc", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean_grpc",
+    path = "../..",
+)
+
+bazel_dep(name = "grpc_lean_protobuf", version = "0.1.0")
+local_path_override(
+    module_name = "grpc_lean_protobuf",
+    path = "../../third_party/Lean-zh/protobuf",
+)
+
+bazel_dep(name = "grpc_lean_protobuf_binary", version = "0.1.0")
+local_path_override(
+    module_name = "grpc_lean_protobuf_binary",
+    path = "../../third_party/Lean-zh/binary",
+)
+
+# ============================================================================
+# Core Bazel dependencies
+# ============================================================================
+
+bazel_dep(name = "bazel_skylib", version = "1.5.0")
+bazel_dep(name = "platforms", version = "0.0.8")
+bazel_dep(name = "rules_cc", version = "0.0.9")
+
+# ============================================================================
+# Protocol Buffers
+# ============================================================================
+
+bazel_dep(name = "rules_proto", version = "6.0.0")
+bazel_dep(name = "protobuf", version = "27.0")
+
+# ============================================================================
+# Nixpkgs - CC toolchain and system dependencies
+# ============================================================================
+
+bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
+bazel_dep(name = "rules_nixpkgs_cc", version = "0.13.0")
+archive_override(
+    module_name = "rules_nixpkgs_cc",
+    integrity = "sha256-DfvHGOim5LN2uURaH43OkzDTld0aU95uMsqbbG6laGA=",
+    strip_prefix = "rules_nixpkgs-0.13.0/toolchains/cc",
+    urls = ["https://github.com/tweag/rules_nixpkgs/archive/refs/tags/v0.13.0.tar.gz"],
+)
+
+# Nixpkgs repository
+nix_repo = use_extension("@rules_nixpkgs_core//extensions:repository.bzl", "nix_repo")
+nix_repo.file(
+    name = "nixpkgs",
+    file = "//:nixpkgs.nix",
+    file_deps = ["//:nixpkgs.json"],
+)
+use_repo(nix_repo, "nixpkgs")
+
+# CC toolchain from Nixpkgs
+cc_configure = use_extension("//:extension.bzl", "cc_configure")
+use_repo(cc_configure, "nixpkgs_config_cc")
+use_repo(cc_configure, "nixpkgs_config_cc_toolchains")
+use_repo(cc_configure, "nixpkgs_config_cc_info")
+
+register_toolchains("@nixpkgs_config_cc_toolchains//:all")
+
+# ============================================================================
+# PostgreSQL client library (libpqxx from Nixpkgs)
+# ============================================================================
+
+nix_pkg = use_extension("@rules_nixpkgs_core//extensions:package.bzl", "nix_pkg")
+nix_pkg.attr(
+    name = "libpqxx",
+    attr = "libpqxx",
+    build_file_content = """\
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "pqxx",
+    srcs = glob(["lib/**/*.dylib", "lib/**/*.so*", "lib/**/*.a"], allow_empty = True),
+    hdrs = glob(["include/**"]),
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
+""",
+    repo = "@nixpkgs",
+)
+
+inject_repo(nix_pkg, "rules_cc")
+
+use_repo(nix_pkg, "libpqxx")

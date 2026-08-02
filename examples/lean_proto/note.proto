@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package lean.example.proto;
+
+import "common/note_common.proto";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  BLUE = 2;
+}
+
+message Note {
+  string title = 1;
+  int32 priority = 2;
+  repeated string tags = 3;
+  map<string, int32> counts = 4;
+  optional string memo = 5;
+  Color color = 6;
+  NoteMeta details = 7;
+  string meta = 8;
+}
+
+service NoteService {
+  rpc Echo(Note) returns (Note);
+  rpc Slow(Note) returns (Note);
+  rpc Fail(Note) returns (Note);
+  rpc Meta(NoteMeta) returns (NoteMeta);
+  rpc List(Note) returns (stream Note);
+  rpc Collect(stream Note) returns (Note);
+  rpc Chat(stream Note) returns (stream Note);
+}

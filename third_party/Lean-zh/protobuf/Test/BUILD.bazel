@@ -1,0 +1,47 @@
+load("@rules_lean//lean:defs.bzl", "lean_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "official_descriptor_set",
+    srcs = ["official/descriptor_set.bin"],
+)
+
+lean_test(
+    name = "proto3_test",
+    srcs = ["Proto3Bazel.lean"],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
+)
+
+lean_test(
+    name = "proto2_import_test",
+    srcs = ["Proto2ImportBazel.lean"],
+    compile_env = {
+        "PROTOC": "$(location @protobuf//:protoc)",
+    },
+    compile_tools = ["@protobuf//:protoc"],
+    data = ["Proto2Defaults.proto"],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
+)
+
+lean_test(
+    name = "proto2_groups_test",
+    srcs = ["Proto2GroupsBazel.lean"],
+    compile_env = {
+        "PROTOC": "$(location @protobuf//:protoc)",
+    },
+    compile_tools = ["@protobuf//:protoc"],
+    data = ["Proto2Groups.proto"],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
+)
+
+lean_test(
+    name = "desc_test",
+    srcs = ["DescBazel.lean"],
+    data = [":official_descriptor_set"],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
+)

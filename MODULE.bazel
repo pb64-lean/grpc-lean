@@ -1,0 +1,61 @@
+# rules_lean_grpc/MODULE.bazel
+"""Bazel module for pure Lean gRPC/proto codegen rules.
+
+Split out from rules_lean so that base Lean consumers do not inherit the proto
+transitive dependency closure. Depend on this module when you use
+lean_proto_library:
+
+    bazel_dep(name = "rules_lean_grpc", version = "0.1.0")
+    load("@rules_lean_grpc//:defs.bzl", "lean_proto_library")
+"""
+
+module(
+    name = "rules_lean_grpc",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+# Base Lean build rules. The local_path_override is honored only when
+# rules_lean_grpc is itself the root module; when consumed as a dependency, the
+# root module supplies the override (or the registry resolves it).
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../rules_lean",
+)
+
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean", dev_dependency = True)
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@grpc_lean_protobuf//:nixpkgs.nix",
+    nix_file_deps = ["@grpc_lean_protobuf//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+register_toolchains("@lean4_toolchain//:all", dev_dependency = True)
+
+# Proto codegen dependencies.
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "protobuf", version = "33.4")
+bazel_dep(name = "zlib", version = "1.3.1.bcr.5")
+
+bazel_dep(name = "grpc_lean_protobuf", version = "0.1.0")
+local_path_override(
+    module_name = "grpc_lean_protobuf",
+    path = "third_party/Lean-zh/protobuf",
+)
+
+bazel_dep(name = "grpc_lean_protobuf_binary", version = "0.1.0")
+local_path_override(
+    module_name = "grpc_lean_protobuf_binary",
+    path = "third_party/Lean-zh/binary",
+)
+
+# TLS 1.3 over formally-verified HACL* crypto (sibling repo). Provides the
+# verified primitives, key schedule, and X.509 validation the TLS engine in
+# Grpc/Tls/ builds on. Mirrors pg-lean's adoption.
+bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
+local_path_override(
+    module_name = "tls13-lean",
+    path = "../tls13-lean",
+)

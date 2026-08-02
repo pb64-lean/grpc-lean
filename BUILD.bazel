@@ -1,0 +1,165 @@
+# rules_lean_grpc/BUILD.bazel
+"""Root package for the rules_lean_grpc module.
+
+The public API lives in defs.bzl; this file marks the module root package so that
+@rules_lean_grpc//:defs.bzl and //:proto.bzl are loadable.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library", "lean_test")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("//:defs.bzl", "lean_proto_library")
+
+proto_library(
+    name = "recursive_struct_proto",
+    srcs = ["Test/recursive_struct.proto"],
+)
+
+lean_proto_library(
+    name = "recursive_struct_lean",
+    proto = ":recursive_struct_proto",
+    module_prefix = "RecursiveProtoTest",
+)
+
+lean_test(
+    name = "recursive_struct_test",
+    srcs = ["Test/RecursiveStructTest.lean"],
+    deps = [
+        ":recursive_struct_lean",
+        "@grpc_lean_protobuf//:protobuf",
+    ],
+)
+
+lean_library(
+    name = "grpc_lean",
+    srcs = [
+        "Grpc.lean",
+        "Grpc/CancellationToken.lean",
+        "Grpc/Client.lean",
+        "Grpc/Framing.lean",
+        "Grpc/Http2.lean",
+        "Grpc/Http2/Connection.lean",
+        "Grpc/Http2/Frame.lean",
+        "Grpc/Http2/Grpc.lean",
+        "Grpc/Http2/Hpack.lean",
+        "Grpc/Http2/Server.lean",
+        "Grpc/Metadata.lean",
+        "Grpc/Protocol.lean",
+        "Grpc/Server.lean",
+        "Grpc/Services/Health.lean",
+        "Grpc/Services/Reflection.lean",
+        "Grpc/Status.lean",
+    ],
+    deps = [
+        "//Zlib:zlib",
+        ":grpc_tls",
+        "@grpc_lean_protobuf//:protobuf",
+    ],
+)
+
+lean_library(
+    name = "grpc_tls",
+    srcs = [
+        "Grpc/Tls/Session.lean",
+        "Grpc/Tls/Rest.lean",
+    ],
+    deps = [
+        "@tls13_lean//Tls:tls",
+    ],
+)
+
+lean_test(
+    name = "zlib_test",
+    srcs = ["Test/ZlibTest.lean"],
+    deps = [
+        ":grpc_lean",
+        "//Zlib:zlib",
+    ],
+)
+
+lean_test(
+    name = "tls_handshake_test",
+    srcs = ["Test/TlsHandshakeTest.lean"],
+    data = glob(["Test/Fixtures/Tls/*"]),
+    deps = ["@tls13_lean//Tls:tls"],
+)
+
+lean_test(
+    name = "grpc_tls_test",
+    srcs = ["Test/GrpcTlsTest.lean"],
+    data = glob(["Test/Fixtures/Tls/*"]),
+    # Loopback sockets are blocked in the darwin sandbox; run unsandboxed.
+    # In-process client+server; run exclusively so concurrent socket tests do not
+    # starve each other's worker pool (see the same-process handshake note).
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "rest_tls_test",
+    srcs = ["Test/RestTlsTest.lean"],
+    data = glob(["Test/Fixtures/Tls/*"]),
+    # In-process client+server; run exclusively so concurrent socket tests do not
+    # starve each other's worker pool (see the same-process handshake note).
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_tls"],
+)
+
+lean_test(
+    name = "health_test",
+    srcs = ["Test/HealthTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "grpc_runtime_test",
+    srcs = ["Test/GrpcRuntimeTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "server_ownership_test",
+    srcs = ["Test/ServerOwnershipTest.lean"],
+    # In-process sockets and task-pool saturation make this a process-level test.
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "client_test",
+    srcs = ["Test/ClientTest.lean"],
+    # Loopback sockets are blocked in the darwin sandbox; run unsandboxed.
+    # In-process client+server; run exclusively so concurrent socket tests do not
+    # starve each other's worker pool (see the same-process handshake note).
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "streaming_test",
+    srcs = ["Test/StreamingTest.lean"],
+    # Loopback sockets are blocked in the darwin sandbox; run unsandboxed.
+    # In-process client+server; run exclusively so concurrent socket tests do not
+    # starve each other's worker pool (see the same-process handshake note).
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "hardening_test",
+    srcs = ["Test/HardeningTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "early_authentication_test",
+    srcs = ["Test/EarlyAuthenticationTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "hpack_test",
+    srcs = ["Test/HpackTest.lean"],
+    deps = [":grpc_lean"],
+)

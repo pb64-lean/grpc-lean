@@ -1,0 +1,35 @@
+// analytics_service.proto
+//
+// Service B in the proof-carrying-message PoC.  EmailAnalytics is a
+// downstream Lean-gRPC service that calls Service A (UserService) and
+// verifies the opaque ProofEnvelope on each response by handing the
+// shipped proof bytes to a generic kernel-backed verifier.
+//
+// Request/response messages are deliberately trivial — all the
+// interesting activity is *inter-service*.  The empty response makes
+// it explicit: Service B isn't transmitting proof-derived summaries
+// back; it is verifying the proof Service A asserts and acting on its
+// own trust.
+
+syntax = "proto3";
+
+package emailanalytics;
+
+option cc_enable_arenas = true;
+
+service EmailAnalytics {
+  // Calls UserService.GetUserWithEmailMatches, verifies the shipped
+  // ProofEnvelope against a *locally-declared* expected trait, and
+  // returns Verified.  Verification failure causes a non-OK gRPC status.
+  rpc VerifyUserEmailGroup(VerifyRequest) returns (VerifyResponse);
+}
+
+message VerifyRequest {
+  uint64 user_id = 1;
+}
+
+message VerifyResponse {
+  // Intentionally empty.  All proving activity is inter-service; this
+  // service exposes verification as a side-effect (logged + reflected
+  // in gRPC status), not as application data flowing back to callers.
+}

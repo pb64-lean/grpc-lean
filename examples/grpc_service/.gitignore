@@ -1,0 +1,30 @@
+# lean-grpc-bazel/.gitignore
+
+# Bazel
+bazel-*
+.bazelrc.user
+
+# Lean
+.lake/
+lake-packages/
+*.olean
+*.ilean
+*.trace
+
+# C++
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.bazelbsp

@@ -1,0 +1,22 @@
+# .lean-lsp-path — extra LEAN_PATH entries for the LSP (lean4ij plugin).
+#
+# One path per line.  Relative paths are resolved against the project root.
+# `#` starts a comment.  Lake inherits this as `initLeanPath` when starting
+# the Lean language server, so these directories are visible for import
+# resolution alongside lake's own computed paths and the stdlib.
+#
+# Populate these by running the appropriate Bazel targets, e.g.:
+#   bazel build //proto:user_grpc //proto:analytics_grpc \
+#               //lean:user_handlers //lean:analytics_handlers \
+#               //lean:proof_transport
+
+# Generated proto + gRPC codegen outputs (from rules_lean).
+bazel-bin/proto/user_grpc_types.lib
+bazel-bin/proto/user_grpc_lean.clib
+bazel-bin/proto/analytics_grpc_types.lib
+bazel-bin/proto/analytics_grpc_lean.clib
+
+# Handwritten Lean sources compiled by rules_lean.
+bazel-bin/lean/user_handlers.lib
+bazel-bin/lean/analytics_handlers.lib
+bazel-bin/lean/proof_transport.lib

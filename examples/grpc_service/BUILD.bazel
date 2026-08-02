@@ -1,0 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "lean_runtime_headers",
+    hdrs = ["@lean4_toolchain//:runtime_headers"],
+    includes = ["external/rules_lean++lean+lean4_toolchain/include"],
+)
+
+alias(
+    name = "server",
+    actual = "//lean:server",
+)
+
+alias(
+    name = "lean_lib",
+    actual = "//proto:user_service_lean_proto",
+)

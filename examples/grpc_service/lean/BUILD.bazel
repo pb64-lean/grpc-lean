@@ -1,0 +1,60 @@
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_binary(
+    name = "_verifier_probe",
+    srcs = ["_VerifierProbe.lean"],
+    strip_module_prefix = "lean",
+    deps = [":proof_transport"],
+)
+
+lean_library(
+    name = "proof_transport",
+    srcs = ["ProofTransport.lean"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "user_handlers",
+    srcs = [
+        "Handlers.lean",
+        "UserService.lean",
+    ],
+    strip_module_prefix = "lean",
+    deps = [
+        "//proto:user_service_lean_proto",
+        "//src:user_repository_ffi",
+        "@rules_lean_grpc//:grpc_lean",
+        "@grpc_lean_protobuf//:protobuf",
+    ],
+)
+
+lean_library(
+    name = "analytics_handlers",
+    srcs = [
+        "Analytics.lean",
+        "EmailAnalyticsService.lean",
+    ],
+    strip_module_prefix = "lean",
+    deps = [
+        ":proof_transport",
+        ":user_handlers",
+        "//proto:analytics_service_lean_proto",
+        "//proto:user_service_lean_proto",
+        "@rules_lean_grpc//:grpc_lean",
+    ],
+)
+
+lean_binary(
+    name = "server",
+    srcs = ["Main.lean"],
+    strip_module_prefix = "lean",
+    deps = [
+        ":analytics_handlers",
+        ":user_handlers",
+        "//proto:analytics_service_lean_proto",
+        "//proto:user_service_lean_proto",
+        "@rules_lean_grpc//:grpc_lean",
+    ],
+)

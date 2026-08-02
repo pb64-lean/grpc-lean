@@ -1,0 +1,150 @@
+// user_service.proto
+// Defines the UserService gRPC service with full CRUD operations
+
+syntax = "proto3";
+
+package userservice;
+
+option cc_enable_arenas = true;
+
+// The user service definition
+service UserService {
+  // Create a new user
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+  // Get a user by ID
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+
+  // Update an existing user
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+
+  // Delete a user by ID
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+
+  // List all users with optional filtering
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // Get a user by ID along with other users sharing the same email.
+  // Response carries an opaque ProofEnvelope; receiver verifies via Lean kernel.
+  rpc GetUserWithEmailMatches(GetUserRequest) returns (GetUserWithEmailMatchesResponse);
+}
+
+// ============================================================================
+// ProofEnvelope — opaque, generic proof transport.
+//
+// Both fields carry Lean source-text representations of `Lean.Expr` terms.
+// `proof_term` is a Lean expression whose elaborated type is the
+// proposition expressed by `prop_term`.  The receiver verifies by
+// elaborating `def _check : (prop_term) := (proof_term)` through the Lean
+// frontend (parser + elaborator + kernel) — a generic, application-agnostic
+// procedure that knows nothing about the RPC or the trait.
+//
+// The receiver independently constructs its own expected `prop_term` from
+// request/response data at the call site; the verifier checks that the
+// shipped proof has that type.  No shared "trait registry" is required.
+// ============================================================================
+
+message ProofEnvelope {
+  string proof_term = 1;
+  string prop_term  = 2;
+}
+
+// Status enum (shared across messages)
+enum Status {
+  STATUS_UNKNOWN = 0;
+  STATUS_ACTIVE = 1;
+  STATUS_SUSPENDED = 2;
+  STATUS_DELETED = 3;
+}
+
+// User message (shared representation)
+message User {
+  uint64 id = 1;
+  string username = 2;
+  string email = 3;
+  Status status = 4;
+}
+
+// ============================================================================
+// CreateUser
+// ============================================================================
+
+message CreateUserRequest {
+  string username = 1;
+  string email = 2;
+}
+
+message CreateUserResponse {
+  bool success = 1;
+  User user = 2;           // The created user (if successful)
+  string error_message = 3; // Error description (if failed)
+}
+
+// ============================================================================
+// GetUser
+// ============================================================================
+
+message GetUserRequest {
+  uint64 user_id = 1;
+}
+
+message GetUserResponse {
+  bool found = 1;
+  User user = 2;  // Populated if found
+}
+
+// ============================================================================
+// GetUserWithEmailMatches
+// ============================================================================
+
+message GetUserWithEmailMatchesResponse {
+  bool found = 1;
+  User user = 2;                    // The queried user (if found)
+  repeated User email_matches = 3;  // Other users sharing the same email
+  ProofEnvelope proof = 4;          // Opaque proof of the trait the producer asserts
+}
+
+// ============================================================================
+// UpdateUser
+// ============================================================================
+
+message UpdateUserRequest {
+  uint64 user_id = 1;
+  optional string username = 2;  // Only update if provided
+  optional string email = 3;     // Only update if provided
+  optional Status status = 4;    // Only update if provided
+}
+
+message UpdateUserResponse {
+  bool success = 1;
+  User user = 2;           // The updated user (if successful)
+  string error_message = 3; // Error description (if failed)
+}
+
+// ============================================================================
+// DeleteUser
+// ============================================================================
+
+message DeleteUserRequest {
+  uint64 user_id = 1;
+}
+
+message DeleteUserResponse {
+  bool success = 1;
+  string error_message = 2; // Error description (if failed)
+}
+
+// ============================================================================
+// ListUsers
+// ============================================================================
+
+message ListUsersRequest {
+  optional Status status_filter = 1;  // Filter by status (if provided)
+  uint32 limit = 2;                   // Max results (0 = no limit)
+  uint32 offset = 3;                  // Pagination offset
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  uint32 total_count = 2;  // Total matching users (before pagination)
+}

@@ -1,0 +1,39 @@
+syntax = "proto2";
+
+package test.proto2defaults;
+
+message Defaults {
+  required string req_string = 1 [default = "hello"];
+  required bytes req_bytes = 2 [default = "world"];
+  optional string opt_string = 3 [default = "fallback"];
+  optional bytes opt_bytes = 4 [default = "payload"];
+  required string req_spaced_string = 5 [default = " padded "];
+  required bytes req_spaced_bytes = 6 [default = " bytes "];
+}
+
+enum Status {
+  STATUS_ZERO = 0;
+  STATUS_ONE = 1;
+}
+
+message EnumHolder {
+  optional Status opt_status = 1;
+  repeated Status rep_status = 2;
+  required Status req_status = 3;
+  repeated Status packed_status = 4 [packed = true];
+}
+
+message EnumMapHolder {
+  map<string, Status> status_by_name = 1;
+  required Status req_status = 2;
+}
+
+message ExtendTarget {
+  extensions 100 to max;
+}
+
+extend ExtendTarget {
+  optional Status ext_status = 100;
+  repeated Status ext_rep_status = 101;
+  repeated Status ext_packed_status = 102 [packed = true];
+}

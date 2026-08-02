@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package test.recursive;
+
+// A minimal Struct/Value-shaped graph that exercises a message-valued map
+// inside a mutually recursive protoc descriptor SCC.
+message Struct {
+  map<string, Value> fields = 1;
+  string message = 2;
+}
+
+message Value {
+  oneof kind {
+    double number_value = 1;
+    Struct struct_value = 2;
+    ListValue list_value = 3;
+  }
+}
+
+message ListValue {
+  repeated Value values = 1;
+}

@@ -1,0 +1,71 @@
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
+load("@rules_lean_grpc//:defs.bzl", "lean_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "note_common_proto",
+    srcs = ["common/note_common.proto"],
+    strip_import_prefix = "/examples/lean_proto",
+)
+
+lean_proto_library(
+    name = "note_common_lean_proto",
+    proto = ":note_common_proto",
+    module_prefix = "LeanProtoExample",
+)
+
+proto_library(
+    name = "note_proto",
+    srcs = ["note.proto"],
+    strip_import_prefix = "/examples/lean_proto",
+    deps = [":note_common_proto"],
+)
+
+lean_proto_library(
+    name = "note_lean_proto",
+    proto = ":note_proto",
+    module_prefix = "LeanProtoExample",
+    proto_deps = [":note_common_lean_proto"],
+)
+
+lean_test(
+    name = "note_roundtrip_test",
+    srcs = ["NoteRoundtrip.lean"],
+    strip_module_prefix = "examples/lean_proto",
+    deps = [
+        ":note_lean_proto",
+        "@rules_lean_grpc//:grpc_lean",
+        "@grpc_lean_protobuf//:protobuf",
+    ],
+)
+
+lean_binary(
+    name = "note_server",
+    srcs = ["NoteServer.lean"],
+    strip_module_prefix = "examples/lean_proto",
+    deps = [
+        ":note_lean_proto",
+        "@rules_lean_grpc//:grpc_lean",
+    ],
+)
+
+sh_test(
+    name = "note_grpcurl_interop_test",
+    srcs = ["note_grpcurl_interop_test.sh"],
+    args = [
+        "$(location :note_server)",
+        "$(location note.proto)",
+    ],
+    data = [
+        "common/note_common.proto",
+        ":note_server",
+        "note.proto",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "requires-grpcurl",
+    ],
+)

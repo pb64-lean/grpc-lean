@@ -1,0 +1,28 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library", "lean_runtime_headers")
+
+# Resolve headers from the consumer-selected Lean toolchain. The grpc-lean
+# module's own toolchain repository is development-only and is intentionally
+# not visible when grpc-lean is consumed as a Bzlmod dependency.
+lean_runtime_headers(
+    name = "lean_runtime_headers",
+)
+
+# C FFI shim: marshals Lean `ByteArray` <-> zlib gzip streams. Use the
+# Bzlmod-provided library so headers and linkage do not depend on host packages.
+cc_library(
+    name = "zlib_shim",
+    srcs = ["shim/zlib_shim.c"],
+    deps = [
+        ":lean_runtime_headers",
+        "@zlib//:zlib",
+    ],
+)
+
+# Lean bindings: `@[extern]` declarations whose symbols the shim defines.
+lean_library(
+    name = "zlib",
+    srcs = ["Gzip.lean"],
+    deps = [":zlib_shim"],
+)

@@ -1,0 +1,12 @@
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "UTF8",
+    srcs = glob([
+        "*.lean",
+    ]),
+    strip_module_prefix = "",
+    deps = ["//Binary:core"],
+)

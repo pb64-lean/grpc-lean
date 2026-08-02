@@ -1,0 +1,73 @@
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Top-level Protobuf.* modules. Each "module-root" file (e.g. Protobuf/Encoding.lean)
+# lives in this package but re-exports a subpackage's modules, so it is built as its
+# own target that depends on that subpackage. Keeping them as separate targets (rather
+# than one glob) lets subpackages depend on the exact module they need without forming
+# a target-level cycle (the underlying Lean module graph is acyclic).
+
+lean_library(
+    name = "base64",
+    srcs = ["Base64.lean"],
+    strip_module_prefix = "",
+    deps = [],
+)
+
+lean_library(
+    name = "utils",
+    srcs = ["Utils.lean"],
+    strip_module_prefix = "",
+    deps = [":base64"],
+)
+
+lean_library(
+    name = "encoding",
+    srcs = ["Encoding.lean"],
+    strip_module_prefix = "",
+    deps = ["//Protobuf/Encoding"],
+)
+
+lean_library(
+    name = "notation",
+    srcs = ["Notation.lean"],
+    strip_module_prefix = "",
+    deps = ["//Protobuf/Notation"],
+)
+
+lean_library(
+    name = "versions",
+    srcs = ["Versions.lean"],
+    strip_module_prefix = "",
+    deps = ["//Protobuf/Versions"],
+)
+
+# Well-known types (google.protobuf.Timestamp/Duration) shared by generated
+# code; protoc-gen-lean4 maps their proto imports to this module.
+lean_library(
+    name = "well_known",
+    srcs = ["WellKnown.lean"],
+    strip_module_prefix = "",
+    deps = [
+        ":base64",
+        ":encoding",
+        ":notation",
+    ],
+)
+
+# Umbrella for the whole Protobuf.* namespace. Compiles the remaining top-level module
+# (Elab) and pulls in every other Protobuf.* module transitively.
+lean_library(
+    name = "Protobuf",
+    srcs = ["Elab.lean"],
+    strip_module_prefix = "",
+    deps = [
+        ":base64",
+        ":utils",
+        ":encoding",
+        ":notation",
+        ":versions",
+        ":well_known",
+    ],
+)

@@ -1,0 +1,29 @@
+# lean-grpc-bazel/proto/BUILD.bazel
+"""BUILD file for protobuf definitions."""
+
+load("@rules_lean_grpc//:defs.bzl", "lean_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "user_service_proto",
+    srcs = ["user_service.proto"],
+)
+
+lean_proto_library(
+    name = "user_service_lean_proto",
+    module_prefix = "GrpcServiceExample",
+    proto = ":user_service_proto",
+)
+
+proto_library(
+    name = "analytics_service_proto",
+    srcs = ["analytics_service.proto"],
+)
+
+lean_proto_library(
+    name = "analytics_service_lean_proto",
+    module_prefix = "GrpcServiceExample",
+    proto = ":analytics_service_proto",
+)

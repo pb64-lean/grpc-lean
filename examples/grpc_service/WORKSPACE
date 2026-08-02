@@ -1,0 +1,13 @@
+# lean-grpc-bazel/WORKSPACE
+"""Workspace file for Lean 4 gRPC Server project.
+
+NOTE: This project uses Bzlmod (MODULE.bazel) for dependency management.
+This WORKSPACE file is kept minimal for compatibility.
+"""
+
+workspace(name = "lean_grpc")
+
+# All dependencies are managed via MODULE.bazel
+# This file is only needed for:
+# 1. Defining the workspace name
+# 2. Legacy compatibility if running with --noenable_bzlmod

@@ -1,0 +1,17 @@
+syntax = "proto2";
+
+package test.proto2groups;
+
+message GroupHolder {
+  optional group OptionalGroup = 1 {
+    optional int32 value = 2;
+  }
+
+  repeated group RepeatedGroup = 3 {
+    optional string name = 4;
+  }
+
+  required group RequiredGroup = 5 {
+    optional int32 value = 6;
+  }
+}

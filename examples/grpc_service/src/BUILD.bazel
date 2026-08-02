@@ -1,0 +1,13 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "user_repository_ffi",
+    srcs = ["user_repository.cpp"],
+    hdrs = ["user_repository.h"],
+    deps = [
+        "//:lean_runtime_headers",
+        "@libpqxx//:pqxx",
+    ],
+)

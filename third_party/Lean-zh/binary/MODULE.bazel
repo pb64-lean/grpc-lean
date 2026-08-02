@@ -1,0 +1,26 @@
+module(
+    name = "grpc_lean_protobuf_binary",
+    version = "0.1.0",
+)
+
+# ============================================================================
+# rules_lean - Lean 4 build rules
+# ============================================================================
+
+# Use local_path_override to reference the parent rules_lean
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../../../../rules_lean",
+)
+
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "//:nixpkgs.nix",
+    nix_file_deps = ["//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains("@lean4_toolchain//:all")

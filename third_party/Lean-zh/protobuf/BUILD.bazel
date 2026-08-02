@@ -1,0 +1,32 @@
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "protobuf",
+    srcs = glob([
+        "Protobuf.lean",
+    ]),
+    strip_module_prefix = "",
+    deps = ["//Protobuf"],
+)
+
+lean_binary(
+    name = "protoc-gen-lean4",
+    srcs = ["Plugin.lean"],
+    compile_env = {
+        "PROTOC": "$(location @protobuf//:protoc)",
+    },
+    compile_tools = ["@protobuf//:protoc"],
+    data = [
+        "proto/google/protobuf/compiler/plugin.proto",
+        "proto/google/protobuf/descriptor.proto",
+    ],
+    out = "protoc-gen-lean4",
+    strip_module_prefix = "",
+    deps = [
+        ":protobuf",
+        "//Protobuf:versions",
+        "//Protobuf/Internal",
+    ],
+)

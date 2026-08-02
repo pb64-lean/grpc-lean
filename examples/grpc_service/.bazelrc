@@ -1,0 +1,83 @@
+# lean-grpc-bazel/.bazelrc
+# Bazel configuration for Lean gRPC project
+
+# ============================================================================
+# Bzlmod settings
+# ============================================================================
+
+# Enable bzlmod (default in Bazel 7+, but explicit for clarity)
+common --enable_bzlmod
+
+# Lockfile settings
+common --lockfile_mode=update
+
+# ============================================================================
+# C++ settings
+# ============================================================================
+
+# Use C++17
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+
+# macOS deployment target (required for protobuf std::variant support)
+build --macos_minimum_os=13.0
+build --host_macos_minimum_os=13.0
+
+# Enable optimization by default
+build --compilation_mode=opt
+
+# ============================================================================
+# Output settings
+# ============================================================================
+
+# Show test output
+test --test_output=errors
+
+# Enable colored output
+build --color=yes
+test --color=yes
+
+# ============================================================================
+# Caching
+# ============================================================================
+
+# Disk cache for local builds
+build --disk_cache=~/.cache/bazel
+
+# Remote caching (uncomment if using)
+# build --remote_cache=grpc://localhost:9092
+
+# ============================================================================
+# Configuration presets
+# ============================================================================
+
+# Debug build
+build:debug --compilation_mode=dbg
+build:debug --cxxopt=-g
+build:debug --cxxopt=-O0
+
+# Address sanitizer
+build:asan --compilation_mode=dbg
+build:asan --cxxopt=-fsanitize=address
+build:asan --linkopt=-fsanitize=address
+build:asan --cxxopt=-fno-omit-frame-pointer
+
+# Thread sanitizer
+build:tsan --compilation_mode=dbg
+build:tsan --cxxopt=-fsanitize=thread
+build:tsan --linkopt=-fsanitize=thread
+
+# ============================================================================
+# Platform settings (for cross-compilation)
+# ============================================================================
+
+# Uncomment to target specific platforms:
+# build:linux --platforms=@platforms//os:linux
+# build:macos --platforms=@platforms//os:macos
+
+# ============================================================================
+# Nix settings
+# ============================================================================
+
+# Inherit Nix environment for sandboxed builds
+build --action_env=NIX_REMOTE
