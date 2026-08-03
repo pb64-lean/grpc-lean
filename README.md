@@ -1,5 +1,7 @@
 # grpc-lean
 
+[![CI](https://github.com/pb64-lean/grpc-lean/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pb64-lean/grpc-lean/actions/workflows/ci.yml) [![Assurance](https://github.com/pb64-lean/grpc-lean/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/pb64-lean/grpc-lean/actions/workflows/assurance.yml)
+
 Protocol Buffers and gRPC for Lean 4: a pure-Lean gRPC client/server runtime
 over HTTP/2, protobuf codegen wired into Bazel, TLS 1.3 termination via the
 sibling [`tls13-lean`](https://github.com/pb64-lean/tls13-lean), and health +

@@ -1,0 +1,34 @@
+name: ci
+
+# Hermetic Bazel tests + grpcurl interop on the self-hosted NixOS runners.
+# NEVER add pull_request here: these jobs run on self-hosted runners.
+# examples/grpc_service is deliberately out of CI scope (no test targets).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "37 3 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
+    with:
+      siblings: rules_lean tls13-lean
+
+  interop:
+    # Explicit target name runs it despite its `manual` tag. The client
+    # deadline check is timing-sensitive under load; bazel-level retries
+    # report transient losses as FLAKY while real breakage still fails.
+    needs: test
+    uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
+    with:
+      siblings: rules_lean tls13-lean
+      targets: "//examples/lean_proto:note_grpcurl_interop_test"
+      extra_args: "--test_env=TEST_GRPC_PORT=50153 --flaky_test_attempts=3"
+      timeout_minutes: 30
