@@ -132,10 +132,9 @@ def register (registry : Registry) (entry : MethodEntry) : Registry :=
 shadowed entry.  `Registry.WellFormed` is preserved by construction. -/
 def registerChecked (registry : Registry) (entry : MethodEntry) :
     Except DuplicateMethod Registry :=
-  if registry.entries.any (fun existing => existing.name == entry.name) then
-    .error { name := entry.name }
-  else
-    .ok (registry.register entry)
+  match registry.entries.find? (fun existing => existing.name == entry.name) with
+  | some _ => .error { name := entry.name }
+  | none => .ok (registry.register entry)
 
 def registerUnary (registry : Registry) (name : MethodName) (handler : UnaryHandler) : Registry :=
   registry.register { name := name, shape := .unary, handler := handler }
@@ -667,6 +666,127 @@ def dispatchBidirectionalStreaming (registry : Registry) (metadata : Metadata) (
     GrpcM ServerStreamingResponse := do
   let response ← registry.dispatchBidirectionalStreamingStream metadata body authorization
   collectServerStreamingStreamResponse response
+
+/-! ## Registry well-formedness -/
+
+/-- The registered method names, in registration order. -/
+def names (registry : Registry) : List MethodName :=
+  registry.entries.toList.map MethodEntry.name
+
+/-- A registry is well formed when no method name is registered twice, so
+name lookup identifies a unique entry. -/
+def WellFormed (registry : Registry) : Prop :=
+  registry.names.Nodup
+
+theorem empty_wellFormed : Registry.empty.WellFormed := by
+  simp [WellFormed, names, empty]
+
+/-- `registerChecked` succeeds exactly when the name is not yet registered. -/
+theorem registerChecked_ok_elim {registry registry' : Registry} {entry : MethodEntry}
+    (h : registry.registerChecked entry = .ok registry') :
+    registry'.entries = registry.entries.push entry
+      ∧ registry.findEntry? entry.name = none := by
+  unfold registerChecked at h
+  split at h
+  next => cases h
+  next hnone => cases h; exact ⟨rfl, hnone⟩
+
+
+private theorem findEntry?_toList {registry : Registry} {name : MethodName} :
+    registry.findEntry? name
+      = registry.entries.toList.find? (fun entry => entry.name == name) := by
+  simp [findEntry?, Array.find?_toList]
+
+/-- Checked registration preserves well-formedness. -/
+theorem registerChecked_wellFormed {registry registry' : Registry} {entry : MethodEntry}
+    (hwf : registry.WellFormed) (h : registry.registerChecked entry = .ok registry') :
+    registry'.WellFormed := by
+  obtain ⟨hentries, hnone⟩ := registerChecked_ok_elim h
+  rw [findEntry?_toList, List.find?_eq_none] at hnone
+  simp only [WellFormed, names, hentries, Array.toList_push, List.map_append,
+    List.map_cons, List.map_nil, List.nodup_append] at *
+  refine ⟨hwf, by simp, ?_⟩
+  intro a ha b hb
+  simp only [List.mem_singleton] at hb
+  subst hb
+  simp only [List.mem_map] at ha
+  obtain ⟨existing, hmem, hname⟩ := ha
+  have := hnone existing hmem
+  simp only [beq_iff_eq] at this
+  exact hname ▸ this
+
+/-- After successful checked registration, looking up the new name finds the
+new entry. -/
+theorem registerChecked_findEntry_self {registry registry' : Registry} {entry : MethodEntry}
+    (h : registry.registerChecked entry = .ok registry') :
+    registry'.findEntry? entry.name = some entry := by
+  obtain ⟨hentries, hnone⟩ := registerChecked_ok_elim h
+  rw [findEntry?_toList] at hnone ⊢
+  rw [hentries, Array.toList_push, List.find?_append, hnone]
+  simp
+
+/-- Checked registration does not change lookups of other names. -/
+theorem registerChecked_findEntry_other {registry registry' : Registry} {entry : MethodEntry}
+    {name : MethodName} (h : registry.registerChecked entry = .ok registry')
+    (hne : name ≠ entry.name) :
+    registry'.findEntry? name = registry.findEntry? name := by
+  obtain ⟨hentries, -⟩ := registerChecked_ok_elim h
+  rw [findEntry?_toList, findEntry?_toList (registry := registry)]
+  rw [hentries, Array.toList_push, List.find?_append]
+  have hne' : (entry.name == name) = false := by
+    simp [beq_eq_false_iff_ne, Ne.symm hne]
+  have : [entry].find? (fun e => e.name == name) = none := by
+    simp [List.find?, hne']
+  rw [this, Option.or_none]
+
+private theorem nodup_names_unique {l : List MethodEntry}
+    (h : (l.map MethodEntry.name).Nodup) :
+    ∀ e₁ ∈ l, ∀ e₂ ∈ l, e₁.name = e₂.name → e₁ = e₂ := by
+  induction l with
+  | nil => intro e₁ h₁; cases h₁
+  | cons head tail ih =>
+      simp only [List.map_cons, List.nodup_cons] at h
+      obtain ⟨hhead, htail⟩ := h
+      intro e₁ h₁ e₂ h₂ hname
+      cases h₁ with
+      | head =>
+          cases h₂ with
+          | head => rfl
+          | tail _ h₂ =>
+              exact absurd (List.mem_map.mpr ⟨e₂, h₂, hname.symm⟩) hhead
+      | tail _ h₁ =>
+          cases h₂ with
+          | head =>
+              exact absurd (List.mem_map.mpr ⟨e₁, h₁, hname⟩) hhead
+          | tail _ h₂ => exact ih htail e₁ h₁ e₂ h₂ hname
+
+/-- In a well-formed registry an entry is uniquely determined by its name. -/
+theorem wellFormed_entry_unique {registry : Registry} {e₁ e₂ : MethodEntry}
+    (hwf : registry.WellFormed) (h₁ : e₁ ∈ registry.entries)
+    (h₂ : e₂ ∈ registry.entries) (hname : e₁.name = e₂.name) : e₁ = e₂ :=
+  nodup_names_unique hwf e₁ (Array.mem_def.mp h₁) e₂ (Array.mem_def.mp h₂) hname
+
+/-- In a well-formed registry, lookup of a registered entry's name finds
+exactly that entry. -/
+theorem wellFormed_findEntry_of_mem {registry : Registry} {entry : MethodEntry}
+    (hwf : registry.WellFormed) (hmem : entry ∈ registry.entries) :
+    registry.findEntry? entry.name = some entry := by
+  rw [findEntry?_toList]
+  have hmem' := Array.mem_def.mp hmem
+  have hfound : ∃ found, registry.entries.toList.find?
+      (fun e => e.name == entry.name) = some found := by
+    match hf : registry.entries.toList.find? (fun e => e.name == entry.name) with
+    | some found => exact ⟨found, hf⟩
+    | none =>
+        rw [List.find?_eq_none] at hf
+        exact absurd (by simp : (entry.name == entry.name) = true) (hf entry hmem')
+  obtain ⟨found, hf⟩ := hfound
+  have hfmem : found ∈ registry.entries.toList := List.mem_of_find?_eq_some hf
+  have hfname : found.name = entry.name := by
+    have := List.find?_some hf
+    simpa using this
+  rw [hf]
+  exact congrArg some (nodup_names_unique hwf found hfmem entry hmem' hfname)
 
 end Registry
 
