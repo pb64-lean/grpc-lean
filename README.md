@@ -41,8 +41,8 @@ flowchart TB
 | Health | `grpc.health.v1.Health` `Check` + `Watch`, per-service status, terminal shutdown |
 | Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
-| Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout (plaintext managed path; see TLS limitations) |
-| Connection lifecycle | No managed connection dies silently: every teardown records a `CloseCause` (peer close, shutdown, keepalive timeout, connection error, connection-task failure), the peer gets a GOAWAY carrying that cause before the socket is retired, and the last 64 causes are readable from `Grpc.Server.closedConnections`. `acceptFailure?`/`checkAccepting` expose the accept loop while the server runs |
+| Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout — over both h2c and TLS |
+| Connection lifecycle | No managed connection dies silently, plaintext or TLS: every teardown records a `CloseCause` (peer close, shutdown, keepalive timeout, connection error, connection-task failure), the peer gets a GOAWAY carrying that cause before the socket is retired — sealed through the TLS session where there is one — and the last 64 causes are readable from `Grpc.Server.closedConnections`. `acceptFailure?`/`checkAccepting` expose the accept loop while the server runs |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
 | Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Every connection-scoped framing check carries a comment naming the RFC rule it follows, including the two places where a rule that would permit a stream error is deliberately widened to a connection error and why |
 
@@ -82,10 +82,14 @@ loop is a reportable failure instead of clients hanging on connect.
 For every cause the peer was told about, teardown then retires the socket in
 `Async`, racing the write-side shutdown against a short timer: a peer that has
 stopped reading cannot stall it, and no worker thread is parked. (A peer that
-closed first already sent its FIN, so that path skips the shutdown.) Lean
-4.31's `Std.Async.TCP` exposes no socket `close`, so the file descriptor itself
-is still released by handle finalization; the shutdown is what makes the FIN
-prompt.
+closed first already sent its FIN, so that path skips the shutdown.) When the
+timer wins, `Async.race` leaves the shutdown task running — bounded at one
+suspended task per stalled peer, holding no worker — and the file descriptor is
+released by finalization when `uv_shutdown` eventually settles. Lean 4.31's
+`Std.Internal.UV.TCP.Socket` offers `shutdown` but no `close`, so prompt FIN is
+reachable and deterministic fd release is not; a single `Socket.close` over
+`uv_close` would remove both residues, and the rationale in
+`Grpc/Http2/Server.lean` states that ask in full.
 
 A complete server (all four RPC shapes plus reflection) is
 `examples/lean_proto/NoteServer.lean`:
@@ -202,9 +206,10 @@ Current limitations:
 - One suite, one group, one signature algorithm: a client that offers none of
   them (for example an FIPS-restricted or TLS 1.2-only client) gets a
   handshake failure rather than a fallback.
-- The TLS accept path does not yet participate in graceful-shutdown
-  bookkeeping (GOAWAY drain, keepalive); those apply to the plaintext managed
-  path.
+- Server-initiated keepalive PINGs are plaintext-only: `keepaliveIntervalMs`
+  is not yet armed on the TLS accept path (its PING would have to be sealed
+  through the session). Cause-carrying teardown, connection registration and
+  the graceful-shutdown drain do apply to TLS.
 
 ## Interoperability status
 
@@ -257,7 +262,8 @@ your editor the same nix-built Lean that Bazel uses.
 control, live h2c loopback servers), plus dedicated HPACK, hardening
 (padding/CONTINUATION/keepalive/crash paths), early-authentication, client,
 streaming (including an 80-connection stress case), connection-lifecycle
-(cause-carrying GOAWAY before teardown), server-ownership, health, zlib, TLS
+(cause-carrying GOAWAY before teardown, over both h2c and a real TLS 1.3
+session), server-ownership, health, zlib, TLS
 handshake, gRPC-over-TLS, REST-over-TLS, and generated-code tests, and the two
 `lean_assurance_test` audits below. `examples/grpc_service/` (a standalone module demonstrating a
 PostgreSQL-backed service and in-process proof checking of client-supplied

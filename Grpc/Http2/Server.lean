@@ -181,7 +181,34 @@ cooperatively and holds no worker, and it races the shutdown against a timer, so
 a stalled peer costs one abandoned promise and `closeFlushTimeoutMs`, never a
 thread and never an unbounded wait. In the ordinary case the peer gets a prompt,
 attributable FIN right behind the GOAWAY instead of an EOF at an arbitrary later
-finalization. -/
+finalization.
+
+What the losing branch costs, precisely, and what a real `close` would fix.
+`Async.race` does not cancel the loser — it documents that the other task "will
+continue the execution until the end" — so when the timer wins, the
+`client.shutdown` task stays alive awaiting the promise `uv_shutdown` resolves.
+`uv_shutdown` completes only once the send queue drains, which a peer holding
+its receive window shut can defer for as long as the kernel keeps
+retransmitting. So this branch leaves exactly one suspended task per stalled
+peer: no worker, no timer, and bounded by one per closed connection — but that
+task holds a reference to the `Client`, so the descriptor is released by
+finalization once `uv_shutdown` eventually completes or fails, not at the
+teardown point. Prompt FIN is achieved; deterministic fd release is not.
+
+`Std.Internal.UV.TCP.Socket` in Lean 4.31 exposes `new`, `connect`, `send`,
+`recv?`, `waitReadable`, `cancelRecv`, `bind`, `listen`, `accept`, `tryAccept`,
+`cancelAccept`, `shutdown`, `getPeerName`, `getSockName`, `noDelay`,
+`keepAlive`. There is no `close`; `cancelRecv`/`cancelAccept` cancel a pending
+read or accept but do not retire the handle.
+
+The upstream ask is one operation — `Socket.close : Socket → IO Unit` over
+`uv_close` — which removes both residues at once. It is unconditional, so there
+is nothing to await and no task to abandon and no timer to race. It discards
+queued writes and cancels outstanding requests instead of draining them, so a
+peer that stopped reading cannot defer it. It is a full close rather than a
+half-close. And it releases the descriptor in the same loop iteration, making fd
+release deterministic at the teardown point. Given it, this whole function
+collapses to that single call. -/
 private def closeConnectionSocket (client : TCP.Socket.Client) : Std.Async.Async Unit := do
   try
     Std.Async.Async.race
