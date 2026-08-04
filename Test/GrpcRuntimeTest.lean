@@ -2968,10 +2968,21 @@ def testMaxConcurrentStreamsEnforced : IO Unit := do
   let secondHeadersFrame : Http2.Frame := {
     activeHeadersFrame with header := { activeHeadersFrame.header with streamId := 3 }
   }
+  -- RFC 9113 §5.1.2 makes exceeding the limit a *stream* error, so the
+  -- connection survives and only the offending stream is reset.
   let secondResult ← Http2.Connection.processFrame registry state1 secondHeadersFrame
-  let secondStatus ← expectStatusError secondResult
-  expectEq secondStatus.code Code.internal
-    "second active stream should be rejected when max concurrent streams is one"
+  let (stateRefused, emittedRefused) ← expectStatusOk secondResult
+  expectEq emittedRefused.size 1
+    "a stream over the concurrency limit should emit exactly one frame"
+  expectEq emittedRefused[0]!.header.frameType Http2.FrameType.rstStream
+    "a stream over the concurrency limit should be refused with RST_STREAM, not GOAWAY"
+  expectEq emittedRefused[0]!.header.streamId 3
+    "RST_STREAM must name only the refused stream"
+  expectEq (← expectStatusOk (Http2.RstStream.decode emittedRefused[0]!))
+    Http2.ErrorCode.refusedStream
+    "RFC 9113 §5.1.2 prescribes REFUSED_STREAM for exceeding the limit"
+  expect (!stateRefused.streams.any fun stream => stream.streamId == 3)
+    "a refused stream must not stay buffered for dispatch"
 
   let requestBody ← expectStatusOk (Message.encode { data := bytes [1, 2, 3] })
   let dataFrame : Http2.Frame := {
@@ -3040,9 +3051,14 @@ def testMaxConcurrentStreamsCountsEarlyRejectedBodyDrains : IO Unit := do
     payload := encodedValidHeaders.1
   }
   let secondResult ← Http2.Connection.processFrame registry state1 secondHeadersFrame
-  let secondStatus ← expectStatusError secondResult
-  expectEq secondStatus.code Code.internal
+  let (_, emittedRefused) ← expectStatusOk secondResult
+  expectEq emittedRefused.size 1
     "early rejected stream should count against max concurrent streams until its body drains"
+  expectEq emittedRefused[0]!.header.frameType Http2.FrameType.rstStream
+    "a stream over the concurrency limit should be refused with RST_STREAM"
+  expectEq (← expectStatusOk (Http2.RstStream.decode emittedRefused[0]!))
+    Http2.ErrorCode.refusedStream
+    "a stream over the concurrency limit should be refused with REFUSED_STREAM"
 
   let requestBody ← expectStatusOk (Message.encode { data := bytes [1, 2, 3] })
   let drainDataFrame : Http2.Frame := {
@@ -3124,10 +3140,18 @@ def testMaxConcurrentStreamsCountsDetachedStreamingDispatch : IO Unit := do
   let secondHeadersFrame : Http2.Frame := {
     requestHeadersFrame with header := { requestHeadersFrame.header with streamId := 3 }
   }
+  emittedRef.set #[]
   let secondResult ← Http2.Connection.processFrameSharedWith registry stateMutex secondHeadersFrame emit
-  let secondStatus ← expectStatusError secondResult
-  expectEq secondStatus.code Code.internal
+  expectStatusOk secondResult
+  let emittedRefused ← emittedRef.get
+  expectEq emittedRefused.size 1
     "detached streaming response should occupy a max-concurrent stream slot"
+  expectEq emittedRefused[0]!.header.frameType Http2.FrameType.rstStream
+    "the stream over the limit should be refused with RST_STREAM, not a connection error"
+  expectEq emittedRefused[0]!.header.streamId 3 "RST_STREAM must name only the refused stream"
+  expectEq (← expectStatusOk (Http2.RstStream.decode emittedRefused[0]!))
+    Http2.ErrorCode.refusedStream
+    "RFC 9113 §5.1.2 prescribes REFUSED_STREAM for exceeding the limit"
 
   let producer ← match ← producerRef.get with
     | some producer => pure producer
@@ -3137,7 +3161,23 @@ def testMaxConcurrentStreamsCountsDetachedStreamingDispatch : IO Unit := do
     let state ← stateMutex.atomically get
     pure state.activeDispatches.isEmpty
 
-  let thirdResult ← Http2.Connection.processFrameSharedWith registry stateMutex secondHeadersFrame emit
+  -- The refused stream keeps its slot until its request body has drained, like
+  -- any other stream rejected before dispatch.
+  let drainDataFrame : Http2.Frame := {
+    header := {
+      length := requestBody.size,
+      frameType := Http2.FrameType.data,
+      flags := Http2.FrameFlag.endStream,
+      streamId := 3
+    },
+    payload := requestBody
+  }
+  expectStatusOk (← Http2.Connection.processFrameSharedWith registry stateMutex drainDataFrame emit)
+
+  let thirdHeadersFrame : Http2.Frame := {
+    requestHeadersFrame with header := { requestHeadersFrame.header with streamId := 5 }
+  }
+  let thirdResult ← Http2.Connection.processFrameSharedWith registry stateMutex thirdHeadersFrame emit
   expectStatusOk thirdResult
 
 def testStreamNativeContentLengthEnforced : IO Unit := do

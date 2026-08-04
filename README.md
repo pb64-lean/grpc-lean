@@ -33,7 +33,7 @@ flowchart TB
 | Area | Status |
 | --- | --- |
 | RPC shapes | Unary, server-streaming, client-streaming, bidirectional — each in a batched (`Array`) and an incremental `MessageStream` variant, with raw-`ByteArray` and typed-codec registration (`registerUnary` … `registerBidirectionalStreamingStreamCodec`) |
-| Deadlines | Server-enforced from `grpc-timeout`; expiry cancels the handler task and returns `DEADLINE_EXCEEDED`. No default deadline, no propagation to downstream calls |
+| Deadlines | Server-enforced from `grpc-timeout`: expiry cancels the handler task and returns `DEADLINE_EXCEEDED`. The absolute deadline reaches the handler as `request.deadline` (or `context.deadline`, via the additive `register*CodecWithContext` variants for typed handlers), and `CallOptions.propagating` turns what is left of it into a downstream call's `grpc-timeout` — or `DEADLINE_EXCEEDED` when nothing is left. No default deadline: a request without `grpc-timeout` still runs unbounded |
 | Early authorization | `Registry.withRequestHeaderAuthorizer` runs after header validation and **before any request body is accepted**; rejected streams get a trailers-only status while the body is drained without dispatch |
 | Message limits | Per-registry and per-client send/receive caps (`RESOURCE_EXHAUSTED`); 4 MiB default |
 | Compression | gzip both directions (see below) |
@@ -43,6 +43,7 @@ flowchart TB
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout (plaintext managed path; see TLS limitations) |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
+| Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Each decision is commented at its check with the rule it follows |
 
 ## Server
 
@@ -85,7 +86,9 @@ over one HTTP/2 connection (background reader + writer tasks). On top of it:
   `finish`, `cancel` — this covers all four shapes incrementally.
 
 `CallOptions` carry request metadata and a raw `grpc-timeout` value (e.g.
-`"5S"`). The client advertises `grpc-accept-encoding: identity,gzip` and
+`"5S"`); `CallOptions.withTimeout` sets it from a `Timeout`, and
+`CallOptions.propagating request.deadline` sets it to the time left on the
+deadline of the request a handler is currently serving. The client advertises `grpc-accept-encoding: identity,gzip` and
 transparently inflates gzip responses; it never compresses requests.
 `Test/ClientTest.lean` and `Test/StreamingTest.lean` are the reference usage.
 
@@ -264,7 +267,9 @@ holds today:
     (`decodeHuffman_encodeHuffman`, resting on prefix-freeness of the
     257-entry table, `huffmanPrefixFree`), and the dynamic-table size
     invariant (`dynamicSize_*_le`);
-  - `Grpc.Protocol` — `grpc-timeout` render/parse (`Timeout.parse?_render`)
+  - `Grpc.Protocol` — `grpc-timeout` render/parse (`Timeout.parse?_render`),
+    including every duration a propagated deadline can produce
+    (`Timeout.ofNanoseconds_bounds`, `Timeout.parse?_render_ofNanoseconds`),
     and `grpc-message` percent-coding (`Percent.decode_encode`);
   - `Grpc.Metadata` — base64 roundtrips behind `-bin` metadata
     (`Base64.decodeBytes_encodeBytes`, `…_encodeBytesUnpadded`);
@@ -279,7 +284,13 @@ holds today:
     RST_STREAM, WINDOW_UPDATE, PING, PRIORITY, GOAWAY, unknown), with
     `prepareHeadersShared_no_reopen` (a claimed stream id can never be
     reopened) and `prepareHeadersShared_concurrency`
-    (`MAX_CONCURRENT_STREAMS` gates admission) as corollaries;
+    (`MAX_CONCURRENT_STREAMS` gates admission: a HEADERS frame either arrives
+    below the limit or opens a stream marked for `REFUSED_STREAM`) as
+    corollaries; per-stream error containment is
+    `processDataShared_inert_reset` — a DATA frame for a stream that has
+    already closed produces no request feed, no dispatch, cancels nothing
+    outside that stream, emits an RST_STREAM naming only it, and leaves the
+    connection serving;
   - `Grpc.Http2.Connection` flow control — conservation, not just bounds:
     `consumeInboundDataWindow_conserves` (a DATA frame debits both receive
     windows by exactly its payload, and the `Nat` equation witnesses that

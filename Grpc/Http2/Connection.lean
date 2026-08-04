@@ -87,6 +87,10 @@ structure State where
   pendingOutbound : Array Frame := #[]
   streams : Array StreamState := #[]
   ignoredInboundStreams : Array Nat := #[]
+  /-- Streams accepted only so their field block is decoded, to be reset with
+  RST_STREAM the moment the block has been read.  See
+  `inboundStreamCapacityRefusal?`. -/
+  refusedInboundStreams : Array Nat := #[]
   activeRequestStreams : Array ActiveRequestStream := #[]
   activeDispatches : Array ActiveDispatch := #[]
   pendingKeepalivePing : Option ByteArray := none
@@ -278,12 +282,23 @@ private def ignoreInboundStreamBody (state : State) (streamId : Nat) : State :=
 def isClientStreamId (streamId : Nat) : Bool :=
   streamId % 2 == 1
 
+/-- Connection error.  RFC 9113 §5.1.1: "An endpoint that receives an
+unexpected stream identifier MUST respond with a connection error
+(Section 5.4.1) of type PROTOCOL_ERROR", and §6.1 says the same of a DATA frame
+whose stream identifier is 0x00.  A frame that names no valid stream cannot be
+scoped to one, so there is nothing to reset. -/
 private def requireClientStreamId (streamId : Nat) (frameName : String) : Except Status Unit := do
   if streamId == 0 then
     throw (Status.internal s!"HTTP/2 {frameName} frame must use a stream id")
   if !isClientStreamId streamId then
     throw (Status.internal s!"HTTP/2 {frameName} frame uses a server-initiated stream id")
 
+/-- Connection error.  RFC 9113 §5.1.1: "The identifier of a newly established
+stream MUST be numerically greater than all streams that the initiating
+endpoint has opened or reserved. ... An endpoint that receives an unexpected
+stream identifier MUST respond with a connection error (Section 5.4.1) of type
+PROTOCOL_ERROR."  Reusing an id means the two peers disagree about which stream
+is which, which no per-stream reset can repair. -/
 private def requireNewClientStreamId (state : State) (streamId : Nat) : Except Status Unit := do
   requireClientStreamId streamId "HEADERS"
   if streamId <= state.lastClientStreamId then
@@ -302,14 +317,29 @@ private def rejectNewStreamAfterOutboundGoAway? (state : State) (streamId : Nat)
       else
         pure none
 
-private def requireInboundStreamCapacity (state : State) : Except Status Unit := do
+/-- `some REFUSED_STREAM` when opening one more stream would exceed the
+advertised SETTINGS_MAX_CONCURRENT_STREAMS.
+
+RFC 9113 §5.1.2: "An endpoint that receives a HEADERS frame that causes its
+advertised concurrent stream limit to be exceeded MUST treat this as a stream
+error (Section 5.4.2) of type PROTOCOL_ERROR or REFUSED_STREAM."  REFUSED_STREAM
+is the better of the two here because §8.7 lets a client safely retry a stream
+the server never processed, and because a client that is merely ahead of the
+limit should back off rather than lose the connection.
+
+The refusal is *recorded*, not raised: the stream is opened so its field block
+still reaches the HPACK decoder, which RFC 9113 §4.3 requires of every field
+block ("A receiver MUST terminate the connection with a connection error of
+type COMPRESSION_ERROR if it does not decompress a field block"), and
+`authorizeRequestHeadersForStream` resets it the moment the block is read. -/
+private def inboundStreamCapacityRefusal? (state : State) : Option ErrorCode :=
   match state.inboundMaxConcurrentStreams with
-  | none => pure ()
+  | none => none
   | some limit =>
       if activeInboundStreamCount state >= limit then
-        throw (Status.internal s!"HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS exceeded: {limit}")
+        some ErrorCode.refusedStream
       else
-        pure ()
+        none
 
 private def headerComplete (frame : Frame) : Bool :=
   frame.header.frameType == FrameType.headers
@@ -331,6 +361,13 @@ private def pendingHeaderStream? (streams : Array StreamState) : Option Nat :=
   streams.findSome? fun stream =>
     if streamHeaderPending stream then some stream.streamId else none
 
+/-- Connection errors throughout.  RFC 9113 §6.10: "A CONTINUATION frame MUST
+be preceded by a HEADERS, PUSH_PROMISE or CONTINUATION frame without the
+END_HEADERS flag set.  A recipient that observes violation of this rule MUST
+respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR."  The
+oversized-block case is a connection error for the reason in §4.3 — a field
+block that is not decompressed desynchronises the connection-wide HPACK
+decoder, so it cannot be answered with RST_STREAM. -/
 private def appendContinuationFrame (streams : Array StreamState) (frame : Frame) :
     Except Status (Array StreamState) := do
   requireClientStreamId frame.header.streamId "CONTINUATION"
@@ -367,6 +404,10 @@ private def clearFlag (flags flag : UInt8) : UInt8 :=
   else
     flags
 
+/-- Connection error.  RFC 9113 §6.1: "If the length of the padding is the
+length of the frame payload or greater, the recipient MUST treat this as a
+connection error (Section 5.4.1) of type PROTOCOL_ERROR."  The frame boundary
+itself is in doubt, so the byte stream cannot be resynchronised per stream. -/
 private def stripPadding (frame : Frame) (frameName : String) : Except Status Frame := do
   if !FrameFlag.has frame.header.flags FrameFlag.padded then
     pure frame
@@ -389,6 +430,16 @@ private def stripPadding (frame : Frame) (frameName : String) : Except Status Fr
         payload := payload
       }
 
+/-- Connection errors.  A truncated priority section is a frame size error in a
+frame carrying a field block, and RFC 9113 §4.2 says "A frame size error in a
+frame that could alter the state of the entire connection MUST be treated as a
+connection error (Section 5.4.1); this includes any frame carrying a field
+block".  The self-dependency check is the one place an RFC stream error
+(§5.3.1: "A stream cannot depend on itself.  An endpoint MUST treat this as a
+stream error (Section 5.4.2) of type PROTOCOL_ERROR") is deliberately widened
+to a connection error: the check runs before the field block reaches the HPACK
+decoder, and §4.3 requires every field block to be decompressed, so refusing
+the stream alone would leave the decoder out of step for every later stream. -/
 private def stripHeadersPriority (frame : Frame) : Except Status Frame := do
   if !FrameFlag.has frame.header.flags FrameFlag.priority then
     pure frame
@@ -430,6 +481,13 @@ private def dataWindowUpdates (frame : Frame) : Except Status (Array Frame) := d
 private def dataFrameWithPayload (frame : Frame) (payload : ByteArray) : Frame :=
   { frame with header := { frame.header with length := payload.size }, payload := payload }
 
+/-- Connection error.  RFC 9113 §6.9 allows either scope here ("A receiver MAY
+respond with a stream error (Section 5.4.2) or connection error
+(Section 5.4.1) of type FLOW_CONTROL_ERROR"), and this connection takes the
+connection scope for both windows: the connection window is shared, so a peer
+that has overrun it has lost track of the shared credit, and a receiver that
+kept serving would have to guess how much of the overrun belonged to which
+stream. -/
 private def consumeInboundDataWindow (state : State) (frame : Frame) : Except Status State := do
   let size := frame.payload.size
   if size == 0 then
@@ -639,6 +697,9 @@ private def applyPeerSetting (state : State) (setting : Setting) : Except Status
 private def applyPeerSettings (state : State) (settings : Array Setting) : Except Status State :=
   settings.foldlM (init := state) applyPeerSetting
 
+/-- Connection error.  RFC 9113 §3.4: "Clients and servers MUST treat an
+invalid connection preface as a connection error (Section 5.4.1) of type
+PROTOCOL_ERROR."  No stream exists yet to scope an error to. -/
 private def consumePreface (state : State) (chunk : ByteArray) : Except Status (State × ByteArray) := do
   if state.prefaceReceived then
     pure (state, chunk)
@@ -812,6 +873,20 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
   match decoded with
   | .error status => pure (.error status)
   | .ok (stream, _headersFrame, headers) =>
+    if containsStreamId state.refusedInboundStreams streamId then
+      -- The field block is decoded (`headers.hpack` carries the advanced
+      -- decoder), so the connection stays in step; the stream itself is reset.
+      -- RFC 9113 §5.1.2 / §5.4.2.
+      match RstStream.frame streamId ErrorCode.refusedStream with
+      | .error status => pure (.error status)
+      | .ok rst =>
+          let state := {
+            state with
+            refusedInboundStreams := removeStreamId state.refusedInboundStreams streamId
+          }
+          pure (.ok (rejectStreamAtHeaders state streamId headers.hpack
+            state.outboundHpack headers.endStream, some #[rst]))
+    else
     match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
         headers.metadata state.outboundMaxFramePayloadLength with
     | .error status => pure (.error status)
@@ -1455,13 +1530,15 @@ private def processHeaders (registry : Registry) (state : State) (frame : Frame)
         | .error status => pure (.error status)
         | .ok (some rst) => pure (.ok (state, #[rst]))
         | .ok none =>
-          match requireInboundStreamCapacity state with
-          | .error status => pure (.error status)
-          | .ok () =>
             let state := {
               state with
               lastClientStreamId := frame.header.streamId,
-              streams := appendStreamFrame state.streams frame
+              streams := appendStreamFrame state.streams frame,
+              refusedInboundStreams :=
+                if (inboundStreamCapacityRefusal? state).isSome then
+                  pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+                else
+                  state.refusedInboundStreams
             }
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
@@ -1493,13 +1570,15 @@ private def processHeadersWith (registry : Registry) (state : State) (frame : Fr
             | .error status => pure (.error status)
             | .ok () => pure (.ok state)
         | .ok none =>
-          match requireInboundStreamCapacity state with
-          | .error status => pure (.error status)
-          | .ok () =>
             let state := {
               state with
               lastClientStreamId := frame.header.streamId,
-              streams := appendStreamFrame state.streams frame
+              streams := appendStreamFrame state.streams frame,
+              refusedInboundStreams :=
+                if (inboundStreamCapacityRefusal? state).isSome then
+                  pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+                else
+                  state.refusedInboundStreams
             }
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
@@ -1639,6 +1718,11 @@ private def processDataWith (registry : Registry) (state : State) (frame : Frame
                     else
                       pure (.ok state)
 
+/-- Connection error.  RFC 9113 §6.2: "A HEADERS frame without the END_HEADERS
+flag set MUST be followed by a CONTINUATION frame for the same stream.  A
+receiver MUST treat the receipt of any other type of frame or a frame on a
+different stream as a connection error (Section 5.4.1) of type
+PROTOCOL_ERROR." -/
 private def requireHeaderBlockContinuation (state : State) (frame : Frame) : Except Status Unit := do
   match pendingHeaderStream? state.streams with
   | none => pure ()
@@ -1648,6 +1732,14 @@ private def requireHeaderBlockContinuation (state : State) (frame : Frame) : Exc
       else
         throw (Status.internal "HTTP/2 header block must be followed by CONTINUATION frames")
 
+/-- Connection errors.  A header/payload length mismatch means the decoder and
+the peer disagree about where frames begin, which is unrecoverable per stream.
+The advertised-size check is RFC 9113 §4.2 ("An endpoint MUST send an error code
+of FRAME_SIZE_ERROR if a frame exceeds the size defined in
+SETTINGS_MAX_FRAME_SIZE"); §4.2 permits a stream error for frames that cannot
+alter connection state, but this check runs before frame-type dispatch and an
+oversized frame has already consumed an unknown amount of the stream, so it is
+kept connection-scoped. -/
 private def requireInboundFrameSize (state : State) (frame : Frame) : Except Status Unit := do
   if frame.header.length != frame.payload.size then
     throw (Status.internal "HTTP/2 frame header length does not match payload size")
@@ -1660,6 +1752,11 @@ private def withNormalizedHeaders (frame : Frame)
   | .error status => pure (.error status)
   | .ok frame => k frame
 
+/-- Connection error.  RFC 9113 §3.4: "The server connection preface consists
+of a potentially empty SETTINGS frame ... that MUST be the first frame the
+server sends", and the client preface "MUST be followed by a SETTINGS frame";
+§6.5 makes anything else at that point a connection error of type
+PROTOCOL_ERROR. -/
 private def requireClientSettingsFrame (state : State) (frame : Frame) : Except Status Unit := do
   if state.prefaceReceived
       && !state.clientSettingsReceived
@@ -1728,11 +1825,18 @@ private def prepareHeadersShared (state : State) (frame : Frame) :
   match ← rejectNewStreamAfterOutboundGoAway? state frame.header.streamId with
   | some rst => pure (state, some rst)
   | none =>
-      requireInboundStreamCapacity state
+      -- Over the concurrency limit the stream is still opened, so its field
+      -- block reaches the HPACK decoder (RFC 9113 §4.3); it is marked for
+      -- RST_STREAM(REFUSED_STREAM) the moment the block has been read.
       pure ({
         state with
         lastClientStreamId := frame.header.streamId,
-        streams := appendStreamFrame state.streams frame
+        streams := appendStreamFrame state.streams frame,
+        refusedInboundStreams :=
+          if (inboundStreamCapacityRefusal? state).isSome then
+            pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+          else
+            state.refusedInboundStreams
       }, none)
 
 private def processHeadersShared (registry : Registry) (state : State) (frame : Frame) :
@@ -2002,6 +2106,11 @@ private def processNonHeaderFrameShared (registry : Registry) (state : State) (f
       let (state, emitted) ← processGoAway state frame
       pure (state, { emitted := emitted })
   | .pushPromise =>
+      -- Connection error.  RFC 9113 §6.6: a server never enables push, and "a
+      -- receiver MUST treat the receipt of a PUSH_PROMISE on a stream that is
+      -- neither 'open' nor 'half-closed (local)' as a connection error
+      -- (Section 5.4.1) of type PROTOCOL_ERROR"; no client-initiated stream can
+      -- legally carry one here.
       throw (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported")
   | .unknown _ => pure (state, {})
   | .headers | .continuation =>
@@ -4131,13 +4240,22 @@ private theorem prepareHeadersShared_no_reopen {state : State} {frame : Frame}
   have := prepareHeadersShared_gt_lastClientStreamId heq
   omega
 
-/-- `SETTINGS_MAX_CONCURRENT_STREAMS` is enforced on inbound streams: a HEADERS
-frame that opens a new stream is only accepted while the number of active
-inbound streams is strictly below the advertised limit. -/
+/-- `SETTINGS_MAX_CONCURRENT_STREAMS` still bounds what can be served, even
+though exceeding it is now a stream error rather than a connection error: a
+HEADERS frame that opens a new stream either arrives with the number of active
+inbound streams strictly below the advertised limit, or the stream it opens is
+marked for RST_STREAM(REFUSED_STREAM).
+
+RFC 9113 §5.1.2 prescribes the stream error; the stream is opened only so its
+field block reaches the HPACK decoder, which §4.3 requires of every field block
+whether or not the stream survives.  `authorizeRequestHeadersForStream` resets
+a marked stream as soon as the block is decoded, so a marked stream never
+reaches a handler. -/
 private theorem prepareHeadersShared_concurrency {state state' : State} {frame : Frame}
     {limit : Nat} (hlimit : state.inboundMaxConcurrentStreams = some limit)
     (heq : prepareHeadersShared state frame = .ok (state', none)) :
-    activeInboundStreamCount state < limit := by
+    activeInboundStreamCount state < limit
+      ∨ containsStreamId state'.refusedInboundStreams frame.header.streamId = true := by
   unfold prepareHeadersShared at heq
   simp only [bind, Except.bind, pure, Except.pure] at heq
   split at heq
@@ -4156,13 +4274,15 @@ private theorem prepareHeadersShared_concurrency {state state' : State} {frame :
           next => cases heq
           next =>
             split at heq
-            next => cases heq
-            next v hcap =>
-              unfold requireInboundStreamCapacity at hcap
-              simp only [bind, Except.bind, pure, Except.pure, hlimit] at hcap
-              split at hcap
-              next => cases hcap
-              next hlt => exact Nat.lt_of_not_le hlt
+            next hrefuse =>
+              cases heq
+              exact Or.inr (containsStreamId_pushUniqueStreamId _ _)
+            next hrefuse =>
+              cases heq
+              refine Or.inl ?_
+              by_cases hlt : limit ≤ activeInboundStreamCount state
+              · exact absurd (by unfold inboundStreamCapacityRefusal?; simp [hlimit, hlt]) hrefuse
+              · omega
 
 /-- The pure bookkeeping of a HEADERS frame preserves well-formedness: the new
 stream carries the id it just claimed, and the CONTINUATION guard rules out a
@@ -4193,11 +4313,11 @@ private theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
           split at heq
           next => cases heq; exact h
           next =>
-            split at heq
-            next => cases heq
-            next =>
-              cases heq
-              exact {
+            -- Whether or not the stream is marked for refusal, the stream table
+            -- and every field `WellFormed` constrains take the same shape.
+            split at heq <;>
+              (cases heq
+               exact {
                 streamIds := by
                   intro s hs
                   rcases mem_appendStreamFrame_of_new hfindnone hs with hmem | hnew'
@@ -4215,7 +4335,7 @@ private theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
                 outboundStreams := h.outboundStreams
                 outboundTable := h.outboundTable
                 inboundTable := h.inboundTable
-              }
+              })
 
 /-- Merging a CONTINUATION fragment preserves well-formedness: the stream keeps
 its id, and its header block was already the open one, so it is still the newest
