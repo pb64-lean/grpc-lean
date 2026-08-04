@@ -14,8 +14,10 @@ structure StreamState where
   streamId : Nat
   frames : Array Frame := #[]
   requestMetadata : Option Metadata := none
-  authorization : HeaderAuthorization := .accept
-  headersAuthorized : Bool := false
+  /-- The registry entry accepted by request-header authorization at
+  END_HEADERS.  `none` means the header block has not been authorized, so the
+  stream must not dispatch. -/
+  authorizedEntry? : Option MethodEntry := none
   deriving Inhabited
 
 structure OutboundStreamWindow where
@@ -645,15 +647,15 @@ private structure DetachedDispatch where
   outboundHpack : Hpack.State
   maxDataFrameSize : Nat
 
+/-- The dispatch family for a request whose body is fed to the handler
+incrementally, carrying the authorized handler at its exact shape. -/
 private inductive RequestStreamingKind where
-  | clientStreaming
-  | bidirectionalStreaming
-  deriving DecidableEq
+  | clientStreaming (handler : ClientStreamingStreamHandler)
+  | bidirectionalStreaming (handler : BidirectionalStreamingStreamHandler)
 
 private structure RequestStreamingDispatch where
   streamId : Nat
   metadata : Metadata
-  authorization : HeaderAuthorization := .accept
   outboundHpack : Hpack.State
   maxDataFrameSize : Nat
   kind : RequestStreamingKind
@@ -675,19 +677,16 @@ private structure SharedFrameResult where
   requestFeeds : Array RequestStreamFeed := #[]
   cancelDispatches : Array ActiveDispatch := #[]
 
-private def requestStreamingKind? (registry : Registry) (metadata : Metadata) :
-    Option RequestStreamingKind :=
-  match Headers.validateUnaryRequestHeaders metadata with
-  | .error _ => none
-  | .ok method =>
-      if (registry.findBidirectionalStreamingStream? method).isSome then
-        some .bidirectionalStreaming
-      else if (registry.findClientStreamingStream? method).isSome then
-        some .clientStreaming
-      else
-        none
+/-- Incremental request-body dispatch applies exactly to entries whose shape
+consumes a `MessageStream`; aggregate shapes buffer the body instead. -/
+private def requestStreamingKind? (entry : MethodEntry) : Option RequestStreamingKind :=
+  match entry with
+  | { shape := .clientStreamingStream, handler, .. } => some (.clientStreaming handler)
+  | { shape := .bidirectionalStreamingStream, handler, .. } =>
+      some (.bidirectionalStreaming handler)
+  | _ => none
 
-private def requestStreamingDispatchForStream? (registry : Registry) (state : State)
+private def requestStreamingDispatchForStream? (state : State)
     (streamId : Nat) : Except Status (State × Option RequestStreamingDispatch) := do
   let stream ← match findStream? state.streams streamId with
     | some stream => pure stream
@@ -697,13 +696,15 @@ private def requestStreamingDispatchForStream? (registry : Registry) (state : St
     | none => throw (Status.internal "missing HTTP/2 HEADERS frame")
   if !headerComplete headersFrame then
     pure (state, none)
-  else if !stream.headersAuthorized then
-    throw (Status.internal "request body dispatch attempted before header authorization")
   else
+    let entry ← match stream.authorizedEntry? with
+      | some entry => pure entry
+      | none =>
+          throw (Status.internal "request body dispatch attempted before header authorization")
     let metadata ← match stream.requestMetadata with
       | some metadata => pure metadata
       | none => throw (Status.internal "authorized request metadata was not retained")
-    match requestStreamingKind? registry metadata with
+    match requestStreamingKind? entry with
     | none => pure (state, none)
     | some kind =>
         let contentLength ← Headers.contentLength? metadata
@@ -732,7 +733,6 @@ private def requestStreamingDispatchForStream? (registry : Registry) (state : St
         pure (state, some {
           streamId := streamId,
           metadata := metadata,
-          authorization := stream.authorization,
           outboundHpack := state.outboundHpack,
           maxDataFrameSize := state.outboundMaxFramePayloadLength,
           kind := kind,
@@ -762,12 +762,11 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
     match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
         headers.metadata state.outboundMaxFramePayloadLength with
     | .error status => pure (.error status)
-    | .ok (.accept authorization) =>
+    | .ok (.accept entry) =>
         let stream := {
           stream with
           requestMetadata := some headers.metadata,
-          authorization := authorization,
-          headersAuthorized := true
+          authorizedEntry? := some entry
         }
         pure (.ok ({
           state with
@@ -847,8 +846,10 @@ private def decodeActiveRequestData (registry : Registry) (active : ActiveReques
 
 private def authorizedUnaryRequestForStream (state : State) (stream : StreamState) :
     Except Status Transport.UnaryRequestFrames := do
-  if !stream.headersAuthorized then
-    throw (Status.internal "request body dispatch attempted before header authorization")
+  let entry ← match stream.authorizedEntry? with
+    | some entry => pure entry
+    | none =>
+        throw (Status.internal "request body dispatch attempted before header authorization")
   let metadata ← match stream.requestMetadata with
     | some metadata => pure metadata
     | none => throw (Status.internal "authorized request metadata was not retained")
@@ -865,8 +866,7 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
     metadata := metadata,
     body := body,
     hpack := state.hpack,
-    authorization := stream.authorization,
-    headersAuthorized := true
+    authorizedEntry? := some entry
   }
 
 private def detachStreamForDispatch (state : State) (streamId : Nat) :
@@ -1168,9 +1168,9 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       match dispatch.requestError with
       | some status =>
           let encoded ← match dispatch.kind with
-            | .clientStreaming =>
+            | .clientStreaming _ =>
                 encodeUnary { status := status, data := ByteArray.empty }
-            | .bidirectionalStreaming =>
+            | .bidirectionalStreaming _ =>
                 encodeStreaming (emptyStreamingResponse status)
           match encoded with
           | .ok outboundHpack => finish (some outboundHpack)
@@ -1180,9 +1180,9 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
               abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
       | none =>
           match dispatch.kind with
-          | .clientStreaming =>
+          | .clientStreaming handler =>
               let result ← (registry.dispatchClientStreamingMessageStream
-                dispatch.metadata requestStream dispatch.authorization).run
+                dispatch.metadata requestStream (some handler)).run
               let encoded ← match result with
                 | .ok response => encodeUnary response
                 | .error status => encodeUnary { status := status, data := ByteArray.empty }
@@ -1192,9 +1192,9 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
                   cancelResponseStreamRef responseStreamCancel
                   finish none
                   abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
-          | .bidirectionalStreaming =>
+          | .bidirectionalStreaming handler =>
               let result ← (registry.dispatchBidirectionalStreamingMessageStream
-                dispatch.metadata requestStream dispatch.authorization).run
+                dispatch.metadata requestStream (some handler)).run
               let encoded ← match result with
                 | .ok response => encodeStreaming response
                 | .error status => encodeStreaming (emptyStreamingResponse status)
@@ -1666,7 +1666,7 @@ private def processHeadersShared (registry : Registry) (state : State) (frame : 
         | .error status => pure (.error status)
         | .ok (state, some result) => pure (.ok (state, result))
         | .ok (state, none) =>
-            match requestStreamingDispatchForStream? registry state frame.header.streamId with
+            match requestStreamingDispatchForStream? state frame.header.streamId with
             | .error status => pure (.error status)
             | .ok (state, some requestStreaming) =>
                 pure (.ok (state, { requestStreaming := some requestStreaming }))
@@ -1697,7 +1697,7 @@ private def processContinuationShared (registry : Registry) (state : State) (fra
         | .error status => pure (.error status)
         | .ok (state, some result) => pure (.ok (state, result))
         | .ok (state, none) =>
-          match requestStreamingDispatchForStream? registry state frame.header.streamId with
+          match requestStreamingDispatchForStream? state frame.header.streamId with
           | .error status => pure (.error status)
           | .ok (state, some requestStreaming) =>
               pure (.ok (state, { requestStreaming := some requestStreaming }))

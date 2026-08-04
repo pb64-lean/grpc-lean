@@ -17,8 +17,10 @@ structure UnaryRequestFrames where
   metadata : Metadata
   body : ByteArray
   hpack : Hpack.State
-  authorization : HeaderAuthorization := .accept
-  headersAuthorized : Bool := false
+  /-- The registry entry authorized when the header block completed, if header
+  authorization already ran on the connection.  `none` means dispatch must
+  look the method up and run the authorizer itself. -/
+  authorizedEntry? : Option MethodEntry := none
 
 structure RequestHeadersFrames where
   streamId : Nat
@@ -385,16 +387,10 @@ private def unsupportedContentType? (metadata : Metadata) : Option String :=
   | none => none
 
 private def registryContainsMethod (registry : Registry) (method : MethodName) : Bool :=
-  (registry.findUnary? method).isSome
-    || (registry.findServerStreamingStream? method).isSome
-    || (registry.findServerStreaming? method).isSome
-    || (registry.findClientStreamingStream? method).isSome
-    || (registry.findClientStreaming? method).isSome
-    || (registry.findBidirectionalStreamingStream? method).isSome
-    || (registry.findBidirectionalStreaming? method).isSome
+  (registry.findEntry? method).isSome
 
 inductive EarlyRequestDecision where
-  | accept (authorization : HeaderAuthorization)
+  | accept (entry : MethodEntry)
   | reject (frames : Array Frame) (outboundHpack : Hpack.State)
 
 def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.State) (streamId : Nat)
@@ -421,8 +417,10 @@ def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.Stat
 /--
 Validate and authorize a complete request header block.  This function is
 called as soon as END_HEADERS arrives, before the connection accepts DATA for
-the stream.  A successful authorization capability is retained in stream
-state and used for dispatch without rerunning the authorizer.
+the stream.  The registry entry for the method is looked up here, so a
+successful decision carries the entry (with the authorizer's accepted
+handler, which has the entry's exact shape by construction); it is retained
+in stream state and used for dispatch without rerunning the authorizer.
 -/
 def authorizeEarlyRequest (registry : Registry) (state : Hpack.State) (streamId : Nat)
     (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :
@@ -435,17 +433,23 @@ def authorizeEarlyRequest (registry : Registry) (state : Hpack.State) (streamId 
     let method ← match Headers.validateUnaryRequestHeaders metadata with
       | .ok method => pure method
       | .error status => return .error status
-    let authorizationResult ← try
-      registry.authorizeRequestHeaders method metadata |>.run
-    catch error =>
-      pure (.error (Status.ofIOError error))
-    match authorizationResult with
-    | .ok authorization => pure (.ok (.accept authorization))
-    | .error status =>
+    let rejectWith (status : Status) : Except Status EarlyRequestDecision :=
       match encodeUnaryResponseFrames state streamId
           { status := status, data := ByteArray.empty } maxDataFrameSize with
-      | .ok encoded => pure (.ok (.reject encoded.1 encoded.2))
-      | .error encodeStatus => pure (.error encodeStatus)
+      | .ok encoded => .ok (.reject encoded.1 encoded.2)
+      | .error encodeStatus => .error encodeStatus
+    match registry.findEntry? method with
+    | none =>
+        pure (rejectWith (Status.unimplemented s!"unknown gRPC method {method.path}"))
+    | some entry =>
+      let authorizationResult ← try
+        registry.authorizeRequestHeaders entry metadata |>.run
+      catch error =>
+        pure (.error (Status.ofIOError error))
+      match authorizationResult with
+      | .ok (.accept handler) => pure (.ok (.accept { entry with handler := handler }))
+      | .ok (.reject status) => pure (rejectWith status)
+      | .error status => pure (rejectWith status)
 
 def encodeServerStreamingStreamResponseFramesWith (state : Hpack.State) (streamId : Nat)
     (response : ServerStreamingStreamResponse)
@@ -590,91 +594,56 @@ def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.
         | .error status =>
             encodeUnary { status := status, data := ByteArray.empty }
         | .ok method =>
-          let authorizationResult ←
-            if request.headersAuthorized then
-              pure (.ok request.authorization)
-            else
-              registry.authorizeRequestHeaders method request.metadata |>.run
-          match authorizationResult with
-          | .error status =>
-              encodeUnary { status := status, data := ByteArray.empty }
-          | .ok authorization =>
-            let decompressed : Except Status ByteArray := do
-              let usesGzip ← Headers.requestUsesGzip request.metadata
-              Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
-            match decompressed with
-            | .error status =>
-                encodeUnary { status := status, data := ByteArray.empty }
+          let decompressBody : Except Status ByteArray := do
+            let usesGzip ← Headers.requestUsesGzip request.metadata
+            Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
+          let runEntry (entry : MethodEntry) : IO (Except Status UnaryDispatchStateResult) := do
+            match decompressBody with
+            | .error status => encodeUnary { status := status, data := ByteArray.empty }
             | .ok body =>
-            match registry.findUnary? method with
-            | some _ =>
-                match (← (registry.dispatchUnary request.metadata body authorization).run) with
-                | .ok response => encodeUnary response
+              match entry.dispatchHandler with
+              | .unary handler =>
+                  match (← (registry.dispatchUnary
+                      request.metadata body (some handler)).run) with
+                  | .ok response => encodeUnary response
+                  | .error status =>
+                      encodeUnary { status := status, data := ByteArray.empty }
+              | .serverStreaming handler =>
+                  match (← (registry.dispatchServerStreamingStream
+                      request.metadata body (some handler)).run) with
+                  | .ok response => encodeStreaming response
+                  | .error status => encodeStreaming (emptyStreamingResponse status)
+              | .clientStreaming handler =>
+                  match (← (registry.dispatchClientStreaming
+                      request.metadata body (some handler)).run) with
+                  | .ok response => encodeUnary response
+                  | .error status =>
+                      encodeUnary { status := status, data := ByteArray.empty }
+              | .bidirectionalStreaming handler =>
+                  match (← (registry.dispatchBidirectionalStreamingStream
+                      request.metadata body (some handler)).run) with
+                  | .ok response => encodeStreaming response
+                  | .error status => encodeStreaming (emptyStreamingResponse status)
+          match request.authorizedEntry? with
+          | some entry => runEntry entry
+          | none =>
+            match registry.findEntry? method with
+            | none =>
+                match decompressBody with
                 | .error status =>
+                    encodeUnary { status := status, data := ByteArray.empty }
+                | .ok _ =>
                     encodeUnary {
-                      status := status,
+                      status := Status.unimplemented s!"unknown gRPC method {method.path}",
                       data := ByteArray.empty
                     }
-            | none =>
-                match registry.findServerStreamingStream? method with
-                | some _ =>
-                    match (← (registry.dispatchServerStreamingStream
-                        request.metadata body authorization).run) with
-                    | .ok response => encodeStreaming response
-                    | .error status =>
-                        encodeStreaming (emptyStreamingResponse status)
-                | none =>
-                    match registry.findServerStreaming? method with
-                    | some _ =>
-                        match (← (registry.dispatchServerStreamingStream
-                            request.metadata body authorization).run) with
-                        | .ok response => encodeStreaming response
-                        | .error status =>
-                            encodeStreaming (emptyStreamingResponse status)
-                    | none =>
-                        match registry.findClientStreaming? method with
-                        | some _ =>
-                            match (← (registry.dispatchClientStreaming
-                                request.metadata body authorization).run) with
-                            | .ok response => encodeUnary response
-                            | .error status =>
-                                encodeUnary {
-                                  status := status,
-                                  data := ByteArray.empty
-                                }
-                        | none =>
-                            match registry.findClientStreamingStream? method with
-                            | some _ =>
-                                match (← (registry.dispatchClientStreaming
-                                    request.metadata body authorization).run) with
-                                | .ok response => encodeUnary response
-                                | .error status =>
-                                    encodeUnary {
-                                      status := status,
-                                      data := ByteArray.empty
-                                    }
-                            | none =>
-                                match registry.findBidirectionalStreamingStream? method with
-                                | some _ =>
-                                    match (← (registry.dispatchBidirectionalStreamingStream
-                                        request.metadata body authorization).run) with
-                                    | .ok response => encodeStreaming response
-                                    | .error status =>
-                                        encodeStreaming (emptyStreamingResponse status)
-                                | none =>
-                                    match registry.findBidirectionalStreaming? method with
-                                    | some _ =>
-                                        match (← (registry.dispatchBidirectionalStreamingStream
-                                            request.metadata body authorization).run) with
-                                        | .ok response => encodeStreaming response
-                                        | .error status =>
-                                            encodeStreaming (emptyStreamingResponse status)
-                                    | none =>
-                                        encodeUnary {
-                                          status := Status.unimplemented
-                                            s!"unknown gRPC method {method.path}",
-                                          data := ByteArray.empty
-                                        }
+            | some entry =>
+              match ← (registry.authorizeRequestHeaders entry request.metadata).run with
+              | .error status =>
+                  encodeUnary { status := status, data := ByteArray.empty }
+              | .ok (.reject status) =>
+                  encodeUnary { status := status, data := ByteArray.empty }
+              | .ok (.accept handler) => runEntry { entry with handler := handler }
 
 def dispatchUnaryFramesWith (registry : Registry) (inboundHpack outboundHpack : Hpack.State)
     (frames : Array Frame) (emit : Array Frame -> IO Unit)

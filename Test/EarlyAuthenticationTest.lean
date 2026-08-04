@@ -77,19 +77,22 @@ def authenticatedRegistry (authorizerCalls handlerCalls : IO.Ref Nat) : Registry
     |>.registerUnary method (fun _ => do
       handlerCalls.modify (fun calls => calls + 1000)
       throw (Status.internal "registry fallback handler must not run"))
-  registry.withRequestHeaderAuthorizer fun requested metadata => do
+  registry.withRequestHeaderAuthorizer fun entry metadata => do
     authorizerCalls.modify (fun calls => calls + 1)
-    if requested != method then
+    if entry.name != method then
       throw (Status.internal "authorizer received the wrong method")
     match (metadata.getAll "authorization").back? with
     | some "TestScheme local-test-token" =>
         let resolvedSession := 23
-        pure (.unary fun request => do
-          handlerCalls.modify (fun calls => calls + 1)
-          pure {
-            data := request.data.push (UInt8.ofNat resolvedSession)
-            status := Status.ok
-          })
+        match entry with
+        | { shape := .unary, .. } =>
+            pure (.accept fun request => do
+              handlerCalls.modify (fun calls => calls + 1)
+              pure {
+                data := request.data.push (UInt8.ofNat resolvedSession)
+                status := Status.ok
+              })
+        | _ => throw (Status.internal "authorizer expected a unary method entry")
     | _ => throw (Status.error .unauthenticated "invalid local access token")
 
 partial def waitUntil (description : String) (remaining : Nat)

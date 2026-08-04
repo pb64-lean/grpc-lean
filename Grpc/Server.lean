@@ -25,33 +25,6 @@ abbrev TypedBidirectionalStreamingStreamHandler (α β : Type) :=
   MessageStream α -> GrpcM (MessageStream β)
 
 /--
-The result of authorizing a completed request header block.  An authorizer may
-simply accept the registry's normal handler, or return a handler capability
-that captures authorization state resolved from those headers.  Capturing the
-state in a handler avoids global/task-local side channels and ensures dispatch
-uses the exact object that was authorized before the request body was read.
--/
-inductive HeaderAuthorization where
-  | accept
-  | unary (handler : UnaryHandler)
-  | serverStreaming (handler : ServerStreamingHandler)
-  | serverStreamingStream (handler : ServerStreamingStreamHandler)
-  | clientStreaming (handler : ClientStreamingHandler)
-  | clientStreamingStream (handler : ClientStreamingStreamHandler)
-  | bidirectionalStreaming (handler : BidirectionalStreamingHandler)
-  | bidirectionalStreamingStream (handler : BidirectionalStreamingStreamHandler)
-  deriving Inhabited
-
-/--
-Request-header authorization runs after gRPC method/header validation and
-before request DATA is accumulated or framed.  It may perform `IO` (for
-example, a mutex-protected live-session lookup); callers should keep it
-bounded because the connection preserves request ordering while it runs.
--/
-abbrev RequestHeaderAuthorizer :=
-  MethodName -> Metadata -> GrpcM HeaderAuthorization
-
-/--
 The seven RPC shapes a registered method handler may have.  The `*Stream`
 shapes consume or produce incremental `MessageStream`s; the others use
 aggregate request/response values.
@@ -93,6 +66,36 @@ def MethodEntry.handlerFor? (entry : MethodEntry) (shape : RpcShape) :
     Option (Handler shape) :=
   if h : entry.shape = shape then some (h ▸ entry.handler) else none
 
+/--
+The result of authorizing a completed request header block against the
+registry entry resolved for the request method.  `accept` must supply a
+handler of the entry's exact shape — usually `entry.handler`, or a capability
+handler that captures authorization state resolved from those headers.
+Capturing the state in a handler avoids global/task-local side channels and
+ensures dispatch uses the exact object that was authorized before the request
+body was read.  Because the result is indexed by the entry, an accepted
+handler of the wrong shape is unrepresentable and dispatch needs no runtime
+shape check.
+-/
+inductive AuthorizationResult (entry : MethodEntry) where
+  | reject (status : Status)
+  | accept (handler : Handler entry.shape)
+
+/-- Accept the entry's registered handler unchanged. -/
+def AuthorizationResult.acceptRegistered (entry : MethodEntry) :
+    AuthorizationResult entry :=
+  .accept entry.handler
+
+/--
+Request-header authorization runs after gRPC method/header validation and
+method lookup, and before request DATA is accumulated or framed.  It may
+perform `IO` (for example, a mutex-protected live-session lookup); callers
+should keep it bounded because the connection preserves request ordering
+while it runs.  Throwing a `Status` is equivalent to returning `.reject`.
+-/
+abbrev RequestHeaderAuthorizer :=
+  (entry : MethodEntry) -> Metadata -> GrpcM (AuthorizationResult entry)
+
 /-- Registration rejected because the method name is already registered. -/
 structure DuplicateMethod where
   name : MethodName
@@ -101,7 +104,8 @@ structure DuplicateMethod where
 structure Registry where
   maxReceiveMessageSize : Option Nat := none
   maxSendMessageSize : Option Nat := none
-  requestHeaderAuthorizer : RequestHeaderAuthorizer := fun _ _ => pure .accept
+  requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
+    pure (.accept entry.handler)
   entries : Array MethodEntry := #[]
 
 namespace Registry
@@ -119,9 +123,10 @@ def withRequestHeaderAuthorizer (registry : Registry)
     (authorizer : RequestHeaderAuthorizer) : Registry :=
   { registry with requestHeaderAuthorizer := authorizer }
 
-def authorizeRequestHeaders (registry : Registry) (method : MethodName)
-    (metadata : Metadata) : GrpcM HeaderAuthorization :=
-  registry.requestHeaderAuthorizer method metadata
+/-- Run the installed request-header authorizer for a looked-up entry. -/
+def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)
+    (metadata : Metadata) : GrpcM (AuthorizationResult entry) :=
+  registry.requestHeaderAuthorizer entry metadata
 
 /-- Append a method entry.  Lookup is first-match-wins, so an entry never
 shadows an earlier registration of the same name. -/
@@ -546,30 +551,44 @@ private def clientStreamingRequestOfStream (request : ClientStreamingStreamReque
     messages := messages
   }
 
-private def authorizationShapeMismatch (method : MethodName) : Status :=
-  Status.internal s!"request-header authorizer selected an incompatible handler for {method.path}"
+/-- Adapt an aggregate server-streaming handler to the incremental shape. -/
+def streamHandlerOfServerStreaming (handler : ServerStreamingHandler) :
+    ServerStreamingStreamHandler :=
+  fun request => do streamResponseOfAggregate (← handler request)
+
+/-- Adapt an aggregate client-streaming handler to the incremental shape. -/
+def streamHandlerOfClientStreaming (handler : ClientStreamingHandler) :
+    ClientStreamingStreamHandler :=
+  fun request => do handler (← clientStreamingRequestOfStream request)
+
+/-- Adapt an aggregate bidirectional-streaming handler to the incremental
+shape. -/
+def streamHandlerOfBidirectionalStreaming (handler : BidirectionalStreamingHandler) :
+    BidirectionalStreamingStreamHandler :=
+  fun request => do
+    streamResponseOfAggregate (← handler (← clientStreamingRequestOfStream request))
 
 def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (authorization : HeaderAuthorization := .accept) :
+    (handler? : Option UnaryHandler := none) :
     GrpcM UnaryResponse := do
   let request ← decodeUnaryRequest registry metadata body
-  let handler ← match authorization with
-    | .accept =>
+  let handler ← match handler? with
+    | some handler => pure handler
+    | none =>
         match registry.findUnary? request.method with
         | some handler => pure handler
         | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-    | .unary handler => pure handler
-    | _ => throw (authorizationShapeMismatch request.method)
   let response ← runWithDeadline request.timeout (handler request)
   validateUnaryResponse registry response
 
 def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (authorization : HeaderAuthorization := .accept) :
+    (handler? : Option ServerStreamingStreamHandler := none) :
     GrpcM ServerStreamingStreamResponse := do
   let request ← decodeUnaryRequest registry metadata body
   let deadline? ← deadlineFromNow? request.timeout
-  let response ← match authorization with
-    | .accept =>
+  let response ← match handler? with
+    | some handler => runWithDeadlineUntil deadline? (handler request)
+    | none =>
         match registry.findServerStreamingStream? request.method with
         | some handler =>
             runWithDeadlineUntil deadline? (handler request)
@@ -579,29 +598,25 @@ def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (b
                 let response ← runWithDeadlineUntil deadline? (handler request)
                 streamResponseOfAggregate response
             | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-    | .serverStreamingStream handler =>
-        runWithDeadlineUntil deadline? (handler request)
-    | .serverStreaming handler => do
-        let response ← runWithDeadlineUntil deadline? (handler request)
-        streamResponseOfAggregate response
-    | _ => throw (authorizationShapeMismatch request.method)
   validateServerStreamingStreamResponse registry {
     response with
     messages := withDeadlineUntil deadline? response.messages
   }
 
 def dispatchServerStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (authorization : HeaderAuthorization := .accept) :
+    (handler? : Option ServerStreamingStreamHandler := none) :
     GrpcM ServerStreamingResponse := do
-  let response ← registry.dispatchServerStreamingStream metadata body authorization
+  let response ← registry.dispatchServerStreamingStream metadata body handler?
   collectServerStreamingStreamResponse response
 
 def dispatchClientStreamingMessageStream (registry : Registry) (metadata : Metadata)
-    (messages : MessageStream ByteArray) (authorization : HeaderAuthorization := .accept) :
+    (messages : MessageStream ByteArray)
+    (handler? : Option ClientStreamingStreamHandler := none) :
     GrpcM UnaryResponse := do
   let (request, deadline?) ← decodeClientStreamingStreamRequest metadata messages
-  let response ← match authorization with
-    | .accept =>
+  let response ← match handler? with
+    | some handler => runWithDeadlineUntil deadline? (handler request)
+    | none =>
         match registry.findClientStreamingStream? request.method with
         | some handler =>
             runWithDeadlineUntil deadline? (handler request)
@@ -611,27 +626,23 @@ def dispatchClientStreamingMessageStream (registry : Registry) (metadata : Metad
                 let aggregateRequest ← clientStreamingRequestOfStream request
                 runWithDeadlineUntil deadline? (handler aggregateRequest)
             | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-    | .clientStreamingStream handler =>
-        runWithDeadlineUntil deadline? (handler request)
-    | .clientStreaming handler => do
-        let aggregateRequest ← clientStreamingRequestOfStream request
-        runWithDeadlineUntil deadline? (handler aggregateRequest)
-    | _ => throw (authorizationShapeMismatch request.method)
   validateUnaryResponse registry response
 
 def dispatchClientStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (authorization : HeaderAuthorization := .accept) :
+    (handler? : Option ClientStreamingStreamHandler := none) :
     GrpcM UnaryResponse := do
   let request ← decodeClientStreamingRequest registry metadata body
   let messages ← MessageStream.ofArray request.messages
-  registry.dispatchClientStreamingMessageStream metadata messages authorization
+  registry.dispatchClientStreamingMessageStream metadata messages handler?
 
 def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata : Metadata)
-    (messages : MessageStream ByteArray) (authorization : HeaderAuthorization := .accept) :
+    (messages : MessageStream ByteArray)
+    (handler? : Option BidirectionalStreamingStreamHandler := none) :
     GrpcM ServerStreamingStreamResponse := do
   let (request, deadline?) ← decodeClientStreamingStreamRequest metadata messages
-  let response ← match authorization with
-    | .accept =>
+  let response ← match handler? with
+    | some handler => runWithDeadlineUntil deadline? (handler request)
+    | none =>
         match registry.findBidirectionalStreamingStream? request.method with
         | some handler =>
             runWithDeadlineUntil deadline? (handler request)
@@ -642,29 +653,22 @@ def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata 
                 let response ← runWithDeadlineUntil deadline? (handler aggregateRequest)
                 streamResponseOfAggregate response
             | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-    | .bidirectionalStreamingStream handler =>
-        runWithDeadlineUntil deadline? (handler request)
-    | .bidirectionalStreaming handler => do
-        let aggregateRequest ← clientStreamingRequestOfStream request
-        let response ← runWithDeadlineUntil deadline? (handler aggregateRequest)
-        streamResponseOfAggregate response
-    | _ => throw (authorizationShapeMismatch request.method)
   validateServerStreamingStreamResponse registry {
     response with
     messages := withDeadlineUntil deadline? response.messages
   }
 
 def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : Metadata)
-    (body : ByteArray) (authorization : HeaderAuthorization := .accept) :
+    (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none) :
     GrpcM ServerStreamingStreamResponse := do
   let request ← decodeClientStreamingRequest registry metadata body
   let messages ← MessageStream.ofArray request.messages
-  registry.dispatchBidirectionalStreamingMessageStream metadata messages authorization
+  registry.dispatchBidirectionalStreamingMessageStream metadata messages handler?
 
 def dispatchBidirectionalStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (authorization : HeaderAuthorization := .accept) :
+    (handler? : Option BidirectionalStreamingStreamHandler := none) :
     GrpcM ServerStreamingResponse := do
-  let response ← registry.dispatchBidirectionalStreamingStream metadata body authorization
+  let response ← registry.dispatchBidirectionalStreamingStream metadata body handler?
   collectServerStreamingStreamResponse response
 
 /-! ## Registry well-formedness -/
@@ -789,5 +793,33 @@ theorem wellFormed_findEntry_of_mem {registry : Registry} {entry : MethodEntry}
   exact congrArg some (nodup_names_unique hwf found hfmem entry hmem' hfname)
 
 end Registry
+
+/--
+View of a method entry as the dispatch family it belongs to, with the handler
+carried at the family's incremental shape.  This is the single place where an
+entry's shape is matched, so every dispatch path receives a handler whose
+type already agrees with the wire protocol it drives.
+-/
+inductive DispatchHandler where
+  | unary (handler : UnaryHandler)
+  | serverStreaming (handler : ServerStreamingStreamHandler)
+  | clientStreaming (handler : ClientStreamingStreamHandler)
+  | bidirectionalStreaming (handler : BidirectionalStreamingStreamHandler)
+
+/-- Classify an entry into its dispatch family, adapting aggregate handlers
+to the family's incremental shape. -/
+def MethodEntry.dispatchHandler (entry : MethodEntry) : DispatchHandler :=
+  match entry with
+  | { shape := .unary, handler, .. } => .unary handler
+  | { shape := .serverStreaming, handler, .. } =>
+      .serverStreaming (Registry.streamHandlerOfServerStreaming handler)
+  | { shape := .serverStreamingStream, handler, .. } => .serverStreaming handler
+  | { shape := .clientStreaming, handler, .. } =>
+      .clientStreaming (Registry.streamHandlerOfClientStreaming handler)
+  | { shape := .clientStreamingStream, handler, .. } => .clientStreaming handler
+  | { shape := .bidirectionalStreaming, handler, .. } =>
+      .bidirectionalStreaming (Registry.streamHandlerOfBidirectionalStreaming handler)
+  | { shape := .bidirectionalStreamingStream, handler, .. } =>
+      .bidirectionalStreaming handler
 
 end Grpc
