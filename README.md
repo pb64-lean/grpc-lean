@@ -39,7 +39,7 @@ flowchart TB
 | Compression | gzip both directions (see below) |
 | Metadata | ASCII + `-bin` base64 binary metadata, full validation (pseudo-header rules, forbidden connection headers, reserved response/trailer names) |
 | Health | `grpc.health.v1.Health` `Check` + `Watch`, per-service status, terminal shutdown |
-| Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. File-descriptor requests answer `NOT_FOUND` unless you supply `FileDescriptor`s in `Reflection.Config` — codegen does not embed descriptors yet |
+| Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout (plaintext managed path; see TLS limitations) |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
@@ -182,11 +182,15 @@ Current limitations, inherited from `tls13-lean`'s single-suite scope:
 
 Honest summary: there is no official gRPC interop-suite or h2spec run yet.
 
-- `//examples/lean_proto:note_grpcurl_interop_test` (tagged `manual`; run it
-  explicitly) drives the Lean server with **grpcurl** (grpc-go) over
-  plaintext h2c: reflection `list`, unary calls with enum/map/optional
-  fields, cross-file imports, `DEADLINE_EXCEEDED` via client deadline, error
-  mapping, a 90 kB payload, and server-, client-, and bidi-streaming calls.
+- `//examples/lean_proto:note_grpcurl_interop_test` drives the Lean server
+  with **grpcurl** (grpc-go) over plaintext h2c: reflection `list`, then
+  `describe` and RPC invocation resolved entirely from the server's embedded
+  descriptors (no `-proto` or `-import-path` flags), including a message
+  defined in an imported file, plus unary calls with enum/map/optional
+  fields, `DEADLINE_EXCEEDED` via client deadline, error mapping, a 90 kB
+  payload, and server-, client- and bidi-streaming calls. It is tagged
+  `manual` and `requires-grpcurl`, so `bazel test //...` skips it — run it
+  explicitly, with grpcurl on `PATH`, to reproduce those results.
 - TLS interop is Lean-client-only for now (see above).
 - Wire behaviors (trailers-only responses, percent-encoded `grpc-message`,
   `-bin` metadata, status mapping) follow the gRPC over HTTP/2 spec and are
@@ -224,11 +228,34 @@ by `.bazelignore`.
 
 ## Assurance and trusted boundary
 
-No formal-verification claim is made for this repository's protocol code.
-What holds today:
+No end-to-end formal-verification claim is made for this repository: nothing
+is proved about the socket-facing I/O, concurrency, or the server loop. What
+holds today:
 
 - **Lean protocol code** (HTTP/2, HPACK, gRPC framing, metadata, dispatch):
-  implemented in Lean, evidence is the test suite described above.
+  implemented in Lean; the I/O paths, dispatch and concurrency are evidenced
+  by the test suite described above.
+- **Kernel-checked laws over the pure codecs and registry** (no `sorry`,
+  no `native_decide`), a growing set rather than a complete one:
+  - `Grpc.Framing` — message-frame encode/decode inversion with residual
+    bytes (`decodeAll_encode_append`), and that a successful size-limited
+    decode never yields an oversized message (`decodeAllWithLimit_size_le`);
+  - `Grpc.Http2.Frame` — frame header and whole-frame inversion with
+    residual bytes (`decodeHeader_encodeHeader_append`,
+    `decodeAll_encode_append`);
+  - `Grpc.Http2.Hpack` — integer roundtrip (`decodeInteger_encodeInteger`),
+    raw literal-string roundtrip (`decodeString_encodeString_raw`), the
+    dynamic-table size invariant (`dynamicSize_*_le`), and prefix-freeness
+    of the 257-entry Huffman table (`huffmanPrefixFree`);
+  - `Grpc.Protocol` — `grpc-timeout` render/parse (`Timeout.parse?_render`)
+    and `grpc-message` percent-coding (`Percent.decode_encode`);
+  - `Grpc.Metadata` — base64 roundtrips behind `-bin` metadata
+    (`Base64.decodeBytes_encodeBytes`, `…_encodeBytesUnpadded`);
+  - `Grpc.Server` — registry well-formedness and lookup uniqueness;
+    `Grpc.Http2.Connection` — rejected streams stay inert.
+
+  The Huffman *coder* roundtrip (decode ∘ encode) is not proved yet; only
+  the table's prefix-freeness is.
 - **C in the trusted computing base**: the zlib shim
   (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) and, via
   `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
