@@ -68,6 +68,22 @@ and `serveClient`/`serveClientWithState` for bring-your-own-socket or shared
 backlog, read size, `TCP_NODELAY`, `maxConcurrentStreams`, `maxHeaderListSize`,
 and keepalive interval/timeout.
 
+A managed connection never dies silently. Every teardown path records a
+`CloseCause` — peer close, server shutdown, keepalive timeout, connection error,
+or a failure of the connection task itself. The peer is told: unless it has
+already gone, it receives a GOAWAY whose debug data is that cause, emitted
+before the socket is retired, so the EOF that follows is attributable rather
+than a bare disconnect. Locally the last 64 causes are readable from
+`Grpc.Server.closedConnections`. `Grpc.Server.acceptFailure?` /
+`checkAccepting` expose the accept loop while the server runs, so a dead accept
+loop is a reportable failure instead of clients hanging on connect.
+
+Teardown retires the socket in `Async`, racing the write-side shutdown against a
+short timer: a peer that has stopped reading cannot stall it, and no worker
+thread is parked. Lean 4.31's `Std.Async.TCP` exposes no socket `close`, so the
+file descriptor itself is still released by handle finalization; the shutdown is
+what makes the FIN prompt.
+
 A complete server (all four RPC shapes plus reflection) is
 `examples/lean_proto/NoteServer.lean`:
 
@@ -237,9 +253,10 @@ your editor the same nix-built Lean that Bazel uses.
 (protocol validation, all four dispatch shapes, HTTP/2 frame codecs, flow
 control, live h2c loopback servers), plus dedicated HPACK, hardening
 (padding/CONTINUATION/keepalive/crash paths), early-authentication, client,
-streaming (including an 80-connection stress case), server-ownership,
-health, zlib, TLS handshake, gRPC-over-TLS, REST-over-TLS, and generated-code
-tests. `examples/grpc_service/` (a standalone module demonstrating a
+streaming (including an 80-connection stress case), connection-lifecycle
+(cause-carrying GOAWAY before teardown), server-ownership, health, zlib, TLS
+handshake, gRPC-over-TLS, REST-over-TLS, and generated-code tests, and the two
+`lean_assurance_test` audits below. `examples/grpc_service/` (a standalone module demonstrating a
 PostgreSQL-backed service and in-process proof checking of client-supplied
 Lean terms) and the vendored `third_party` modules are excluded from `//...`
 by `.bazelignore`.
@@ -247,8 +264,20 @@ by `.bazelignore`.
 ## Assurance and trusted boundary
 
 No end-to-end formal-verification claim is made for this repository: nothing
-is proved about the socket-facing I/O, concurrency, or the server loop. What
-holds today:
+is proved about the socket-facing I/O, concurrency, or the server loop.
+
+Everything claimed below is checked mechanically, not by review. `bazel test
+//:grpc_assurance` audits the compiled `Environment` while the test binary is
+compiled: each principal theorem named in that target must exist, be a theorem,
+and close over no axiom outside `propext`, `Classical.choice`, `Quot.sound`; no
+constant under `Grpc.*` or `Zlib.*` may reach `sorryAx`; and `@[extern]` may
+appear only in `Zlib.Gzip`. **No non-standard axiom is allowed and none is
+used**: no proof here uses `bv_decide`, so unlike some sibling repositories
+there is no generated LRAT-certificate axiom (`…._native.bv_decide.ax_1_5`) in
+the allowed set — a proof that introduced one would fail the audit.
+`//:grpc_tls_assurance` makes the same `@[extern]` statement about `Grpc.Tls.*`.
+
+What holds today:
 
 - **Lean protocol code** (HTTP/2, HPACK, gRPC framing, metadata, dispatch):
   implemented in Lean; the I/O paths, dispatch and concurrency are evidenced
@@ -308,8 +337,10 @@ holds today:
   HEADERS/CONTINUATION steps (header decoding, authorization, dispatch
   spawning), and everything above the codecs.
 - **C in the trusted computing base**: the zlib shim
-  (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) and, via
-  `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
+  (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) — and nothing
+  else first-party, which is what `//:grpc_assurance` confirms by allowing
+  `@[extern]` in `Zlib.Gzip` and nowhere else under `Grpc.*`/`Zlib.*` — and,
+  via `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
   themselves carry externally machine-verified correctness proofs; the shim
   and `@[extern]` bindings do not.
 - **External dependencies**: zlib (Bazel module), the vendored

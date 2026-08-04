@@ -142,7 +142,7 @@ def serverPrefaceBytes (maxConcurrentStreams : Option Nat := none)
 private def findStream? (streams : Array StreamState) (streamId : Nat) : Option StreamState :=
   streams.find? (fun stream => stream.streamId == streamId)
 
-private def removeStream (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
+def removeStream (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
   streams.filter (fun stream => stream.streamId != streamId)
 
 private def appendStreamFrame (streams : Array StreamState) (frame : Frame) : Array StreamState :=
@@ -217,7 +217,7 @@ private def removeActiveDispatchesForStream (dispatches : Array ActiveDispatch) 
     Array ActiveDispatch :=
   dispatches.filter (fun dispatch => dispatch.streamId != streamId)
 
-private def containsStreamId (streamIds : Array Nat) (streamId : Nat) : Bool :=
+def containsStreamId (streamIds : Array Nat) (streamId : Nat) : Bool :=
   streamIds.any (· == streamId)
 
 private def removeStreamId (streamIds : Array Nat) (streamId : Nat) : Array Nat :=
@@ -240,7 +240,7 @@ private def activeInboundStreamIds (state : State) : Array Nat :=
     (init := streamIds)
     (fun ids dispatch => pushUniqueStreamId ids dispatch.streamId)
 
-private def activeInboundStreamCount (state : State) : Nat :=
+def activeInboundStreamCount (state : State) : Nat :=
   activeInboundStreamIds state |>.size
 
 private def findActiveRequestStream? (streams : Array ActiveRequestStream) (streamId : Nat) :
@@ -357,7 +357,7 @@ def streamHeaderPending (stream : StreamState) : Bool :=
   | some frame => frame.header.frameType == FrameType.headers && !headerComplete frame
   | none => false
 
-private def pendingHeaderStream? (streams : Array StreamState) : Option Nat :=
+def pendingHeaderStream? (streams : Array StreamState) : Option Nat :=
   streams.findSome? fun stream =>
     if streamHeaderPending stream then some stream.streamId else none
 
@@ -368,7 +368,7 @@ respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR."  The
 oversized-block case is a connection error for the reason in §4.3 — a field
 block that is not decompressed desynchronises the connection-wide HPACK
 decoder, so it cannot be answered with RST_STREAM. -/
-private def appendContinuationFrame (streams : Array StreamState) (frame : Frame) :
+def appendContinuationFrame (streams : Array StreamState) (frame : Frame) :
     Except Status (Array StreamState) := do
   requireClientStreamId frame.header.streamId "CONTINUATION"
   let stream ← match findStream? streams frame.header.streamId with
@@ -488,7 +488,7 @@ connection scope for both windows: the connection window is shared, so a peer
 that has overrun it has lost track of the shared credit, and a receiver that
 kept serving would have to guess how much of the overrun belonged to which
 stream. -/
-private def consumeInboundDataWindow (state : State) (frame : Frame) : Except Status State := do
+def consumeInboundDataWindow (state : State) (frame : Frame) : Except Status State := do
   let size := frame.payload.size
   if size == 0 then
     pure state
@@ -561,7 +561,7 @@ private theorem popFirstFrame_size_lt {frames : Array Frame} {frame : Frame}
   simp only [popFirstFrame, Array.size_extract]
   omega
 
-private def flushOutbound (state : State) (emitted : Array Frame := #[]) :
+def flushOutbound (state : State) (emitted : Array Frame := #[]) :
     State × Array Frame :=
   match h : state.pendingOutbound[0]? with
   | none => (state, emitted)
@@ -747,18 +747,18 @@ private def emitResultFrames (emit : Array Frame -> IO Unit)
       | .error status => pure (.error status)
       | .ok () => pure (.ok state)
 
-private structure DetachedDispatch where
+structure DetachedDispatch where
   request : Transport.UnaryRequestFrames
   outboundHpack : Hpack.State
   maxDataFrameSize : Nat
 
 /-- The dispatch family for a request whose body is fed to the handler
 incrementally, carrying the authorized handler at its exact shape. -/
-private inductive RequestStreamingKind where
+inductive RequestStreamingKind where
   | clientStreaming (handler : ClientStreamingStreamHandler)
   | bidirectionalStreaming (handler : BidirectionalStreamingStreamHandler)
 
-private structure RequestStreamingDispatch where
+structure RequestStreamingDispatch where
   streamId : Nat
   metadata : Metadata
   outboundHpack : Hpack.State
@@ -769,13 +769,13 @@ private structure RequestStreamingDispatch where
   closeImmediately : Bool := false
   usesGzip : Bool := false
 
-private structure RequestStreamFeed where
+structure RequestStreamFeed where
   producer : MessageStream.Producer ByteArray
   messages : Array ByteArray := #[]
   error : Option Status := none
   close : Bool := false
 
-private structure SharedFrameResult where
+structure SharedFrameResult where
   emitted : Array Frame := #[]
   detached : Option DetachedDispatch := none
   requestStreaming : Option RequestStreamingDispatch := none
@@ -970,7 +970,7 @@ private def queueRequestCredits (active : ActiveRequestStream) (decoded : Messag
       (decoded.messages.map (fun message => Message.prefixLength + message.data.size))
   }
 
-private def decodeActiveRequestData (registry : Registry) (active : ActiveRequestStream)
+def decodeActiveRequestData (registry : Registry) (active : ActiveRequestStream)
     (frame : Frame) : Except Status (ActiveRequestStream × Array ByteArray × Bool) :=
   match checkContentLength? active.contentLength
       (active.receivedBodyBytes + frame.payload.size) false with
@@ -1209,7 +1209,7 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
 /-- Pure half of credit-on-consume: pop the next deferred per-message credit
 and put exactly that many bytes back into the stream's receive window.  The
 returned amount is what the peer's WINDOW_UPDATE must carry. -/
-private def takeRequestStreamCredit (state : State) (streamId : Nat) : State × Nat :=
+def takeRequestStreamCredit (state : State) (streamId : Nat) : State × Nat :=
   match findActiveRequestStream? state.activeRequestStreams streamId with
   | none => (state, 0)
   | some active =>
@@ -1826,7 +1826,7 @@ authorizer call: stream-id validation, buffering the header frame, and
 claiming the stream id.  Factored out so the authorization-before-body
 groundwork (end of file) can reason about HEADERS steps without touching
 `IO`. -/
-private def prepareHeadersShared (state : State) (frame : Frame) :
+def prepareHeadersShared (state : State) (frame : Frame) :
     Except Status (State × Option Frame) := do
   requireClientStreamId frame.header.streamId "HEADERS"
   if (findStream? state.streams frame.header.streamId).isSome then
@@ -1909,7 +1909,7 @@ private def processContinuationShared (registry : Registry) (state : State) (fra
 the whole frame immediately (so one stalled stream cannot starve the
 connection); the stream window is credited only for padding, because the
 payload's stream credit is deferred until the handler consumes each message. -/
-private def processActiveRequestData (registry : Registry) (state : State) (frame : Frame)
+def processActiveRequestData (registry : Registry) (state : State) (frame : Frame)
     (active : ActiveRequestStream) : Except Status (State × SharedFrameResult) :=
   match consumeInboundDataWindow state frame with
   | .error status => .error status
@@ -2032,7 +2032,7 @@ private def resetClosedStreamData (state : State) (frame : Frame) :
 /-- DATA for a unary request: the body is buffered on the stream and both
 windows are credited immediately, since the whole request is dispatched at
 END_STREAM. -/
-private def processUnaryRequestData (state : State) (frame : Frame) :
+def processUnaryRequestData (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) :=
   match findStream? state.streams frame.header.streamId with
   | none => .error (Status.internal "HTTP/2 DATA frame arrived before request HEADERS")
@@ -2062,7 +2062,7 @@ private def processUnaryRequestData (state : State) (frame : Frame) :
             else
               .ok (buffered, { emitted := updates })
 
-private def processDataShared (registry : Registry) (state : State) (frame : Frame) :
+def processDataShared (registry : Registry) (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) :=
   match requireClientStreamId frame.header.streamId "DATA" with
   | .error status => .error status
@@ -2091,7 +2091,7 @@ private def processDataShared (registry : Registry) (state : State) (frame : Fra
 `IO` authorizer (i.e. everything except HEADERS/CONTINUATION).  Factored out of
 `processFrameShared` so the authorization-before-body groundwork (end of file)
 can state trace theorems over arbitrary non-header frame steps. -/
-private def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : Frame) :
+def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) := do
   match frame.header.frameType with
   | .settings =>
@@ -2532,7 +2532,7 @@ id back in drain mode, leaving every other stream's state untouched.
 
 This is the pure statement of per-stream error containment: the connection is
 not torn down, and nothing outside `frame.header.streamId` moves. -/
-private theorem processDataShared_inert_reset {registry : Registry} {state state' : State}
+theorem processDataShared_inert_reset {registry : Registry} {state state' : State}
     {frame : Frame} {result : SharedFrameResult}
     (hinert : state.StreamInert frame.header.streamId)
     (hnotrej : state.rejectedAtHeaders frame.header.streamId = false)
@@ -2595,7 +2595,7 @@ private theorem processDataShared_inert_reset {registry : Registry} {state state
 /-- A pure trace of the shared kernel's DATA-frame steps: each listed frame
 is processed by `processDataShared` from the previous state and produces the
 recorded `SharedFrameResult`. -/
-private inductive DataTrace (registry : Registry) :
+inductive DataTrace (registry : Registry) :
     State -> List (Frame × SharedFrameResult) -> State -> Prop
   | nil (state : State) : DataTrace registry state [] state
   | step {state mid final : State} {frame : Frame} {result : SharedFrameResult}
@@ -3050,7 +3050,7 @@ private theorem processNonHeaderFrameShared_inert {registry : Registry} {state :
 /-- A pure trace of shared-kernel steps over non-header frames: each listed
 frame is processed by `processNonHeaderFrameShared` from the previous state
 and produces the recorded `SharedFrameResult`. -/
-private inductive FrameTrace (registry : Registry) :
+inductive FrameTrace (registry : Registry) :
     State -> List (Frame × SharedFrameResult) -> State -> Prop
   | nil (state : State) : FrameTrace registry state [] state
   | step {state mid final : State} {frame : Frame} {result : SharedFrameResult}
@@ -3096,7 +3096,7 @@ private theorem FrameTrace.inert_no_dispatch {registry : Registry}
 whose body is still open, any pure trace of non-header frames whose DATA
 frames target that stream drains without producing any dispatch work, and the
 stream ends (and stays) inert. -/
-private theorem rejectStreamAtHeaders_frameTrace_no_dispatch
+theorem rejectStreamAtHeaders_frameTrace_no_dispatch
     {registry : Registry} {state final : State}
     {steps : List (Frame × SharedFrameResult)}
     (streamId : Nat) (inboundHpack outboundHpack : Hpack.State) (endStream : Bool)
@@ -4153,7 +4153,7 @@ private theorem processDataShared_wellFormed {registry : Registry} {state : Stat
           next => exact processUnaryRequestData_wellFormed h heq
 
 /-- Every pure non-header frame step preserves well-formedness. -/
-private theorem processNonHeaderFrameShared_wellFormed {registry : Registry} {state : State}
+theorem processNonHeaderFrameShared_wellFormed {registry : Registry} {state : State}
     {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
     (heq : processNonHeaderFrameShared registry state frame = .ok res) :
     WellFormed res.1 := by
@@ -4238,7 +4238,7 @@ private theorem prepareHeadersShared_gt_lastClientStreamId {state : State} {fram
 below `lastClientStreamId`, and a HEADERS frame is only accepted strictly
 above it, so a stream that was reset, drained or dispatched away can never be
 reopened on the same connection. -/
-private theorem prepareHeadersShared_no_reopen {state : State} {frame : Frame}
+theorem prepareHeadersShared_no_reopen {state : State} {frame : Frame}
     {res : State × Option Frame} (heq : prepareHeadersShared state frame = .ok res)
     {claimed : Nat} (hclaimed : claimed ≤ state.lastClientStreamId) :
     frame.header.streamId ≠ claimed := by
@@ -4257,7 +4257,7 @@ field block reaches the HPACK decoder, which §4.3 requires of every field block
 whether or not the stream survives.  `authorizeRequestHeadersForStream` resets
 a marked stream as soon as the block is decoded, so a marked stream never
 reaches a handler. -/
-private theorem prepareHeadersShared_concurrency {state state' : State} {frame : Frame}
+theorem prepareHeadersShared_concurrency {state state' : State} {frame : Frame}
     {limit : Nat} (hlimit : state.inboundMaxConcurrentStreams = some limit)
     (heq : prepareHeadersShared state frame = .ok (state', none)) :
     activeInboundStreamCount state < limit
@@ -4293,7 +4293,7 @@ private theorem prepareHeadersShared_concurrency {state state' : State} {frame :
 /-- The pure bookkeeping of a HEADERS frame preserves well-formedness: the new
 stream carries the id it just claimed, and the CONTINUATION guard rules out a
 second open header block. -/
-private theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
+theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
     {res : State × Option Frame} (h : WellFormed state)
     (hpending : pendingHeaderStream? state.streams = none)
     (heq : prepareHeadersShared state frame = .ok res) : WellFormed res.1 := by
@@ -4346,7 +4346,7 @@ private theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
 /-- Merging a CONTINUATION fragment preserves well-formedness: the stream keeps
 its id, and its header block was already the open one, so it is still the newest
 stream. -/
-private theorem appendContinuationFrame_wellFormed {state : State} {frame : Frame}
+theorem appendContinuationFrame_wellFormed {state : State} {frame : Frame}
     {streams' : Array StreamState} (h : WellFormed state)
     (heq : appendContinuationFrame state.streams frame = .ok streams') :
     WellFormed { state with streams := streams' } := by
@@ -4441,7 +4441,7 @@ private theorem inboundStreamWindow_set (state : State) (streamId window : Nat) 
 
 /-- A DATA frame debits both receive windows by exactly its payload size; the
 `Nat` equations also witness that neither subtraction truncated. -/
-private theorem consumeInboundDataWindow_conserves {state state' : State} {frame : Frame}
+theorem consumeInboundDataWindow_conserves {state state' : State} {frame : Frame}
     (h : consumeInboundDataWindow state frame = .ok state') :
     state'.inboundConnectionWindow + frame.payload.size = state.inboundConnectionWindow
       ∧ inboundStreamWindow state' frame.header.streamId + frame.payload.size
@@ -4537,7 +4537,7 @@ private theorem stripPadding_size_le {frame frame' : Frame} {frameName : String}
 
 /-- The unary DATA path credits back exactly what it debited: both receive
 windows come out of the step unchanged. -/
-private theorem processUnaryRequestData_windows {state : State} {frame : Frame}
+theorem processUnaryRequestData_windows {state : State} {frame : Frame}
     {res : State × SharedFrameResult}
     (heq : processUnaryRequestData state frame = .ok res) :
     res.1.inboundConnectionWindow = state.inboundConnectionWindow
@@ -4581,7 +4581,7 @@ private theorem processUnaryRequestData_windows {state : State} {frame : Frame}
 /-- The streaming DATA path restores the connection window exactly and leaves
 the stream window short by exactly the post-padding payload — the bytes whose
 credit is deferred until the handler consumes the messages they carry. -/
-private theorem processActiveRequestData_windows {registry : Registry} {state : State}
+theorem processActiveRequestData_windows {registry : Registry} {state : State}
     {frame : Frame} {active : ActiveRequestStream} {res : State × SharedFrameResult}
     (heq : processActiveRequestData registry state frame active = .ok res) :
     res.1.inboundConnectionWindow = state.inboundConnectionWindow := by
@@ -4618,7 +4618,7 @@ private theorem processActiveRequestData_windows {registry : Registry} {state : 
 
 /-- Total bytes of stream-window credit queued for messages the handler has
 not consumed yet. -/
-private def creditSum (credits : Array Nat) : Nat := credits.foldl (· + ·) 0
+def creditSum (credits : Array Nat) : Nat := credits.foldl (· + ·) 0
 
 private theorem foldl_add_init : ∀ (l : List Nat) (init : Nat),
     l.foldl (· + ·) init = init + l.foldl (· + ·) 0 := by
@@ -4647,7 +4647,7 @@ private theorem creditSum_messages (messages : Array Message) :
 /-- Nothing is lost between the wire and the deferred-credit queue: every byte
 the DATA frame delivered is either queued as credit for a message the decoder
 completed, or still buffered as the prefix of an incomplete one. -/
-private theorem decodeActiveRequestData_conserves {registry : Registry}
+theorem decodeActiveRequestData_conserves {registry : Registry}
     {active active' : ActiveRequestStream} {frame : Frame}
     {messages : Array ByteArray} {close : Bool}
     (h : decodeActiveRequestData registry active frame = .ok (active', messages, close)) :
@@ -4682,7 +4682,7 @@ private theorem decodeActiveRequestData_conserves {registry : Registry}
 /-- Consuming one message returns exactly the credit that was queued for it:
 the stream's receive window grows by the amount the WINDOW_UPDATE carries, and
 by nothing else. -/
-private theorem takeRequestStreamCredit_conserves (state : State) (streamId : Nat) :
+theorem takeRequestStreamCredit_conserves (state : State) (streamId : Nat) :
     inboundStreamWindow (takeRequestStreamCredit state streamId).1 streamId
       = inboundStreamWindow state streamId + (takeRequestStreamCredit state streamId).2 := by
   unfold takeRequestStreamCredit
@@ -4709,7 +4709,7 @@ private theorem takeRequestStreamCredit_queued {state : State} {streamId : Nat}
 /-! ### Outbound conservation -/
 
 /-- Flow-controlled bytes in a batch of frames: only DATA is flow-controlled. -/
-private def dataPayloadBytes (frames : Array Frame) : Nat :=
+def dataPayloadBytes (frames : Array Frame) : Nat :=
   frames.foldl (fun total frame =>
     total + (if frame.header.frameType == FrameType.data then frame.payload.size else 0)) 0
 
@@ -4730,7 +4730,7 @@ private theorem cleanupOutboundIfEndStream_outboundConnectionWindow (state : Sta
 the wire is debited from the outbound connection window, and nothing else is.
 The `Nat` equation also witnesses that the window subtraction never truncated,
 so we never send more than the peer granted. -/
-private theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
+theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
     (flushOutbound state emitted).1.outboundConnectionWindow
         + dataPayloadBytes (flushOutbound state emitted).2
       = state.outboundConnectionWindow + dataPayloadBytes emitted := by

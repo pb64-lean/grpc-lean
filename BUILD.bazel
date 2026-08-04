@@ -7,7 +7,7 @@ The public API lives in defs.bzl; this file marks the module root package so tha
 
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library", "lean_test")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("//:defs.bzl", "lean_proto_library")
 
@@ -72,6 +72,89 @@ lean_library(
     deps = [
         "@tls13_lean//Tls:tls",
     ],
+)
+
+# Compile-time audit of everything this repository proves and of where its
+# trusted C boundary sits. The principal theorems must exist, be theorems, and
+# close over no axiom beyond the standard three; nothing in `Grpc.*` or `Zlib.*`
+# may reach `sorryAx`; and `@[extern]` may appear only in `Zlib.Gzip`, which is
+# the mechanical form of the README's claim that the zlib shim is the only C
+# this repository adds to its trusted computing base.
+#
+# `allowed_axioms` is deliberately the bare standard three. No proof here uses
+# `bv_decide`, so no generated LRAT-certificate axiom
+# (`<lemma>._native.bv_decide.ax_1_5`) exists to allow; reaching for it in a
+# proof a principal theorem depends on fails this audit, which is the point.
+lean_assurance_test(
+    name = "grpc_assurance",
+    allowed_axioms = [
+        "propext",
+        "Classical.choice",
+        "Quot.sound",
+    ],
+    allowed_extern_modules = ["Zlib.Gzip"],
+    module_prefixes = [
+        "Grpc",
+        "Zlib",
+    ],
+    principal_theorems = [
+        # Registry: well-formedness holds of the empty registry, is preserved by
+        # checked registration, and makes method lookup unambiguous.
+        "Grpc.Registry.empty_wellFormed",
+        "Grpc.Registry.registerChecked_wellFormed",
+        "Grpc.Registry.wellFormed_entry_unique",
+        # Authorization before body: a stream rejected at HEADERS feeds no body
+        # to a handler and dispatches none, over any trace of non-header frames.
+        "Grpc.Http2.Connection.rejectStreamAtHeaders_inert",
+        "Grpc.Http2.Connection.rejectStreamAtHeaders_frameTrace_no_dispatch",
+        "Grpc.Http2.Connection.processDataShared_inert_reset",
+        # Connection.WellFormed: holds initially and is preserved by every pure
+        # frame transition.
+        "Grpc.Http2.Connection.initialState_wellFormed",
+        "Grpc.Http2.Connection.prepareHeadersShared_wellFormed",
+        "Grpc.Http2.Connection.appendContinuationFrame_wellFormed",
+        "Grpc.Http2.Connection.processNonHeaderFrameShared_wellFormed",
+        "Grpc.Http2.Connection.prepareHeadersShared_no_reopen",
+        "Grpc.Http2.Connection.prepareHeadersShared_concurrency",
+        # Flow control: conservation, and the deadlock-freedom argument for
+        # credit-on-consume.
+        "Grpc.Http2.Connection.consumeInboundDataWindow_conserves",
+        "Grpc.Http2.Connection.processUnaryRequestData_windows",
+        "Grpc.Http2.Connection.processActiveRequestData_windows",
+        "Grpc.Http2.Connection.decodeActiveRequestData_conserves",
+        "Grpc.Http2.Connection.takeRequestStreamCredit_conserves",
+        "Grpc.Http2.Connection.flushOutbound_conserves",
+        "Grpc.Http2.Connection.defaultStreamWindow_admits_max_message",
+        "Grpc.Http2.Connection.inboundWindow_pos_of_incomplete",
+        # Codec laws, every one the README names.
+        "Grpc.Http2.Hpack.decodeHuffman_encodeHuffman",
+        "Grpc.Http2.Hpack.decodeString_encodeString",
+        "Grpc.Http2.Hpack.decodeInteger_encodeInteger",
+        "Grpc.Http2.Hpack.huffmanPrefixFree",
+        "Grpc.Http2.Frame.decodeAll_encode_append",
+        "Grpc.Http2.Frame.decodeHeader_encodeHeader_append",
+        "Grpc.Message.decodeAll_encode_append",
+        "Grpc.Message.decodeAllWithLimit_size_le",
+        "Grpc.Percent.decode_encode",
+        "Grpc.Timeout.parse?_render",
+        "Grpc.Timeout.parse?_render_ofNanoseconds",
+        "Grpc.Base64.decodeBytes_encodeBytes",
+        "Grpc.Base64.decodeBytes_encodeBytesUnpadded",
+    ],
+    deps = [
+        ":grpc_lean",
+        "//Zlib:zlib",
+    ],
+)
+
+# The TLS-facing layer declares no C of its own: every cryptographic primitive
+# it reaches comes from tls13-lean's own audited HaclStar boundary, so no
+# `@[extern]` may appear under `Grpc.Tls`.
+lean_assurance_test(
+    name = "grpc_tls_assurance",
+    allowed_extern_modules = [],
+    module_prefixes = ["Grpc.Tls"],
+    deps = [":grpc_tls"],
 )
 
 lean_test(
