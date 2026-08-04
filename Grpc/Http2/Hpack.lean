@@ -74,7 +74,7 @@ structure StringResult where
 
 private def huffmanEOSSymbol : Nat := 256
 
-private def huffmanCodes : Array Nat := #[
+def huffmanCodes : Array Nat := #[
   0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
   0xfffffe8, 0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec,
   0xfffffed, 0xfffffee, 0xfffffef, 0xffffff0, 0xffffff1, 0xffffff2, 0x3ffffffe, 0xffffff3,
@@ -110,7 +110,7 @@ private def huffmanCodes : Array Nat := #[
   0x3fffffff
 ]
 
-private def huffmanCodeLengths : Array Nat := #[
+def huffmanCodeLengths : Array Nat := #[
   13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
   28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
   6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
@@ -130,7 +130,7 @@ private def huffmanCodeLengths : Array Nat := #[
   30
 ]
 
-private def findHuffmanSymbol? (code bits i : Nat) : Option Nat :=
+def findHuffmanSymbol? (code bits i : Nat) : Option Nat :=
   if i >= huffmanCodes.size then
     none
   else if huffmanCodes[i]! == code && huffmanCodeLengths[i]! == bits then
@@ -533,7 +533,12 @@ def encodeHeaderBlock (state : State) (headers : Array Header) : Except Status (
   the accounted table size (RFC 7541 §4.1: name + value bytes + 32 per
   entry) never exceeds the applicable maximum.
 * `huffmanPrefixFree` — the fixed 257-entry Huffman table is prefix-free
-  (`huffmanPrefixFreeCheck` spells out the pairwise bit-prefix test).
+  (`pairwiseNoBitPrefix` spells out the pairwise bit-prefix test), with
+  `huffmanCode_not_bitPrefix` reading it off at a pair of table indices and
+  `findHuffmanSymbol?_proper_prefix_eq_none` turning it into the property
+  the bit-serial decoder needs: the table search returns `none` at every
+  position strictly inside a symbol's code, so decoding cannot stop early.
+  The full Huffman `decode ∘ encode` roundtrip is not proved yet.
 -/
 
 private theorem getElem_push_eq (a : ByteArray) (x : UInt8)
@@ -943,6 +948,110 @@ Huffman decoder can never confuse one symbol's code with the start of
 another's. -/
 theorem huffmanPrefixFree : pairwiseNoBitPrefix huffmanCodeTable = true := by
   decide
+
+/-- A successful table search returns an in-range index whose code and length
+are exactly the ones searched for. -/
+private theorem findHuffmanSymbol?_eq_some (code bits i : Nat) :
+    ∀ j, findHuffmanSymbol? code bits i = some j ->
+      j < huffmanCodes.size ∧ huffmanCodes[j]! = code ∧ huffmanCodeLengths[j]! = bits := by
+  fun_induction findHuffmanSymbol? code bits i
+  next i hge =>
+    intro j hj
+    cases hj
+  next i hge hmatch =>
+    intro j hj
+    injection hj with hji
+    subst hji
+    simp only [Bool.and_eq_true, beq_iff_eq] at hmatch
+    exact ⟨by omega, hmatch.1, hmatch.2⟩
+  next i hge hmatch ih => exact ih
+
+/-- The pairwise prefix-freeness check, read off at a pair of distinct
+indices. -/
+private theorem pairwiseNoBitPrefix_getElem :
+    ∀ {l : List (Nat × Nat)}, pairwiseNoBitPrefix l = true ->
+      ∀ (i j : Nat) (hi : i < l.length) (hj : j < l.length), i ≠ j ->
+        isBitPrefix l[i].2 l[i].1 l[j].2 l[j].1 = false := by
+  intro l
+  induction l with
+  | nil => intro _ i j hi; exact absurd hi (by simp)
+  | cons head tail ih =>
+      intro h i j hi hj hij
+      rw [pairwiseNoBitPrefix] at h
+      simp only [Bool.and_eq_true] at h
+      obtain ⟨hall, htail⟩ := h
+      have hallmem : ∀ x ∈ tail,
+          (!isBitPrefix head.2 head.1 x.2 x.1 && !isBitPrefix x.2 x.1 head.2 head.1) = true := by
+        intro x hx
+        have := List.all_eq_true.mp hall x hx
+        simpa using this
+      match i, j with
+      | 0, 0 => exact absurd rfl hij
+      | 0, j + 1 =>
+          have hjt : j < tail.length := by simpa using hj
+          have := hallmem tail[j] (List.getElem_mem hjt)
+          simp only [Bool.and_eq_true, Bool.not_eq_true'] at this
+          simpa using this.1
+      | i + 1, 0 =>
+          have hit : i < tail.length := by simpa using hi
+          have := hallmem tail[i] (List.getElem_mem hit)
+          simp only [Bool.and_eq_true, Bool.not_eq_true'] at this
+          simpa using this.2
+      | i + 1, j + 1 =>
+          have hit : i < tail.length := by simpa using hi
+          have hjt : j < tail.length := by simpa using hj
+          have := ih htail i j hit hjt (by omega)
+          simpa using this
+
+set_option maxRecDepth 8192 in
+private theorem huffmanCodeLengths_size : huffmanCodeLengths.size = huffmanCodes.size := by
+  rfl
+
+private theorem huffmanCodeTable_length : huffmanCodeTable.length = huffmanCodes.size := by
+  rw [huffmanCodeTable, List.length_zip, Array.length_toList, Array.length_toList,
+    huffmanCodeLengths_size, Nat.min_self]
+
+private theorem huffmanCodeTable_getElem {i : Nat} (h : i < huffmanCodeTable.length) :
+    huffmanCodeTable[i] = (huffmanCodes[i]!, huffmanCodeLengths[i]!) := by
+  have hi : i < huffmanCodes.size := by rw [huffmanCodeTable_length] at h; exact h
+  have hl : i < huffmanCodeLengths.size := by rw [huffmanCodeLengths_size]; exact hi
+  simp only [huffmanCodeTable, List.getElem_zip, Array.getElem_toList,
+    getElem!_pos huffmanCodes i hi, getElem!_pos huffmanCodeLengths i hl]
+
+/-- Prefix-freeness at a pair of distinct table indices. -/
+theorem huffmanCode_not_bitPrefix {i j : Nat} (hi : i < huffmanCodes.size)
+    (hj : j < huffmanCodes.size) (hij : i ≠ j) :
+    isBitPrefix huffmanCodeLengths[i]! huffmanCodes[i]! huffmanCodeLengths[j]! huffmanCodes[j]!
+      = false := by
+  have hi' : i < huffmanCodeTable.length := by rw [huffmanCodeTable_length]; exact hi
+  have hj' : j < huffmanCodeTable.length := by rw [huffmanCodeTable_length]; exact hj
+  have h := pairwiseNoBitPrefix_getElem huffmanPrefixFree i j hi' hj' hij
+  rwa [huffmanCodeTable_getElem hi', huffmanCodeTable_getElem hj'] at h
+
+/-- The decoder cannot stop early: no proper bit-prefix of an assigned
+Huffman code is itself an assigned code, so scanning bit by bit the table
+search returns `none` at every position strictly inside a symbol's code.
+This is the property `huffmanPrefixFree` buys the decoder. -/
+theorem findHuffmanSymbol?_proper_prefix_eq_none {i k : Nat} (hi : i < huffmanCodes.size)
+    (hk : k < huffmanCodeLengths[i]!) :
+    findHuffmanSymbol? (huffmanCodes[i]! / 2 ^ (huffmanCodeLengths[i]! - k)) k 0 = none := by
+  cases hfind : findHuffmanSymbol?
+      (huffmanCodes[i]! / 2 ^ (huffmanCodeLengths[i]! - k)) k 0 with
+  | none => rfl
+  | some j =>
+      obtain ⟨hj, hcode, hlen⟩ := findHuffmanSymbol?_eq_some _ _ _ j hfind
+      exfalso
+      have hne : j ≠ i := by
+        intro heq
+        rw [heq] at hlen
+        omega
+      have hpref : isBitPrefix huffmanCodeLengths[j]! huffmanCodes[j]!
+          huffmanCodeLengths[i]! huffmanCodes[i]! = true := by
+        rw [isBitPrefix, hcode, hlen]
+        simp only [Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
+        exact ⟨by omega, by first | rfl | trivial⟩
+      rw [huffmanCode_not_bitPrefix hj hi hne] at hpref
+      exact absurd hpref (by simp)
 
 end Hpack
 end Http2
