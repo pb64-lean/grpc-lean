@@ -43,7 +43,7 @@ flowchart TB
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout (plaintext managed path; see TLS limitations) |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
-| Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Each decision is commented at its check with the rule it follows |
+| Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Every connection-scoped framing check carries a comment naming the RFC rule it follows, including the two places where a rule that would permit a stream error is deliberately widened to a connection error and why |
 
 ## Server
 
