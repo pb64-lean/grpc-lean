@@ -152,6 +152,16 @@ lean_test(
 )
 
 lean_test(
+    name = "connection_lifecycle_test",
+    srcs = ["Test/ConnectionLifecycleTest.lean"],
+    # Loopback sockets are blocked in the darwin sandbox; run unsandboxed.
+    # In-process client+server; run exclusively so concurrent socket tests do not
+    # starve each other's worker pool (see the same-process handshake note).
+    tags = ["no-sandbox", "exclusive"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "hardening_test",
     srcs = ["Test/HardeningTest.lean"],
     deps = [":grpc_lean"],

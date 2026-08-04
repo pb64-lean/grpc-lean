@@ -65,5 +65,18 @@ def wait (server : Instance) : IO Unit :=
 def isShutdown (server : Instance) : IO Bool :=
   Http2.Server.isShutdown server
 
+/-- `some err` once the accept loop has died; `none` while it is alive.  A dead accept
+loop otherwise shows up only as clients hanging on connect. -/
+def acceptFailure? (server : Instance) : IO (Option IO.Error) :=
+  Http2.Server.acceptFailure? server
+
+/-- Still accepting connections?  Throws the accept loop's error if it died. -/
+def checkAccepting (server : Instance) : IO Bool :=
+  Http2.Server.checkAccepting server
+
+/-- Why the most recently finished connections finished. -/
+def closedConnections (server : Instance) : IO (Array Http2.Server.ClosedConnection) :=
+  Http2.Server.closedConnectionRecords server
+
 end Server
 end Grpc
