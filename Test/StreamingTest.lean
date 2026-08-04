@@ -248,23 +248,55 @@ def testTrailersOnlyViaHandle (client : Client.Connection) : Async Unit := do
   expectEq status.code Code.unimplemented "unknown method should be UNIMPLEMENTED"
   IO.println "trailers-only via handle ok"
 
+def describeCause : Http2.Server.CloseCause → String
+  | .peerClosed => "peerClosed"
+  | .serverShutdown => "serverShutdown"
+  | .keepaliveTimeout => "keepaliveTimeout"
+  | .protocolError status => s!"protocolError({status.messageD})"
+  | .transportError message => s!"transportError({message})"
+
+/-- What the server itself says about the connections it closed and about the health
+of its accept loop.  A client-side "connection closed by peer" is only half of the
+story; this is the other half, and it is why the failure below names a cause. -/
+def serverDiagnostics (server : Grpc.Server.Instance) : IO String := do
+  let closed ← Grpc.Server.closedConnections server
+  let causes := closed.map fun record => s!"#{record.id}:{describeCause record.cause}"
+  let accepting ← try
+      pure (toString (← Grpc.Server.checkAccepting server))
+    catch err =>
+      pure s!"threw {err}"
+  let failure ← match ← Grpc.Server.acceptFailure? server with
+    | none => pure "none"
+    | some err => pure (toString err)
+  pure s!"accepting={accepting} acceptFailure={failure} \
+    closed={closed.size} causes=[{String.intercalate ", " causes.toList}]"
+
 /-- Many simultaneously open connections: with the async server each idle connection
 suspends its event loop rather than parking a worker thread, so this should scale on
 a small pool. Runs an RPC on all of them concurrently, lets them all sit idle, then
 runs a second round to prove the idle loops are still live. -/
-def testManyConnections (port : UInt16) : IO Unit := do
+def testManyConnections (server : Grpc.Server.Instance) (port : UInt16) : IO Unit := do
   let n := 80
   let clients ← (Array.range n).mapM fun _ =>
     Client.connect { address := Http2.Server.loopback port }
-  let round (tag : String) : Async Unit := do
-    discard <| Async.concurrentlyAll <| clients.map fun client => do
+  let round (tag : String) : Async (Array (Option String)) := do
+    Async.concurrentlyAll <| clients.map fun client => do
       match ← Client.call client (pathOf "Echo") tag.toUTF8 with
-      | .error status => throw (IO.userError s!"many-connections {tag} failed: {status.messageD}")
+      | .error status => pure (some status.messageD)
       | .ok (_, data) =>
           if data != tag.toUTF8 then
-            throw (IO.userError s!"many-connections {tag} echoed wrong payload")
-  Async.block (round "round-one")
-  Async.block (round "round-two")
+            pure (some "echoed wrong payload")
+          else
+            pure none
+  let runRound (tag : String) : IO Unit := do
+    let outcomes := Async.block (round tag)
+    let failures := (← outcomes).filterMap id
+    unless failures.isEmpty do
+      let diagnostics ← serverDiagnostics server
+      throw (IO.userError s!"many-connections {tag} failed on \
+        {failures.size}/{n} connections: {failures[0]!} [server: {diagnostics}]")
+  runRound "round-one"
+  runRound "round-two"
   for client in clients do
     Client.close client
   IO.println s!"many connections ({n} open, two concurrent rounds) ok"
@@ -290,7 +322,7 @@ def main : IO Unit := do
   Async.block (testCancelMidStream client)
   Async.block (testHealthWatchRst client health)
   Async.block (testTrailersOnlyViaHandle client)
-  testManyConnections port
+  testManyConnections server port
 
   Client.close client
   Grpc.Server.shutdown server

@@ -611,8 +611,17 @@ private def initializeConnection
     tls := tls
   }
   try
-    startBackgroundTasks connection
+    -- The connection preface must be the first bytes this endpoint puts on the
+    -- wire (RFC 9113 §3.4), and the outbound channel is the only thing that
+    -- orders them.  So the preface is enqueued *before* the reader exists: the
+    -- server sends its own SETTINGS without waiting for ours, and a reader
+    -- started first can decode that SETTINGS and enqueue its ACK before this
+    -- line runs.  The peer then reads a SETTINGS ACK where the preface must be
+    -- and kills the connection — a race whose window is exactly the scheduling
+    -- delay between spawning the reader and enqueuing here, so it appears only
+    -- under load and only on some connections.
     enqueueBytes connection prefaceWire
+    startBackgroundTasks connection
     pure connection
   catch error =>
     shutdownConnection connection
