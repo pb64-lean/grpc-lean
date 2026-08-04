@@ -126,6 +126,28 @@ def testMissingAndWrongRejectAtHeaders : IO Unit := do
     expect (status.message == some "invalid local access token")
       s!"wrong early authentication detail: {status.message}"
 
+def testRejectResultIsEarlyStatus : IO Unit := do
+  let handlerCalls ← IO.mkRef 0
+  let registry := Registry.empty
+    |>.registerUnary method (fun request => do
+      handlerCalls.modify (fun calls => calls + 1)
+      pure { data := request.data, status := Status.ok })
+    |>.withRequestHeaderAuthorizer (fun _ _ =>
+      pure (.reject (Status.error .permissionDenied "token lacks scope")))
+  let headers ← headersFrame (some "TestScheme local-test-token")
+  let (state, emitted) ← expectOk
+    (← Http2.Connection.processFrame registry readyState headers)
+    "process authorizer reject result"
+  let status ← rejectedStatus emitted
+  expect (status.code == .permissionDenied)
+    s!"reject result returned the wrong status: {status.code}"
+  expect (status.message == some "token lacks scope")
+    s!"reject result returned the wrong detail: {status.message}"
+  expect (state.ignoredInboundStreams.contains 1)
+    "reject result did not put the request body in drain-only state"
+  expect ((← handlerCalls.get) == 0)
+    "reject result entered the handler"
+
 def testAuthorizerResourceFailureIsEarlyStatus : IO Unit := do
   let handlerCalls ← IO.mkRef 0
   let registry := Registry.empty
@@ -320,6 +342,7 @@ end Test.EarlyAuthentication
 
 def main : IO Unit := do
   Test.EarlyAuthentication.testMissingAndWrongRejectAtHeaders
+  Test.EarlyAuthentication.testRejectResultIsEarlyStatus
   Test.EarlyAuthentication.testAuthorizerResourceFailureIsEarlyStatus
   Test.EarlyAuthentication.testMalformedUnauthenticatedBodyCannotOverrideStatus
   Test.EarlyAuthentication.testOversizedUnauthenticatedBodyCannotOverrideStatus
