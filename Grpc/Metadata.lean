@@ -99,7 +99,8 @@ private def alphabet : Array UInt8 :=
 private def alphabetByte (i : Nat) : UInt8 :=
   alphabet[i]!
 
-private def padByte : UInt8 := 61
+private def alphabetChar (i : Nat) : Char :=
+  Char.ofNat (alphabetByte i).toNat
 
 private def decodeChar? (c : Char) : Option Nat :=
   if 'A' <= c && c <= 'Z' then
@@ -115,41 +116,30 @@ private def decodeChar? (c : Char) : Option Nat :=
   else
     none
 
-private partial def encodeLoop (bytes : ByteArray) (i : Nat) (out : ByteArray) : ByteArray :=
+private def encodeLoop (bytes : ByteArray) (i : Nat) : List Char :=
   if h : i < bytes.size then
-    let b0 := bytes[i]
     if h1 : i + 1 < bytes.size then
-      let b1 := bytes[i + 1]
       if h2 : i + 2 < bytes.size then
-        let b2 := bytes[i + 2]
-        let n0 := b0.toNat
-        let n1 := b1.toNat
-        let n2 := b2.toNat
-        let out := out.push (alphabetByte (n0 / 4))
-        let out := out.push (alphabetByte (((n0 % 4) * 16) + (n1 / 16)))
-        let out := out.push (alphabetByte (((n1 % 16) * 4) + (n2 / 64)))
-        let out := out.push (alphabetByte (n2 % 64))
-        encodeLoop bytes (i + 3) out
+        alphabetChar (bytes[i].toNat / 4)
+          :: alphabetChar (((bytes[i].toNat % 4) * 16) + (bytes[i + 1].toNat / 16))
+          :: alphabetChar (((bytes[i + 1].toNat % 16) * 4) + (bytes[i + 2].toNat / 64))
+          :: alphabetChar (bytes[i + 2].toNat % 64)
+          :: encodeLoop bytes (i + 3)
       else
-        let n0 := b0.toNat
-        let n1 := b1.toNat
-        let out := out.push (alphabetByte (n0 / 4))
-        let out := out.push (alphabetByte (((n0 % 4) * 16) + (n1 / 16)))
-        let out := out.push (alphabetByte ((n1 % 16) * 4))
-        out.push padByte
+        [alphabetChar (bytes[i].toNat / 4),
+          alphabetChar (((bytes[i].toNat % 4) * 16) + (bytes[i + 1].toNat / 16)),
+          alphabetChar ((bytes[i + 1].toNat % 16) * 4), '=']
     else
-      let n0 := b0.toNat
-      let out := out.push (alphabetByte (n0 / 4))
-      let out := out.push (alphabetByte ((n0 % 4) * 16))
-      let out := out.push padByte
-      out.push padByte
+      [alphabetChar (bytes[i].toNat / 4), alphabetChar ((bytes[i].toNat % 4) * 16), '=', '=']
   else
-    out
+    []
+  termination_by bytes.size - i
+  decreasing_by omega
 
 def encodeBytes (bytes : ByteArray) : String :=
-  String.fromUTF8! (encodeLoop bytes 0 ByteArray.empty)
+  String.ofList (encodeLoop bytes 0)
 
-private partial def dropLeadingPadding : List Char -> List Char
+private def dropLeadingPadding : List Char -> List Char
   | '=' :: rest => dropLeadingPadding rest
   | chars => chars
 
@@ -168,7 +158,7 @@ private def decodeQuad (a b : Nat) (c d : Option Nat) : ByteArray :=
           let byte2 := UInt8.ofNat (((c % 4) * 64) + d)
           ByteArray.empty.push byte0 |>.push byte1 |>.push byte2
 
-private partial def decodeLoop (chars : List Char) (out : ByteArray) : Except String ByteArray :=
+private def decodeLoop (chars : List Char) (out : ByteArray) : Except String ByteArray :=
   match chars with
   | [] => .ok out
   | a :: b :: c :: d :: rest =>

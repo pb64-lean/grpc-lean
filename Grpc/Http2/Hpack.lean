@@ -26,45 +26,46 @@ structure IntegerResult where
 private def prefixMax (prefixBits : Nat) : Nat :=
   (2 ^ prefixBits) - 1
 
-private partial def encodeIntegerRest (value : Nat) (out : ByteArray) : ByteArray :=
+private def encodeIntegerRest (value : Nat) (out : ByteArray) : ByteArray :=
   if value >= 128 then
     encodeIntegerRest (value / 128) (out.push (UInt8.ofNat ((value % 128) + 128)))
   else
     out.push (UInt8.ofNat value)
+  termination_by value
+  decreasing_by omega
 
 def encodeInteger (prefixBits : Nat) (prefixMask : Nat) (value : Nat) :
-    Except Status ByteArray := do
+    Except Status ByteArray :=
   if prefixBits == 0 || prefixBits > 8 then
-    throw (Status.internal "HPACK integer prefix width must be between 1 and 8 bits")
-  let max := prefixMax prefixBits
-  if value < max then
-    pure (ByteArray.empty.push (UInt8.ofNat (prefixMask + value)))
+    .error (Status.internal "HPACK integer prefix width must be between 1 and 8 bits")
+  else if value < prefixMax prefixBits then
+    .ok (ByteArray.empty.push (UInt8.ofNat (prefixMask + value)))
   else
-    pure (encodeIntegerRest (value - max) (ByteArray.empty.push (UInt8.ofNat (prefixMask + max))))
+    .ok (encodeIntegerRest (value - prefixMax prefixBits)
+      (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits))))
 
-private partial def decodeIntegerRest (bytes : ByteArray) (offset value shift : Nat) :
-    Except Status IntegerResult := do
+private def decodeIntegerRest (bytes : ByteArray) (offset value shift : Nat) :
+    Except Status IntegerResult :=
   if offset >= bytes.size then
-    throw (Status.internal "truncated HPACK integer")
-  let byte := bytes[offset]!.toNat
-  let value := value + ((byte % 128) * (2 ^ shift))
-  if byte < 128 then
-    pure { value := value, next := offset + 1 }
+    .error (Status.internal "truncated HPACK integer")
+  else if bytes[offset]!.toNat < 128 then
+    .ok { value := value + ((bytes[offset]!.toNat % 128) * (2 ^ shift)), next := offset + 1 }
   else
-    decodeIntegerRest bytes (offset + 1) value (shift + 7)
+    decodeIntegerRest bytes (offset + 1)
+      (value + ((bytes[offset]!.toNat % 128) * (2 ^ shift))) (shift + 7)
+  termination_by bytes.size - offset
+  decreasing_by omega
 
 def decodeInteger (prefixBits : Nat) (bytes : ByteArray) (offset : Nat) :
-    Except Status IntegerResult := do
+    Except Status IntegerResult :=
   if prefixBits == 0 || prefixBits > 8 then
-    throw (Status.internal "HPACK integer prefix width must be between 1 and 8 bits")
-  if offset >= bytes.size then
-    throw (Status.internal "missing HPACK integer")
-  let max := prefixMax prefixBits
-  let value := bytes[offset]!.toNat % (2 ^ prefixBits)
-  if value < max then
-    pure { value := value, next := offset + 1 }
+    .error (Status.internal "HPACK integer prefix width must be between 1 and 8 bits")
+  else if offset >= bytes.size then
+    .error (Status.internal "missing HPACK integer")
+  else if bytes[offset]!.toNat % (2 ^ prefixBits) < prefixMax prefixBits then
+    .ok { value := bytes[offset]!.toNat % (2 ^ prefixBits), next := offset + 1 }
   else
-    decodeIntegerRest bytes (offset + 1) max 0
+    decodeIntegerRest bytes (offset + 1) (prefixMax prefixBits) 0
 
 structure StringResult where
   value : String
@@ -200,30 +201,38 @@ values costs CPU for little relative gain, and header fields this large are
 dominated by frame overhead anyway. -/
 def huffmanMaxEncodeLength : Nat := 1024
 
-def encodeString (value : String) : Except Status ByteArray := do
+def encodeString (value : String) : Except Status ByteArray :=
   let bytes := value.toUTF8
   let huffman :=
     if bytes.size <= huffmanMaxEncodeLength then encodeHuffman bytes else bytes
   if huffman.size < bytes.size then
-    let prefixBytes ← encodeInteger 7 128 huffman.size
-    pure (prefixBytes.append huffman)
+    match encodeInteger 7 128 huffman.size with
+    | .error status => .error status
+    | .ok prefixBytes => .ok (prefixBytes.append huffman)
   else
-    let prefixBytes ← encodeInteger 7 0 bytes.size
-    pure (prefixBytes.append bytes)
+    match encodeInteger 7 0 bytes.size with
+    | .error status => .error status
+    | .ok prefixBytes => .ok (prefixBytes.append bytes)
 
-def decodeString (bytes : ByteArray) (offset : Nat) : Except Status StringResult := do
+def decodeString (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
   if offset >= bytes.size then
-    throw (Status.internal "missing HPACK string")
-  let huffman := bytes[offset]!.toNat >= 128
-  let length ← decodeInteger 7 bytes offset
-  let endPos := length.next + length.value
-  if endPos > bytes.size then
-    throw (Status.internal "truncated HPACK string")
-  let raw := bytes.extract length.next endPos
-  let raw ← if huffman then decodeHuffman raw else pure raw
-  match String.fromUTF8? raw with
-  | some decoded => pure { value := decoded, next := endPos }
-  | none => throw (Status.internal "HPACK string is not valid UTF-8")
+    .error (Status.internal "missing HPACK string")
+  else
+    match decodeInteger 7 bytes offset with
+    | .error status => .error status
+    | .ok length =>
+        if length.next + length.value > bytes.size then
+          .error (Status.internal "truncated HPACK string")
+        else
+          match (if bytes[offset]!.toNat >= 128 then
+              decodeHuffman (bytes.extract length.next (length.next + length.value))
+            else
+              .ok (bytes.extract length.next (length.next + length.value))) with
+          | .error status => .error status
+          | .ok raw =>
+              match String.fromUTF8? raw with
+              | some decoded => .ok { value := decoded, next := length.next + length.value }
+              | none => .error (Status.internal "HPACK string is not valid UTF-8")
 
 def staticEntries : Array Header :=
   #[
@@ -299,13 +308,18 @@ def entrySize (header : Header) : Nat :=
 def dynamicSize (entries : Array Header) : Nat :=
   entries.foldl (fun size header => size + entrySize header) 0
 
-private partial def evictTo (maxSize : Nat) (entries : Array Header) : Array Header :=
+private def evictTo (maxSize : Nat) (entries : Array Header) : Array Header :=
   if dynamicSize entries <= maxSize then
     entries
-  else if entries.isEmpty then
+  else if hempty : entries.isEmpty then
     entries
   else
     evictTo maxSize entries.pop
+  termination_by entries.size
+  decreasing_by
+    simp only [Array.isEmpty, decide_eq_true_eq] at hempty
+    simp only [Array.size_pop]
+    omega
 
 private def prepend (header : Header) (entries : Array Header) : Array Header :=
   entries.foldl (fun acc entry => acc.push entry) #[header]
@@ -483,6 +497,304 @@ def encodeHeaderBlock (state : State) (headers : Array Header) : Except Status (
   headers.foldlM (init := (out, state)) fun (out, state) header => do
     let (encoded, state) ← encodeHeader state header
     pure (out.append encoded, state)
+
+/-!
+### Codec laws
+
+* `decodeInteger_encodeInteger` — HPACK integer roundtrip with residual
+  bytes: decoding `encodeInteger prefixBits prefixMask value ++ rest` at
+  offset 0 recovers `value` and stops exactly at the encoded length, for any
+  prefix mask that leaves the low `prefixBits` bits clear and fits with the
+  filled prefix in one byte (every call site in this file satisfies both).
+* `dynamicSize_resize_le` / `dynamicSize_insert_le` /
+  `dynamicSize_resizeChecked_le` / `dynamicSize_setMaxAllowedSize_le` — the
+  dynamic-table size invariant: after any resize, insert, or checked resize
+  the accounted table size (RFC 7541 §4.1: name + value bytes + 32 per
+  entry) never exceeds the applicable maximum.
+* `huffmanPrefixFree` — the fixed 257-entry Huffman table is prefix-free
+  (`huffmanPrefixFreeCheck` spells out the pairwise bit-prefix test).
+-/
+
+private theorem getElem_push_eq (a : ByteArray) (x : UInt8)
+    {h : a.size < (a.push x).size} : (a.push x)[a.size] = x := by
+  rcases a with ⟨data⟩
+  show (Array.push data x)[data.size] = x
+  exact Array.getElem_push_eq ..
+
+private theorem getElem_push_lt (a : ByteArray) (x : UInt8) (i : Nat) (hi : i < a.size)
+    {h : i < (a.push x).size} : (a.push x)[i] = a[i] := by
+  rcases a with ⟨data⟩
+  show (Array.push data x)[i] = data[i]
+  exact Array.getElem_push_lt hi
+
+private theorem encodeIntegerRest_size_lt (value : Nat) (out : ByteArray) :
+    out.size < (encodeIntegerRest value out).size := by
+  fun_induction encodeIntegerRest value out
+  next value out h ih =>
+    have hpush : (out.push (UInt8.ofNat (value % 128 + 128))).size = out.size + 1 :=
+      ByteArray.size_push
+    omega
+  next value out h =>
+    simp [ByteArray.size_push]
+
+private theorem encodeIntegerRest_getElem_prefix (value : Nat) (out : ByteArray) :
+    ∀ (i : Nat) (hi : i < out.size),
+      ∀ {h : i < (encodeIntegerRest value out).size},
+        (encodeIntegerRest value out)[i] = out[i]'hi := by
+  fun_induction encodeIntegerRest value out
+  next value out hge ih =>
+    intro i hi h
+    have hpush : (out.push (UInt8.ofNat (value % 128 + 128))).size = out.size + 1 :=
+      ByteArray.size_push
+    have step := ih i (by omega) (h := h)
+    rw [step, getElem_push_lt _ _ _ hi]
+  next value out hlt =>
+    intro i hi h
+    exact getElem_push_lt _ _ _ hi
+
+/-- Decoding the continuation bytes emitted by `encodeIntegerRest` recovers
+the encoded value scaled into the accumulator, and stops exactly at the end
+of the emitted bytes. -/
+private theorem decodeIntegerRest_encodeIntegerRest (value : Nat) (out : ByteArray) :
+    ∀ (rest : ByteArray) (base shift : Nat),
+      decodeIntegerRest (encodeIntegerRest value out ++ rest) out.size base shift
+        = .ok { value := base + value * 2 ^ shift,
+                next := (encodeIntegerRest value out).size } := by
+  fun_induction encodeIntegerRest value out
+  next value out hge ih =>
+    intro rest base shift
+    have hb : UInt8.ofNat (value % 128 + 128) = UInt8.ofNat (value % 128 + 128) := rfl
+    generalize hbdef : UInt8.ofNat (value % 128 + 128) = b at *
+    have hpush : (out.push b).size = out.size + 1 := ByteArray.size_push
+    have hsize : (out.push b).size < (encodeIntegerRest (value / 128) (out.push b)).size :=
+      encodeIntegerRest_size_lt ..
+    have happsz : (encodeIntegerRest (value / 128) (out.push b) ++ rest).size
+        = (encodeIntegerRest (value / 128) (out.push b)).size + rest.size :=
+      ByteArray.size_append
+    have hbyte : (encodeIntegerRest (value / 128) (out.push b) ++ rest)[out.size]!
+        = b := by
+      rw [getElem!_pos (encodeIntegerRest (value / 128) (out.push b) ++ rest) out.size
+        (by omega)]
+      rw [ByteArray.getElem_append_left (by omega)]
+      rw [encodeIntegerRest_getElem_prefix (value / 128) (out.push b) out.size (by omega)]
+      exact getElem_push_eq ..
+    have hbn : b.toNat = value % 128 + 128 := by
+      rw [← hbdef]
+      simp only [UInt8.toNat_ofNat', Nat.reducePow]
+      omega
+    rw [decodeIntegerRest.eq_def]
+    rw [if_neg (by omega)]
+    rw [hbyte]
+    rw [if_neg (by omega)]
+    have hmod : (b.toNat % 128) = value % 128 := by omega
+    rw [hmod]
+    have hoff : out.size + 1 = (out.push b).size := hpush.symm
+    rw [hoff, ih rest (base + value % 128 * 2 ^ shift) (shift + 7)]
+    have harith : base + value % 128 * 2 ^ shift + value / 128 * 2 ^ (shift + 7)
+        = base + value * 2 ^ shift := by
+      rw [Nat.pow_add]
+      have h1 : value / 128 * (2 ^ shift * 2 ^ 7) = value / 128 * 2 ^ 7 * 2 ^ shift := by
+        rw [Nat.mul_comm (2 ^ shift) (2 ^ 7), ← Nat.mul_assoc]
+      rw [h1, Nat.add_assoc, ← Nat.add_mul]
+      have h2 : value % 128 + value / 128 * 2 ^ 7 = value := by
+        simp only [Nat.reducePow]
+        omega
+      rw [h2]
+    rw [harith]
+  next value out hlt =>
+    intro rest base shift
+    generalize hbdef : UInt8.ofNat value = b at *
+    have hpush : (out.push b).size = out.size + 1 := ByteArray.size_push
+    have happsz : (out.push b ++ rest).size = (out.push b).size + rest.size :=
+      ByteArray.size_append
+    have hbyte : (out.push b ++ rest)[out.size]! = b := by
+      rw [getElem!_pos (out.push b ++ rest) out.size (by omega)]
+      rw [ByteArray.getElem_append_left (by omega)]
+      exact getElem_push_eq ..
+    have hbn : b.toNat = value := by
+      rw [← hbdef]
+      simp only [UInt8.toNat_ofNat', Nat.reducePow]
+      omega
+    rw [decodeIntegerRest.eq_def]
+    rw [if_neg (by omega)]
+    rw [hbyte]
+    rw [if_pos (by omega)]
+    have hmod : (b.toNat % 128) = value := by omega
+    rw [hmod, hpush.symm]
+
+/-- HPACK integer roundtrip with residual bytes: decoding
+`encodeInteger prefixBits prefixMask value ++ rest` at offset 0 recovers
+`value` and stops exactly at the end of the encoded bytes. The mask must
+leave the low `prefixBits` bits clear and fit in one byte together with the
+filled prefix; every encoder call site in this file satisfies both. -/
+theorem decodeInteger_encodeInteger {prefixBits prefixMask value : Nat}
+    {encoded : ByteArray}
+    (hmask : prefixMask % 2 ^ prefixBits = 0)
+    (hfits : prefixMask + 2 ^ prefixBits ≤ 256)
+    (henc : encodeInteger prefixBits prefixMask value = .ok encoded)
+    (rest : ByteArray) :
+    decodeInteger prefixBits (encoded ++ rest) 0
+      = .ok { value := value, next := encoded.size } := by
+  have hpm : prefixMax prefixBits = 2 ^ prefixBits - 1 := rfl
+  have hpow : 0 < 2 ^ prefixBits := Nat.two_pow_pos prefixBits
+  unfold encodeInteger at henc
+  split at henc
+  next => cases henc
+  next hguard =>
+    split at henc
+    next hsmall =>
+      cases henc
+      have hlt : prefixMask + value < 256 := by omega
+      have hb : (ByteArray.empty.push (UInt8.ofNat (prefixMask + value))).size = 1 := rfl
+      have happsz : (ByteArray.empty.push (UInt8.ofNat (prefixMask + value)) ++ rest).size
+          = 1 + rest.size := by
+        rw [ByteArray.size_append, hb]
+      have hbyte : (ByteArray.empty.push (UInt8.ofNat (prefixMask + value)) ++ rest)[(0 : Nat)]!
+          = UInt8.ofNat (prefixMask + value) := by
+        rw [getElem!_pos _ _ (by omega)]
+        rw [ByteArray.getElem_append_left (by omega)]
+        rfl
+      have hbn : (UInt8.ofNat (prefixMask + value)).toNat = prefixMask + value := by
+        simp only [UInt8.toNat_ofNat', Nat.reducePow]
+        omega
+      have hmod : (prefixMask + value) % 2 ^ prefixBits = value := by
+        rw [Nat.add_mod, hmask, Nat.zero_add, Nat.mod_mod]
+        exact Nat.mod_eq_of_lt (by omega)
+      unfold decodeInteger
+      rw [if_neg hguard]
+      rw [if_neg (by omega)]
+      rw [hbyte]
+      rw [hbn, hmod]
+      rw [if_pos (by omega)]
+      rw [hb]
+    next hbig =>
+      cases henc
+      have hfill : prefixMask + prefixMax prefixBits < 256 := by omega
+      have hb : (ByteArray.empty.push
+          (UInt8.ofNat (prefixMask + prefixMax prefixBits))).size = 1 := rfl
+      have hsz := encodeIntegerRest_size_lt (value - prefixMax prefixBits)
+        (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits)))
+      have happsz : (encodeIntegerRest (value - prefixMax prefixBits)
+            (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits)))
+          ++ rest).size
+          = (encodeIntegerRest (value - prefixMax prefixBits)
+              (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits)))).size
+            + rest.size :=
+        ByteArray.size_append
+      have hbyte : (encodeIntegerRest (value - prefixMax prefixBits)
+            (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits)))
+          ++ rest)[(0 : Nat)]!
+          = UInt8.ofNat (prefixMask + prefixMax prefixBits) := by
+        rw [getElem!_pos _ _ (by omega)]
+        rw [ByteArray.getElem_append_left (by omega)]
+        rw [encodeIntegerRest_getElem_prefix _ _ 0 (by omega)]
+        rfl
+      have hbn : (UInt8.ofNat (prefixMask + prefixMax prefixBits)).toNat
+          = prefixMask + prefixMax prefixBits := by
+        simp only [UInt8.toNat_ofNat', Nat.reducePow]
+        omega
+      have hmod : (prefixMask + prefixMax prefixBits) % 2 ^ prefixBits
+          = prefixMax prefixBits := by
+        rw [Nat.add_mod, hmask, Nat.zero_add, Nat.mod_mod]
+        exact Nat.mod_eq_of_lt (by omega)
+      unfold decodeInteger
+      rw [if_neg hguard]
+      rw [if_neg (by omega)]
+      rw [hbyte]
+      rw [hbn, hmod]
+      rw [if_neg (by omega)]
+      have hoff : (0 : Nat) + 1 = (ByteArray.empty.push
+          (UInt8.ofNat (prefixMask + prefixMax prefixBits))).size := by rw [hb]
+      rw [hoff]
+      rw [decodeIntegerRest_encodeIntegerRest (value - prefixMax prefixBits) _ rest
+        (prefixMax prefixBits) 0]
+      have hval : prefixMax prefixBits + (value - prefixMax prefixBits) * 2 ^ 0 = value := by
+        simp only [Nat.pow_zero, Nat.mul_one]
+        omega
+      rw [hval]
+
+/-!
+#### Dynamic-table size invariant
+-/
+
+private theorem dynamicSize_empty : dynamicSize #[] = 0 := rfl
+
+private theorem dynamicSize_evictTo_le (maxSize : Nat) (entries : Array Header) :
+    dynamicSize (evictTo maxSize entries) ≤ maxSize := by
+  fun_induction evictTo maxSize entries
+  next entries h => exact h
+  next entries h hempty =>
+    have hsz : entries.size = 0 := by
+      simpa [Array.isEmpty] using hempty
+    have hnil : entries = #[] := Array.size_eq_zero_iff.mp hsz
+    rw [hnil] at h
+    exact absurd (dynamicSize_empty ▸ Nat.zero_le maxSize) h
+  next entries h hempty ih => exact ih
+
+/-- After `resize`, the accounted dynamic-table size fits the new maximum. -/
+theorem dynamicSize_resize_le (state : State) (maxSize : Nat) :
+    dynamicSize (resize state maxSize).dynamic ≤ maxSize :=
+  dynamicSize_evictTo_le maxSize state.dynamic
+
+/-- After `insert`, the accounted dynamic-table size still fits the table
+maximum. -/
+theorem dynamicSize_insert_le (state : State) (header : Header) :
+    dynamicSize (insert state header).dynamic ≤ state.maxSize := by
+  unfold insert
+  split
+  next =>
+    show dynamicSize #[] ≤ state.maxSize
+    simp [dynamicSize_empty]
+  next => exact dynamicSize_evictTo_le ..
+
+/-- After a checked resize, the accounted dynamic-table size fits the newly
+requested maximum. -/
+theorem dynamicSize_resizeChecked_le {state state' : State} {maxSize : Nat}
+    (h : resizeChecked state maxSize = .ok state') :
+    dynamicSize state'.dynamic ≤ maxSize := by
+  unfold resizeChecked at h
+  simp only [pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    cases h
+    exact dynamicSize_resize_le ..
+
+/-- After acknowledging a peer's maximum, the accounted dynamic-table size
+fits the new maximum. -/
+theorem dynamicSize_setMaxAllowedSize_le (state : State) (maxSize : Nat) :
+    dynamicSize (setMaxAllowedSize state maxSize).dynamic ≤ maxSize :=
+  dynamicSize_resize_le state maxSize
+
+/-!
+#### Huffman table prefix-freeness
+-/
+
+/-- `code₁` (of bit length `len₁`) is a bit-prefix of `code₂` (of bit length
+`len₂`). -/
+def isBitPrefix (len₁ code₁ len₂ code₂ : Nat) : Bool :=
+  len₁ ≤ len₂ && code₂ / 2 ^ (len₂ - len₁) == code₁
+
+/-- The pairwise prefix-freeness test over a `(code, length)` table: no
+entry's code is a bit-prefix of a different entry's code. -/
+def pairwiseNoBitPrefix : List (Nat × Nat) -> Bool
+  | [] => true
+  | (code, len) :: tail =>
+      (tail.all fun (code', len') =>
+        !isBitPrefix len code len' code' && !isBitPrefix len' code' len code)
+        && pairwiseNoBitPrefix tail
+
+/-- The full 257-entry HPACK Huffman table paired as `(code, length)`. -/
+def huffmanCodeTable : List (Nat × Nat) :=
+  huffmanCodes.toList.zip huffmanCodeLengths.toList
+
+set_option maxRecDepth 4096 in
+/-- The fixed HPACK Huffman table (all 256 byte symbols plus EOS) is
+prefix-free: no assigned code is a bit-prefix of another entry's code, so a
+Huffman decoder can never confuse one symbol's code with the start of
+another's. -/
+theorem huffmanPrefixFree : pairwiseNoBitPrefix huffmanCodeTable = true := by
+  decide
 
 end Hpack
 end Http2

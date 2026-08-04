@@ -54,6 +54,17 @@ def nanoseconds : TimeoutUnit -> Nat
   | .microsecond => 1000
   | .nanosecond => 1
 
+def toChar : TimeoutUnit -> Char
+  | .hour => 'H'
+  | .minute => 'M'
+  | .second => 'S'
+  | .millisecond => 'm'
+  | .microsecond => 'u'
+  | .nanosecond => 'n'
+
+theorem ofChar?_toChar (unit : TimeoutUnit) : ofChar? unit.toChar = some unit := by
+  cases unit <;> rfl
+
 end TimeoutUnit
 
 structure Timeout where
@@ -69,7 +80,7 @@ private def digit? (c : Char) : Option Nat :=
   else
     none
 
-private partial def parseDigits (chars : List Char) (value : Nat) : Option Nat :=
+private def parseDigits (chars : List Char) (value : Nat) : Option Nat :=
   match chars with
   | [] => some value
   | c :: rest =>
@@ -95,6 +106,114 @@ def toNanoseconds (timeout : Timeout) : Nat :=
 
 def toMillisecondsCeil (timeout : Timeout) : Nat :=
   (timeout.toNanoseconds + 999999) / 1000000
+
+private def digitChar (n : Nat) : Char :=
+  Char.ofNat ('0'.toNat + n)
+
+private def renderDigits (n : Nat) : List Char :=
+  if n < 10 then
+    [digitChar n]
+  else
+    renderDigits (n / 10) ++ [digitChar (n % 10)]
+  termination_by n
+  decreasing_by omega
+
+/-- Render a timeout as its `grpc-timeout` header value (decimal digits
+followed by the unit character, e.g. `"250m"`). -/
+def render (timeout : Timeout) : String :=
+  String.ofList (renderDigits timeout.value ++ [timeout.unit.toChar])
+
+/-!
+### Codec laws
+
+`parse?_render`: rendering a timeout whose value is nonzero and fits the
+8-digit wire limit parses back to exactly that timeout.
+-/
+
+private theorem digit?_digitChar {n : Nat} (h : n < 10) : digit? (digitChar n) = some n :=
+  (by decide : ∀ i : Fin 10, digit? (digitChar i.val) = some i.val) ⟨n, h⟩
+
+private theorem parseDigits_append (l₁ l₂ : List Char) (value : Nat) :
+    parseDigits (l₁ ++ l₂) value
+      = match parseDigits l₁ value with
+        | some v => parseDigits l₂ v
+        | none => none := by
+  induction l₁ generalizing value with
+  | nil => rfl
+  | cons c rest ih =>
+      cases hd : digit? c with
+      | none => simp only [List.cons_append, parseDigits, hd]
+      | some d =>
+          simp only [List.cons_append, parseDigits, hd]
+          exact ih _
+
+/-- `10 ^ (number of decimal digits of n)`. -/
+private def pow10 (n : Nat) : Nat :=
+  if n < 10 then 10 else 10 * pow10 (n / 10)
+  termination_by n
+  decreasing_by omega
+
+private theorem parseDigits_renderDigits (n : Nat) :
+    ∀ value, parseDigits (renderDigits n) value = some (value * pow10 n + n) := by
+  fun_induction renderDigits n
+  next n h =>
+    intro value
+    simp only [parseDigits, digit?_digitChar h]
+    rw [pow10, if_pos h]
+  next n h ih =>
+    intro value
+    rw [parseDigits_append]
+    simp only [ih, parseDigits, digit?_digitChar (Nat.mod_lt n (by omega))]
+    conv => rhs; rw [pow10, if_neg h]
+    have hmul : value * (10 * pow10 (n / 10)) = value * pow10 (n / 10) * 10 := by
+      rw [Nat.mul_comm 10 (pow10 (n / 10)), ← Nat.mul_assoc]
+    rw [hmul]
+    exact congrArg some (by omega)
+
+private theorem renderDigits_ne_nil (n : Nat) : renderDigits n ≠ [] := by
+  rw [renderDigits]
+  split <;> simp
+
+private theorem renderDigits_length_le (k : Nat) :
+    ∀ {n : Nat}, n < 10 ^ (k + 1) -> (renderDigits n).length ≤ k + 1 := by
+  induction k with
+  | zero =>
+      intro n h
+      rw [renderDigits, if_pos (by omega)]
+      simp
+  | succ k ih =>
+      intro n h
+      rw [renderDigits]
+      split
+      next => simp
+      next h10 =>
+        rw [List.length_append]
+        have hdiv : n / 10 < 10 ^ (k + 1) := by
+          rw [Nat.pow_succ, Nat.mul_comm] at h
+          exact Nat.div_lt_of_lt_mul h
+        have := ih hdiv
+        simp only [List.length_cons, List.length_nil]
+        omega
+
+/-- Rendering roundtrip: a nonzero timeout value that fits the 8-digit wire
+limit parses back to exactly the same timeout. -/
+theorem parse?_render (timeout : Timeout) (hpos : timeout.value ≠ 0)
+    (hle : timeout.value ≤ 99999999) :
+    parse? timeout.render = some timeout := by
+  unfold parse? render
+  rw [String.toList_ofList, List.reverse_append]
+  simp only [List.reverse_cons, List.reverse_nil, List.nil_append, List.singleton_append,
+    List.reverse_reverse]
+  rw [if_neg (by
+    simp only [Bool.or_eq_true, not_or]
+    refine ⟨?_, ?_⟩
+    · simp [List.isEmpty_iff, renderDigits_ne_nil]
+    · have := renderDigits_length_le 7 (n := timeout.value) (by omega)
+      simp only [decide_eq_true_eq]
+      omega)]
+  rw [TimeoutUnit.ofChar?_toChar]
+  simp only [parseDigits_renderDigits, Nat.zero_mul, Nat.zero_add]
+  rw [if_neg (by simpa using hpos)]
 
 end Timeout
 
@@ -250,16 +369,24 @@ private def unreserved (byte : UInt8) : Bool :=
     || (0x61 <= n && n <= 0x7a)
     || n == 0x2d || n == 0x2e || n == 0x5f || n == 0x7e || n == 0x20
 
-def encode (message : String) : String :=
-  let bytes := message.toUTF8
-  let out := bytes.foldl (init := "") fun acc byte =>
-    if unreserved byte then
-      acc.push (Char.ofNat byte.toNat)
-    else
-      acc.push '%' |>.push (hexDigit (byte.toNat / 16)) |>.push (hexDigit (byte.toNat % 16))
-  out
+private def encodeByte (byte : UInt8) : List Char :=
+  if unreserved byte then
+    [Char.ofNat byte.toNat]
+  else
+    ['%', hexDigit (byte.toNat / 16), hexDigit (byte.toNat % 16)]
 
-private partial def decodeLoop (chars : List Char) (out : ByteArray) : Except String ByteArray :=
+private def encodeFrom (bytes : ByteArray) (i : Nat) : List Char :=
+  if h : i < bytes.size then
+    encodeByte bytes[i] ++ encodeFrom bytes (i + 1)
+  else
+    []
+  termination_by bytes.size - i
+  decreasing_by omega
+
+def encode (message : String) : String :=
+  String.ofList (encodeFrom message.toByteArray 0)
+
+private def decodeLoop (chars : List Char) (out : ByteArray) : Except String ByteArray :=
   match chars with
   | [] => .ok out
   | '%' :: a :: b :: rest =>
@@ -274,6 +401,115 @@ def decode (message : String) : Except String String := do
   match String.fromUTF8? bytes with
   | some value => pure value
   | none => throw "percent-decoded grpc-message is not valid UTF-8"
+
+/-!
+### Codec laws
+
+`decode_encode`: percent-decoding inverts percent-encoding for every string.
+-/
+
+set_option maxRecDepth 4096 in
+private theorem toUInt8_char_unreserved {byte : UInt8} (h : unreserved byte = true) :
+    (Char.ofNat byte.toNat).toUInt8 = byte := by
+  have := (by decide : ∀ i : Fin 256, unreserved (UInt8.ofNat i.val) = true →
+      (Char.ofNat (UInt8.ofNat i.val).toNat).toUInt8 = UInt8.ofNat i.val)
+    ⟨byte.toNat, by have := UInt8.toNat_lt byte; omega⟩
+  simp only [UInt8.ofNat_toNat] at this
+  exact this h
+
+set_option maxRecDepth 4096 in
+private theorem char_ne_percent_unreserved {byte : UInt8} (h : unreserved byte = true) :
+    Char.ofNat byte.toNat ≠ '%' := by
+  have := (by decide : ∀ i : Fin 256, unreserved (UInt8.ofNat i.val) = true →
+      Char.ofNat (UInt8.ofNat i.val).toNat ≠ '%')
+    ⟨byte.toNat, by have := UInt8.toNat_lt byte; omega⟩
+  simp only [UInt8.ofNat_toNat] at this
+  exact this h
+
+private theorem fromHex?_hexDigit {n : Nat} (h : n < 16) : fromHex? (hexDigit n) = some n :=
+  (by decide : ∀ i : Fin 16, fromHex? (hexDigit i.val) = some i.val) ⟨n, h⟩
+
+private theorem decodeLoop_cons_ne {c : Char} (hc : c ≠ '%') (l : List Char) (out : ByteArray) :
+    decodeLoop (c :: l) out = decodeLoop l (out.push c.toUInt8) := by
+  rw [decodeLoop.eq_def]
+  split <;> simp_all
+
+private theorem byteArray_push_eq_append (a : ByteArray) (x : UInt8) :
+    a.push x = a ++ ByteArray.empty.push x := by
+  have hdata : (a.push x).data = (a ++ ByteArray.empty.push x).data := by
+    rw [ByteArray.data_push, ByteArray.data_append]
+    exact Array.push_eq_append
+  cases ha : a.push x
+  cases hb : a ++ ByteArray.empty.push x
+  simp_all
+
+private theorem extract_singleton {bytes : ByteArray} {i : Nat} (h : i < bytes.size) :
+    bytes.extract i (i + 1) = ByteArray.empty.push bytes[i] := by
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract]
+    show min (i + 1) bytes.size - i = 1
+    omega
+  · intro j hj hj'
+    rw [ByteArray.getElem_extract]
+    have hj0 : j = 0 := by
+      rw [ByteArray.size_extract] at hj
+      omega
+    subst hj0
+    rfl
+
+private theorem push_extract_step {bytes : ByteArray} {i : Nat} (h : i < bytes.size)
+    (out : ByteArray) :
+    out.push bytes[i] ++ bytes.extract (i + 1) bytes.size
+      = out ++ bytes.extract i bytes.size := by
+  rw [byteArray_push_eq_append, ByteArray.append_assoc,
+    show ByteArray.empty.push bytes[i] = bytes.extract i (i + 1) from (extract_singleton h).symm,
+    ByteArray.extract_append_extract,
+    show min i (i + 1) = i from by omega,
+    show max (i + 1) bytes.size = bytes.size from by omega]
+
+private theorem decodeLoop_encodeFrom (bytes : ByteArray) (i : Nat) :
+    ∀ out, decodeLoop (encodeFrom bytes i) out = .ok (out ++ bytes.extract i bytes.size) := by
+  fun_induction encodeFrom bytes i
+  next i h ih =>
+    intro out
+    have hlt := UInt8.toNat_lt bytes[i]
+    by_cases hu : unreserved bytes[i] = true
+    · rw [show encodeByte bytes[i] = [Char.ofNat bytes[i].toNat] from by
+        rw [encodeByte, if_pos hu]]
+      rw [List.singleton_append, decodeLoop_cons_ne (char_ne_percent_unreserved hu),
+        toUInt8_char_unreserved hu, ih, push_extract_step h]
+    · rw [show encodeByte bytes[i]
+          = '%' :: hexDigit (bytes[i].toNat / 16) :: hexDigit (bytes[i].toNat % 16) :: [] from by
+        rw [encodeByte, if_neg hu]]
+      simp only [List.cons_append, List.nil_append, decodeLoop,
+        fromHex?_hexDigit (show bytes[i].toNat / 16 < 16 by omega),
+        fromHex?_hexDigit (show bytes[i].toNat % 16 < 16 by omega)]
+      rw [show UInt8.ofNat (bytes[i].toNat / 16 * 16 + bytes[i].toNat % 16) = bytes[i] from by
+        rw [show bytes[i].toNat / 16 * 16 + bytes[i].toNat % 16 = bytes[i].toNat from by omega,
+          UInt8.ofNat_toNat]]
+      rw [ih, push_extract_step h]
+  next i h =>
+    intro out
+    rw [show bytes.extract i bytes.size = ByteArray.empty from
+        ByteArray.extract_eq_empty_iff.mpr (by omega),
+      ByteArray.append_empty]
+    rfl
+
+private theorem fromUTF8?_toByteArray (s : String) :
+    String.fromUTF8? s.toByteArray = some s := by
+  have hv : s.toByteArray.IsValidUTF8 := ⟨s.toList, String.utf8Encode_toList.symm⟩
+  unfold String.fromUTF8?
+  split
+  next h => rfl
+  next h => exact absurd hv h
+
+/-- Percent-decoding inverts percent-encoding. -/
+theorem decode_encode (message : String) : decode (encode message) = .ok message := by
+  unfold decode encode
+  simp only [bind, Except.bind]
+  rw [String.toList_ofList, decodeLoop_encodeFrom message.toByteArray 0 ByteArray.empty]
+  simp only [ByteArray.extract_zero_size, ByteArray.empty_append, fromUTF8?_toByteArray,
+    pure, Except.pure]
 
 end Percent
 
