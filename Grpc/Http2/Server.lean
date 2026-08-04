@@ -93,6 +93,12 @@ structure ActiveConnection where
   stopToken : Std.CancellationToken
   /-- Set by whichever teardown path fires first; read by `finishManagedClient`. -/
   closeCause : IO.Ref (Option CloseCause)
+  /-- The TLS session, published once its handshake completes.  Teardown bytes for
+  such a connection must be sealed through it; writing a GOAWAY straight to the
+  socket would put plaintext on an encrypted stream.  Stays `none` for h2c and for
+  a TLS connection that died before it had a session — in both cases there is
+  nothing to seal and nothing the peer could read. -/
+  tlsSession : IO.Ref (Option Grpc.Tls.ServerSession)
 
 /-- Exact owner of one accepted connection computation.  Retaining the outer
 `Async.toIO` handle gives shutdown a joinable ownership boundary for every
@@ -195,6 +201,32 @@ private def sendBytes (client : TCP.Socket.Client) (bytes : ByteArray) : IO Unit
   else
     (client.send bytes).block
 
+/-- Put teardown bytes on a connection's wire: straight to the socket for h2c, sealed
+through the session for TLS. -/
+private def sendConnectionBytes (tls? : Option Grpc.Tls.ServerSession)
+    (client : TCP.Socket.Client) (bytes : ByteArray) : IO Unit :=
+  match tls? with
+  | none => sendBytes client bytes
+  | some session => session.send bytes
+
+/-- Retire a connection's transport.  For TLS the record queue is closed and its
+writer joined first, so everything already sealed (the GOAWAY, then close_notify)
+is on the socket before the FIN — and so the writer task cannot outlive the
+connection suspended on a queue nobody will close. -/
+private def retireConnection (tls? : Option Grpc.Tls.ServerSession)
+    (client : TCP.Socket.Client) : Std.Async.Async Unit := do
+  match tls? with
+  | none => pure ()
+  | some session =>
+      try session.closeNotify catch _ => pure ()
+      session.drainWriter
+  closeConnectionSocket client
+
+/-- `retireConnection` from a synchronous cleanup path. -/
+private def retireConnectionDetached (tls? : Option Grpc.Tls.ServerSession)
+    (client : TCP.Socket.Client) : IO Unit := do
+  discard <| Std.Async.Async.toIO (retireConnection tls? client)
+
 private def sendGoAway (client : TCP.Socket.Client) (state : Connection.State)
     (status : Status) : IO Unit := do
   if state.prefaceReceived then
@@ -225,7 +257,7 @@ private def sendGracefulGoAway (connection : ActiveConnection) : IO Unit := do
     match gracefulGoAwayBytes state with
     | .ok bytes =>
         try
-          sendBytes connection.client bytes
+          sendConnectionBytes (← connection.tlsSession.get) connection.client bytes
         catch _ =>
           pure ()
     | .error _ => pure ()
@@ -233,7 +265,7 @@ private def sendGracefulGoAway (connection : ActiveConnection) : IO Unit := do
 /-- Tell the peer why this connection is ending, exactly once.  Claiming
 `outboundGoAwayLastStreamId` under the state mutex makes this idempotent and makes it
 defer to a GOAWAY that some other path (graceful drain) already sent. -/
-private def sendCauseGoAway (client : TCP.Socket.Client)
+private def sendCauseGoAway (tls? : Option Grpc.Tls.ServerSession) (client : TCP.Socket.Client)
     (stateMutex : Std.Mutex Connection.State) (cause : CloseCause) : IO Unit := do
   if !cause.notifiesPeer then
     return ()
@@ -254,7 +286,7 @@ private def sendCauseGoAway (client : TCP.Socket.Client)
           | .error _ => pure ()
           | .ok bytes =>
               try
-                sendBytes client bytes
+                sendConnectionBytes tls? client bytes
               catch _ =>
                 pure ()
 
@@ -312,7 +344,8 @@ private def nextActiveConnectionId (server : Server) : IO Nat := do
 private def registerActiveConnection (server : Server) (id : Nat)
     (client : TCP.Socket.Client)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
-    (closeCause : IO.Ref (Option CloseCause)) :
+    (closeCause : IO.Ref (Option CloseCause))
+    (tlsSession : IO.Ref (Option Grpc.Tls.ServerSession)) :
     IO (Option ActiveConnection) := do
   match server.activeConnections with
   | none => pure none
@@ -322,7 +355,8 @@ private def registerActiveConnection (server : Server) (id : Nat)
         client := client,
         stateMutex := stateMutex,
         stopToken := stopToken,
-        closeCause := closeCause
+        closeCause := closeCause,
+        tlsSession := tlsSession
       }
       connectionsMutex.atomically do
         let connections ← get
@@ -597,7 +631,7 @@ private def finishManagedClient (server : Server) (id : Nat) (client : TCP.Socke
       | .error _ => pure ()
   let cause := (← closeCause.get).getD CloseCause.peerClosed
   recordClosedConnection server id cause
-  sendCauseGoAway client stateMutex cause
+  sendCauseGoAway none client stateMutex cause
   unregisterActiveConnection server connection?
   -- Retire the socket for exactly the causes that told the peer something: it has
   -- to see the connection end promptly behind that GOAWAY.  A peer that closed
@@ -637,7 +671,9 @@ private def spawnManagedClient (server : Server) (registry : Registry)
     (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize)
   let stopToken ← Std.CancellationToken.new
   let closeCause ← IO.mkRef (none : Option CloseCause)
+  let tlsSession ← IO.mkRef (none : Option Grpc.Tls.ServerSession)
   let connection? ← registerActiveConnection server id client stateMutex stopToken closeCause
+    tlsSession
   let retained ← IO.Promise.new
   try
     let task ← Std.Async.Async.toIO
@@ -764,55 +800,146 @@ private def freshTlsServerConfig (tlsConfig : TlsConfig) : IO Tls.Server.Config 
 private def tlsServerSend (session : Grpc.Tls.ServerSession) (bytes : ByteArray) : IO Unit :=
   session.send bytes
 
+/-- Per-connection event loop over TLS.  Structurally the same as
+`serveManagedClientLoop`, including its cause reporting: every exit records why,
+and the GOAWAY naming it is emitted once by `finishManagedTlsClient` rather than
+inline here, so a TLS connection dies exactly as attributably as an h2c one. -/
 private partial def serveTlsClientLoop (registry : Registry) (config : Config)
     (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
-    (stopToken : Std.CancellationToken) : Std.Async.Async Unit := do
+    (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
+    Std.Async.Async Unit := do
   match ← nextManagedClientEvent config session.socket stopToken with
-  | ManagedClientEvent.stop => pure ()
+  | ManagedClientEvent.stop =>
+      reportCloseCause closeCause CloseCause.serverShutdown
   | ManagedClientEvent.received none =>
+      reportCloseCause closeCause CloseCause.peerClosed
       discard <| Connection.cancelActiveShared stateMutex
   | ManagedClientEvent.received (some rawChunk) =>
       match ← session.feedInbound rawChunk with
-      | none => discard <| Connection.cancelActiveShared stateMutex
+      | none =>
+          -- An authenticated close_notify, or transport EOF: the peer is done.
+          reportCloseCause closeCause CloseCause.peerClosed
+          discard <| Connection.cancelActiveShared stateMutex
       | some plaintext =>
           match ← Connection.processBytesEncodedSharedWith
               registry stateMutex plaintext (tlsServerSend session) with
           | .ok () =>
               if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
-                pure ()
+                reportCloseCause closeCause CloseCause.peerClosed
               else
-                serveTlsClientLoop registry config session stateMutex stopToken
+                serveTlsClientLoop registry config session stateMutex stopToken closeCause
           | .error status =>
-              let state ← getConnectionState stateMutex
-              (match errorGoAwayBytes state status with
-               | .ok bytes => try session.send bytes catch _ => pure ()
-               | .error _ => pure ())
-              try session.closeNotify catch _ => pure ()
+              reportCloseCause closeCause (CloseCause.protocolError status)
               discard <| Connection.cancelActiveShared stateMutex
 
-private def serveTlsConnection (registry : Registry) (config : Config)
-    (tlsConfig : TlsConfig) (client : TCP.Socket.Client) : Std.Async.Async Unit := do
+/-- Single teardown point for a managed TLS connection, mirroring
+`finishManagedClient`: record the cause, seal the GOAWAY that names it through the
+session, unregister, then retire the transport.  `sendCauseGoAway` itself only
+emits once the HTTP/2 preface has been seen, which is exactly "far enough along to
+carry a GOAWAY" — a connection that died during the TLS handshake has no HTTP/2
+framing to say it in, and gets a recorded cause but no frame. -/
+private def finishManagedTlsClient (server : Server) (id : Nat)
+    (client : TCP.Socket.Client) (session? : Option Grpc.Tls.ServerSession)
+    (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
+    (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause)) :
+    Std.Async.Async Unit := do
+  discard <| Grpc.CancellationToken.cancel stopToken
+    (reason := Std.CancellationReason.shutdown)
+  let cause := (← closeCause.get).getD CloseCause.peerClosed
+  recordClosedConnection server id cause
+  try
+    sendCauseGoAway session? client stateMutex cause
+  catch _ =>
+    pure ()
+  unregisterActiveConnection server connection?
+  -- Unlike h2c, the peer-closed case still has work to do: the session's record
+  -- writer is a real task suspended on a queue, and only closing that queue ends
+  -- it.  `retireConnection` closes and joins it either way, and only spends a
+  -- close_notify and a socket shutdown on a peer that can still read them.
+  match session? with
+  | none =>
+      if cause.notifiesPeer then
+        closeConnectionSocket client
+  | some session =>
+      if cause.notifiesPeer then
+        retireConnection (some session) client
+      else
+        session.drainWriter
+
+private def serveManagedTlsClient (server : Server) (registry : Registry) (config : Config)
+    (tlsConfig : TlsConfig) (id : Nat) (client : TCP.Socket.Client)
+    (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
+    (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
+    (tlsSession : IO.Ref (Option Grpc.Tls.ServerSession))
+    (retained : IO.Promise Unit) : Std.Async.Async Unit := do
+  waitUntilConnectionTaskRetained retained
   try
     if config.noDelay then
       client.noDelay
     let serverConfig ← freshTlsServerConfig tlsConfig
     let session ← Grpc.Tls.ServerSession.establish client serverConfig config.readSize
-    let stateMutex ← newConnectionStateMutex config
-      (Connection.initialState config.maxConcurrentStreams config.maxHeaderListSize)
-    let stopToken ← Std.CancellationToken.new
+    -- Publish the session before any byte of HTTP/2: from here on every teardown
+    -- path — including `shutdown`'s graceful GOAWAY, which runs on another task —
+    -- must seal what it sends instead of writing plaintext onto this socket.
+    tlsSession.set (some session)
     let preface ← ofStatusExcept
       (Connection.serverPrefaceBytes config.maxConcurrentStreams config.maxHeaderListSize)
     session.send preface
-    serveTlsClientLoop registry config session stateMutex stopToken
-  catch _ =>
-    pure ()
+    serveTlsClientLoop registry config session stateMutex stopToken closeCause
+    finishManagedTlsClient server id client (some session) stateMutex stopToken
+      connection? closeCause
+  catch err =>
+    -- Do not let a TLS connection die anonymously either.  A handshake that
+    -- failed has no session, so this is also the path that records the failure
+    -- of a peer that never got as far as speaking HTTP/2.
+    reportCloseCause closeCause (CloseCause.transportError (toString err))
+    finishManagedTlsClient server id client (← tlsSession.get) stateMutex stopToken
+      connection? closeCause
+    throw err
+
+private def spawnManagedTlsClient (server : Server) (registry : Registry)
+    (tlsConfig : TlsConfig) (client : TCP.Socket.Client)
+    (shutdownToken : Std.CancellationToken) : IO Unit := do
+  let id ← nextActiveConnectionId server
+  let stateMutex ← newConnectionStateMutex server.config
+    (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize)
+  let stopToken ← Std.CancellationToken.new
+  let closeCause ← IO.mkRef (none : Option CloseCause)
+  let tlsSession ← IO.mkRef (none : Option Grpc.Tls.ServerSession)
+  -- Registered before the handshake runs, so `shutdown`/`wait` can see and drain a
+  -- connection that is still negotiating TLS.  `sendGracefulGoAway` is a no-op
+  -- until the HTTP/2 preface has been read, so registering this early cannot put a
+  -- frame on a socket that is not carrying HTTP/2 yet.
+  let connection? ← registerActiveConnection server id client stateMutex stopToken closeCause
+    tlsSession
+  let retained ← IO.Promise.new
+  try
+    let task ← Std.Async.Async.toIO
+      (serveManagedTlsClient server registry server.config tlsConfig id client stateMutex
+        stopToken connection? closeCause tlsSession retained)
+    retainConnectionTask server { id := id, task := task }
+    retained.resolve ()
+    if ← shutdownToken.isCancelled then
+      match connection? with
+      | none => pure ()
+      | some connection => sendGracefulGoAway connection
+    pruneFinishedConnectionTasks server
+  catch err =>
+    retained.resolve ()
+    reportCloseCause closeCause (CloseCause.transportError (toString err))
+    recordClosedConnection server id (CloseCause.transportError (toString err))
+    discard <| Grpc.CancellationToken.cancel stopToken
+      (reason := Std.CancellationReason.shutdown)
+    unregisterActiveConnection server connection?
+    retireConnectionDetached (← tlsSession.get) client
+    throw err
 
 private partial def acceptTlsLoop (server : Server) (registry : Registry)
     (tlsConfig : TlsConfig) (token : Std.CancellationToken) : Std.Async.Async Unit := do
   match ← nextAcceptLoopEvent server token with
   | AcceptLoopEvent.shutdown => pure ()
   | AcceptLoopEvent.accepted client =>
-      discard <| Std.Async.Async.toIO (serveTlsConnection registry server.config tlsConfig client)
+      spawnManagedTlsClient server registry tlsConfig client token
       acceptTlsLoop server registry tlsConfig token
 
 /-- Bind, then accept connections and serve gRPC over TLS 1.3 on each. -/
@@ -820,12 +947,14 @@ def serveTls (registry : Registry) (tlsConfig : TlsConfig) (config : Config := {
   let server ← bind config
   let token ← Std.CancellationToken.new
   let activeConnections ← Std.Mutex.new #[]
+  let connectionTasks ← Std.Mutex.new #[]
   let nextConnectionId ← IO.mkRef 0
   let closedConnections ← Std.Mutex.new #[]
   let server := {
     server with
     shutdownToken := some token,
     activeConnections := some activeConnections,
+    connectionTasks := some connectionTasks,
     nextConnectionId := some nextConnectionId,
     closedConnections := some closedConnections
   }
@@ -850,7 +979,7 @@ private def forceCloseActiveConnections (server : Server) : IO Unit := do
     discard <| Connection.cancelActiveShared connection.stateMutex
     discard <| Grpc.CancellationToken.cancel connection.stopToken
       (reason := Std.CancellationReason.shutdown)
-    closeConnectionSocketDetached connection.client
+    retireConnectionDetached (← connection.tlsSession.get) connection.client
 
 private partial def waitActiveConnectionsDrained (server : Server)
     (remainingMs : Option Nat) : IO Unit := do

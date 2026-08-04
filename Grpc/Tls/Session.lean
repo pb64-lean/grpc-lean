@@ -100,6 +100,9 @@ structure ServerSession where
   socket : TCP.Socket.Client
   state : Std.Mutex Server.State
   outbound : Std.CloseableChannel ByteArray
+  /-- Exact writer handle, joined by `drainWriter` so everything already sealed
+  reaches the socket before the connection is retired. -/
+  private writer : AsyncTask Unit
 
 /-- The single writer loop: drains sealed record bytes and writes them to the
 socket in FIFO order, awaiting each send *cooperatively* (never parking a worker
@@ -197,8 +200,8 @@ def establish (socket : TCP.Socket.Client) (config : Server.Config)
   let state ← serverHandshake socket config readSize
   let outbound ← Std.CloseableChannel.new
   let stateMutex ← Std.Mutex.new state
-  discard <| startWriter socket outbound
-  pure { socket := socket, state := stateMutex, outbound := outbound }
+  let writer ← startWriter socket outbound
+  pure { socket := socket, state := stateMutex, outbound := outbound, writer := writer }
 
 /-- The ALPN protocol negotiated with the client, if any (e.g. "h2"). -/
 def alpnSelected (session : ServerSession) : IO (Option String) :=
@@ -251,6 +254,20 @@ def closeNotify (session : ServerSession) : IO Unit := do
         set output.state
         discard <| session.outbound.send output.wireBytes
     | .error _ => pure ()
+
+/-- Close the record queue and join the exact writer task, so every record already
+sealed — a GOAWAY, a close_notify — is on the socket before the caller retires it.
+
+Runs in `Async`, so a server closing many TLS connections at once suspends rather
+than parking a worker per connection.  It is also the only thing that ends the
+writer task: a session whose queue is never closed leaves that task suspended on a
+`recv` nobody will ever satisfy. -/
+def drainWriter (session : ServerSession) : Async Unit := do
+  discard <| session.outbound.close.toBaseIO
+  try
+    Async.ofAsyncTask session.writer
+  catch _ =>
+    pure ()
 
 end ServerSession
 
