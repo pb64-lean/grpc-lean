@@ -38,7 +38,8 @@ def service : _root_.lean.example.proto.NoteService := {
 }
 
 def registry : Grpc.Registry :=
-  Grpc.Services.Reflection.register <|
+  Grpc.Services.Reflection.registerWith
+    { files := _root_.lean.example.proto.NoteService.fileDescriptors } <|
     _root_.lean.example.proto.NoteService.register Grpc.Registry.empty service
 
 def portFromArgs (args : List String) : UInt16 :=

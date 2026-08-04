@@ -42,6 +42,46 @@ grep -q '^lean\.example\.proto\.NoteService$' <<<"${services}"
 grep -q '^grpc\.reflection\.v1\.ServerReflection$' <<<"${services}"
 grep -q '^grpc\.reflection\.v1alpha\.ServerReflection$' <<<"${services}"
 
+# --- Reflection-only interop: no -proto/-import-path flags below this block.
+# grpcurl resolves the schema entirely from the server's embedded descriptors
+# (ServerReflectionInfo FileContainingSymbol / FileByFilename).
+
+# Describe the service via reflection.
+describe_service="$(
+  grpcurl -plaintext -connect-timeout 3 -max-time 5 \
+    "127.0.0.1:${port}" describe lean.example.proto.NoteService
+)"
+grep -q 'rpc Echo ( .lean.example.proto.Note ) returns ( .lean.example.proto.Note )' <<<"${describe_service}"
+grep -q 'rpc Chat ( stream .lean.example.proto.Note ) returns ( stream .lean.example.proto.Note )' <<<"${describe_service}"
+
+# Describe a message that lives in the imported common/note_common.proto; the
+# server must return the transitive descriptor closure for this to resolve.
+describe_meta="$(
+  grpcurl -plaintext -connect-timeout 3 -max-time 5 \
+    "127.0.0.1:${port}" describe lean.example.proto.NoteMeta
+)"
+grep -q 'created_at_unix' <<<"${describe_meta}"
+
+# Invoke Echo purely via reflection.
+reflection_echo="$(
+  grpcurl -plaintext -connect-timeout 3 -max-time 5 \
+    -d '{"title":"via reflection","priority":9,"color":"RED"}' \
+    "127.0.0.1:${port}" lean.example.proto.NoteService/Echo
+)"
+grep -q '"title": "via reflection echoed"' <<<"${reflection_echo}"
+grep -q '"priority": 9' <<<"${reflection_echo}"
+grep -q '"color": "RED"' <<<"${reflection_echo}"
+
+# Invoke Meta purely via reflection; request/response types come from the
+# imported dependency file.
+reflection_meta="$(
+  grpcurl -plaintext -connect-timeout 3 -max-time 5 \
+    -d '{"owner":"reflection rpc","createdAtUnix":"1700000400"}' \
+    "127.0.0.1:${port}" lean.example.proto.NoteService/Meta
+)"
+grep -q '"owner": "reflection rpc echoed"' <<<"${reflection_meta}"
+grep -q '"createdAtUnix": "1700000400"' <<<"${reflection_meta}"
+
 response="$(
   grpcurl -plaintext -connect-timeout 3 -max-time 5 \
     -import-path "${proto_dir}" \
