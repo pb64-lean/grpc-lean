@@ -599,7 +599,13 @@ private def finishManagedClient (server : Server) (id : Nat) (client : TCP.Socke
   recordClosedConnection server id cause
   sendCauseGoAway client stateMutex cause
   unregisterActiveConnection server connection?
-  closeConnectionSocket client
+  -- Retire the socket for exactly the causes that told the peer something: it has
+  -- to see the connection end promptly behind that GOAWAY.  A peer that closed
+  -- first already sent its FIN and is not reading, so shutting down towards it
+  -- buys nothing and costs a timer and two tasks on the hottest teardown path —
+  -- measurably so when many connections close at once.
+  if cause.notifiesPeer then
+    closeConnectionSocket client
 
 private def serveManagedClient (server : Server) (registry : Registry) (id : Nat)
     (client : TCP.Socket.Client) (stateMutex : Std.Mutex Connection.State)
