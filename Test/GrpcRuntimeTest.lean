@@ -4979,6 +4979,88 @@ def testHttp2StreamErrorContainment : IO Unit := do
       IO.cancel waitTask
       throw (IO.userError "stream-error containment server did not drain")
 
+/-- Deadline propagation: the remaining time of an inbound request becomes the
+`grpc-timeout` of a downstream call, and an exhausted deadline refuses the call
+instead of issuing one that cannot succeed. -/
+def testDeadlinePropagation : IO Unit := do
+  -- Every duration renders to a header value that parses back (the proved law
+  -- `Timeout.parse?_render_ofNanoseconds`), including the extremes.
+  for nanoseconds in [0, 1, 999, 1000, 250000000, 5000000000, 3600000000000,
+      99999999 * 3600000000000 * 2] do
+    let timeout := Timeout.ofNanoseconds nanoseconds
+    expectEq (Timeout.parse? timeout.render) (some timeout)
+      s!"rendered timeout for {nanoseconds}ns should parse back"
+    expect (timeout.value != 0) "a propagated timeout must never render as zero"
+
+  -- Rounding is up, so a downstream call never gets less time than remains.
+  expectEq (Timeout.ofNanoseconds 1) { value := 1, unit := TimeoutUnit.nanosecond }
+    "a sub-unit remainder should round up to the smallest representable timeout"
+  expectEq (Timeout.ofNanoseconds 99999999) { value := 99999999, unit := TimeoutUnit.nanosecond }
+    "a duration that fits eight digits should use the finest unit"
+  expectEq (Timeout.ofNanoseconds 250000000) { value := 250000, unit := TimeoutUnit.microsecond }
+    "a duration past eight digits should step up to the next coarser unit"
+
+  -- No deadline on the request: nothing is propagated.
+  match ← Deadline.remaining? none with
+  | .unbounded => pure ()
+  | _ => throw (IO.userError "a request without a deadline should propagate none")
+
+  -- A deadline already in the past refuses the downstream call.
+  match ← Deadline.remaining? (some 0) with
+  | .exceeded => pure ()
+  | _ => throw (IO.userError "an expired deadline should report exceeded")
+
+  -- A live deadline yields a timeout no longer than what remains.
+  let now ← IO.monoNanosNow
+  match ← Deadline.remaining? (some (now + 5000000000)) with
+  | .remaining timeout =>
+      expect (timeout.toNanoseconds <= 5000000000 + timeout.unit.nanoseconds)
+        "propagated timeout should not exceed the remaining time by more than one unit"
+  | _ => throw (IO.userError "a live deadline should report remaining time")
+
+  -- CallOptions.propagating threads it into a downstream call.
+  let base : Client.CallOptions := { metadata := Metadata.empty.insert "x-trace" "downstream" }
+  match ← base.propagating none with
+  | .ok options =>
+      expectEq options.timeout none "no deadline should leave the downstream timeout unset"
+      expectEq (options.metadata.get? "x-trace") (some "downstream")
+        "propagating must preserve the caller's metadata"
+  | .error status => throw (IO.userError s!"unexpected error: {status.messageD}")
+  let now ← IO.monoNanosNow
+  match ← base.propagating (some (now + 2000000000)) with
+  | .ok options =>
+      match options.timeout with
+      | none => throw (IO.userError "a live deadline should set a downstream grpc-timeout")
+      | some raw =>
+          match Timeout.parse? raw with
+          | none => throw (IO.userError s!"downstream grpc-timeout {raw} should be parseable")
+          | some timeout =>
+              expect (timeout.toNanoseconds <= 2000000000 + timeout.unit.nanoseconds)
+                "downstream grpc-timeout should not exceed the caller's remaining time"
+  | .error status => throw (IO.userError s!"unexpected error: {status.messageD}")
+  match ← base.propagating (some 0) with
+  | .ok _ => throw (IO.userError "an expired deadline should not produce call options")
+  | .error status =>
+      expectEq status.code Code.deadlineExceeded
+        "an expired deadline should refuse the downstream call with DEADLINE_EXCEEDED"
+
+  -- The server hands the absolute deadline to the handler.
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let seenDeadline ← IO.mkRef (none : Option (Option Nat))
+  let registry := Registry.empty.registerUnary method fun request => do
+    seenDeadline.set (some request.deadline)
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let body ← expectStatusOk (Message.encode { data := bytes [1] })
+  discard <| runGrpcM (registry.dispatchUnary (requestHeaders.insert "grpc-timeout" "5S") body)
+  match ← seenDeadline.get with
+  | some (some _) => pure ()
+  | _ => throw (IO.userError "a handler should see the absolute deadline of its request")
+  seenDeadline.set none
+  discard <| runGrpcM (registry.dispatchUnary requestHeaders body)
+  match ← seenDeadline.get with
+  | some none => pure ()
+  | _ => throw (IO.userError "a request without grpc-timeout should carry no deadline")
+
 def main : IO Unit := do
   testStatus
   testMetadata
@@ -5044,6 +5126,7 @@ def main : IO Unit := do
   testHttp2H2CServer
   testHttp2ServeManagedLifecycle
   testHttp2StreamErrorContainment
+  testDeadlinePropagation
   testHttp2H2CServerReadsWhileStreamOpen
   testHttp2H2CServerFlushesActiveStreamOnWindowUpdate
   testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream
