@@ -650,6 +650,31 @@ def frame (streamId : Nat) (errorCode : ErrorCode) : Except Status Frame := do
     payload := payload
   }
 
+/-- A built RST_STREAM frame is an RST_STREAM frame. -/
+theorem frame_frameType {streamId : Nat} {code : ErrorCode} {out : Frame}
+    (h : frame streamId code = .ok out) : out.header.frameType = FrameType.rstStream := by
+  unfold frame at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next => cases h; rfl
+
+/-- A built RST_STREAM frame names the stream it was built for: a stream error
+never touches another stream (RFC 9113 §5.4.2). -/
+theorem frame_streamId {streamId : Nat} {code : ErrorCode} {out : Frame}
+    (h : frame streamId code = .ok out) : out.header.streamId = streamId := by
+  unfold frame at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next => cases h; rfl
+
 def decode (frame : Frame) : Except Status ErrorCode := do
   if frame.header.frameType != FrameType.rstStream then
     throw (Status.internal "expected HTTP/2 RST_STREAM frame")

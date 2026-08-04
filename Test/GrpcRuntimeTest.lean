@@ -4835,6 +4835,110 @@ def testHttp2H2CServerCancelsPipeStreamOnRst : IO Unit := do
   (client.shutdown).block
   awaitIoTask serverTask
 
+/-- RFC 9113 §5.4.2 per-stream error containment, end to end over a socket.
+
+A DATA frame arriving on a stream the server has already finished is a *stream*
+error (§6.1, STREAM_CLOSED): the server must answer RST_STREAM for that stream
+and keep serving.  Before this was contained, the same frame produced
+GOAWAY(INTERNAL_ERROR) and killed every other stream on the connection. -/
+def testHttp2StreamErrorContainment : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let registry := Registry.empty.registerUnary method fun request => do
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let path := "/lean.example.proto.NoteService/Echo"
+  let (block1, encoder1) ← expectStatusOk
+    (Http2.Hpack.encodeHeaderBlock {} (requestHeadersForPath path))
+  let (block3, _) ← expectStatusOk
+    (Http2.Hpack.encodeHeaderBlock encoder1 (requestHeadersForPath path))
+
+  let headersFrameFor (streamId : Nat) (block : ByteArray) : Http2.Frame := {
+    header := {
+      length := block.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.endHeaders,
+      streamId := streamId
+    },
+    payload := block
+  }
+  let dataFrameFor (streamId : Nat) (payload : ByteArray) (endStream : Bool) : Http2.Frame := {
+    header := {
+      length := payload.size,
+      frameType := Http2.FrameType.data,
+      flags := if endStream then Http2.FrameFlag.endStream else 0,
+      streamId := streamId
+    },
+    payload := payload
+  }
+  let trailersFor (streamId : Nat) (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == streamId
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+
+  let clientSettings ← expectStatusOk (Http2.Settings.frame #[])
+  let clientSettingsWire ← expectStatusOk (Http2.Frame.encode clientSettings)
+  let body ← expectStatusOk ({ data := bytes [7, 7, 7] } : Message).encode
+
+  let firstWire := Http2.connectionPreface
+    |>.append clientSettingsWire
+    |>.append (← expectStatusOk (Http2.Frame.encode (headersFrameFor 1 block1)))
+    |>.append (← expectStatusOk (Http2.Frame.encode (dataFrameFor 1 body true)))
+  (client.send firstWire).block
+
+  let afterFirst ← readHttp2FramesUntilWithTimeout client {} (trailersFor 1)
+    observeTimeoutMs "stream 1 should complete before the stray DATA frame"
+  expect (!afterFirst.frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway)
+    "a healthy unary call must not produce GOAWAY"
+
+  -- Stream 1 is closed now.  A DATA frame for it is a stream error.
+  (client.send (← expectStatusOk
+    (Http2.Frame.encode (dataFrameFor 1 body false)))).block
+  let afterStray ← readHttp2FramesUntilWithTimeout client
+    { afterFirst with frames := #[] }
+    (fun frames => frames.any fun frame => frame.header.frameType == Http2.FrameType.rstStream)
+    observeTimeoutMs "DATA on a closed stream should be answered with RST_STREAM"
+  let rst? := afterStray.frames.find? fun frame =>
+    frame.header.frameType == Http2.FrameType.rstStream
+  match rst? with
+  | none => throw (IO.userError "expected an RST_STREAM for the closed stream")
+  | some rst =>
+      expectEq rst.header.streamId 1 "RST_STREAM must name only the offending stream"
+      expectEq (← expectStatusOk (Http2.RstStream.decode rst)) Http2.ErrorCode.streamClosed
+        "RFC 9113 §6.1 prescribes STREAM_CLOSED for DATA on a closed stream"
+  expect (!afterStray.frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway)
+    "a stream error must not tear the connection down with GOAWAY"
+
+  -- The connection must keep serving: a fresh stream still completes.
+  let secondWire := (← expectStatusOk (Http2.Frame.encode (headersFrameFor 3 block3)))
+    |>.append (← expectStatusOk (Http2.Frame.encode (dataFrameFor 3 body true)))
+  (client.send secondWire).block
+  let afterSecond ← readHttp2FramesUntilWithTimeout client
+    { afterStray with frames := #[] } (trailersFor 3)
+    observeTimeoutMs "the connection must keep serving new streams after a stream error"
+  expect (!afterSecond.frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway)
+    "serving a later stream must not produce GOAWAY either"
+  let responseData := afterSecond.frames.filter fun frame =>
+    frame.header.frameType == Http2.FrameType.data && frame.header.streamId == 3
+  expect (responseData.size > 0) "stream 3 should carry a response body"
+  let messages ← expectStatusOk (Message.decodeAll (dataPayloads responseData))
+  expectEq messages.size 1 "stream 3 response should contain one message"
+  expectEq messages[0]!.data (bytes [7, 7, 7]) "stream 3 response should echo the request"
+
+  (client.shutdown).block
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask (Grpc.Server.wait server)
+  match ← awaitTaskWithin waitTask observeTimeoutMs with
+  | some _ => pure ()
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "stream-error containment server did not drain")
+
 def main : IO Unit := do
   testStatus
   testMetadata
@@ -4899,6 +5003,7 @@ def main : IO Unit := do
   testHttp2Connection
   testHttp2H2CServer
   testHttp2ServeManagedLifecycle
+  testHttp2StreamErrorContainment
   testHttp2H2CServerReadsWhileStreamOpen
   testHttp2H2CServerFlushesActiveStreamOnWindowUpdate
   testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream

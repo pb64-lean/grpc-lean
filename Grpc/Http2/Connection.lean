@@ -1849,6 +1849,76 @@ private def processActiveRequestData (registry : Registry) (state : State) (fram
                 }]
               })
 
+/-! ### Per-stream error containment
+
+RFC 9113 §5.4 splits framing failures in two, and the distinction is the whole
+point of this section.
+
+* A *connection* error (§5.4.1) is "any error that prevents further processing
+  of the frame layer or corrupts any connection state".  It is reported with
+  GOAWAY and ends the connection.
+* A *stream* error (§5.4.2) is "an error related to a specific stream that does
+  not affect processing of other streams".  It is reported with RST_STREAM and
+  the connection keeps serving.
+
+`streamErrorResult` is the single mechanism for the second kind.  It emits the
+RST_STREAM the RFC prescribes, drops every trace of the stream from the request
+tables, cancels a dispatch already running for it, and leaves the id in
+drain-only mode (`ignoredInboundStreams`) — because §5.4.2 continues: "after
+sending the RST_STREAM, the sending endpoint MUST be prepared to receive and
+process additional frames sent on the stream that might have been sent by the
+peer prior to the arrival of the RST_STREAM", and §6.9 requires those frames'
+flow-controlled bytes to stay accounted for.  Drain-only mode is exactly the
+mode already used for a stream rejected at headers, so its inertness is covered
+by `State.StreamInert` and the trace theorems below.
+
+One constraint shapes every decision here: a stream error may only be raised
+once the frame's field block (if any) has been decoded.  RFC 9113 §4.3 —
+"A decoding error in a field block MUST be treated as a connection error of
+type COMPRESSION_ERROR" — makes the HPACK dynamic table connection-wide state,
+so skipping a block desynchronises the decoder for every later stream.  That is
+why the failures detected *before* HPACK decoding (padding, truncated priority
+section, oversized header block, CONTINUATION sequencing) stay connection-fatal
+even where an RFC rule in isolation would allow a stream error. -/
+private def streamErrorResult (state : State) (streamId : Nat) (code : ErrorCode)
+    (emitted : Array Frame := #[]) : Except Status (State × SharedFrameResult) := do
+  let rst ← RstStream.frame streamId code
+  let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
+  let state := removeOutboundStreamState {
+    state with
+    activeRequestStreams := removeActiveRequestStream state.activeRequestStreams streamId
+  } streamId
+  pure (ignoreInboundStreamBody state streamId,
+    { emitted := emitted.push rst, cancelDispatches := cancelDispatches })
+
+/-- A DATA frame naming a stream id that was opened earlier and has since
+closed.
+
+RFC 9113 §6.1: "If a DATA frame is received whose stream is not in the 'open'
+or 'half-closed (local)' state, the recipient MUST respond with a stream error
+(Section 5.4.2) of type STREAM_CLOSED."  This is the common case in practice —
+a client that races an extra DATA frame against the END_STREAM it already sent,
+or against our RST_STREAM — and it used to kill the whole connection.
+
+The frame is drained through `processIgnoredInboundData` *before* the
+RST_STREAM is emitted so the receive windows are credited exactly as for any
+other body byte: RFC 9113 §5.4.2 requires the flow-controlled bytes of frames
+that cross a reset to remain accounted for.
+
+An id *above* `lastClientStreamId` has never been opened (`idle`), and §5.1
+says of that state: "Receiving any frame other than HEADERS or PRIORITY on a
+stream in this state MUST be treated as a connection error (Section 5.4.1) of
+type PROTOCOL_ERROR."  So `lastClientStreamId` is exactly the frontier between
+the stream-scoped and the connection-scoped reading of the same symptom. -/
+private def resetClosedStreamData (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) := do
+  let streamId := frame.header.streamId
+  let rst ← RstStream.frame streamId ErrorCode.streamClosed
+  let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
+  let state := removeOutboundStreamState state streamId
+  let (state, updates) ← processIgnoredInboundData (ignoreInboundStreamBody state streamId) frame
+  pure (state, { emitted := updates.push rst, cancelDispatches := cancelDispatches })
+
 /-- DATA for a unary request: the body is buffered on the stream and both
 windows are credited immediately, since the whole request is dispatched at
 END_STREAM. -/
@@ -1894,7 +1964,18 @@ private def processDataShared (registry : Registry) (state : State) (frame : Fra
     else
       match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
       | some active => processActiveRequestData registry state frame active
-      | none => processUnaryRequestData state frame
+      | none =>
+        match findStream? state.streams frame.header.streamId with
+        | some _ => processUnaryRequestData state frame
+        | none =>
+            -- No buffered stream, no incremental feed, not draining: either the
+            -- id has already been opened and closed (RFC 9113 §6.1 stream error
+            -- STREAM_CLOSED) or it was never opened at all (§5.1 `idle`, a
+            -- connection error of type PROTOCOL_ERROR).
+            if frame.header.streamId ≤ state.lastClientStreamId then
+              resetClosedStreamData state frame
+            else
+              processUnaryRequestData state frame
 
 /-- The pure shared-kernel step for every frame type that does not require the
 `IO` authorizer (i.e. everything except HEADERS/CONTINUATION).  Factored out of
@@ -2101,9 +2182,11 @@ implementations:
 * `processDataShared_rejected` — DATA for a drain-mode stream produces no
   request feed, no detached dispatch, no request-streaming dispatch and no
   cancellations, and cannot make the stream dispatchable again.
-* `processDataShared_inert_error` — DATA for an inert stream that is not in
-  drain mode (e.g. after END_STREAM finished the drain) is a protocol error;
-  the connection tears down instead of dispatching.
+* `processDataShared_inert_reset` — DATA for an inert stream that is not in
+  drain mode (e.g. after END_STREAM finished the drain, or after the stream
+  was reset) is contained to that stream: RST_STREAM naming only that id, no
+  request feed, no dispatch, nothing cancelled outside the id, and the stream
+  goes back into drain mode.  The connection keeps serving.
 * `DataTrace.inert_no_dispatch` / `rejectStreamAtHeaders_dataTrace_no_dispatch`
   — the trace-level statement: over any pure DATA trace for a rejected
   stream, every step is dispatch-free and the stream ends inert.
@@ -2324,14 +2407,29 @@ private theorem processDataShared_rejected {registry : Registry} {state state' :
       obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
       exact ⟨rfl, rfl, rfl, rfl, hs, hl, ha⟩
 
-/-- A DATA frame for an inert stream that is not in drain mode is a protocol
-error: the connection refuses it instead of dispatching. -/
-private theorem processDataShared_inert_error {registry : Registry} {state : State}
-    {frame : Frame} (hinert : state.StreamInert frame.header.streamId)
+/-- A DATA frame for an inert stream that is not in drain mode — the stream was
+opened, ran to completion or was reset, and the peer is still sending on it — is
+contained to that stream.  The step goes through `resetClosedStreamData`
+(RFC 9113 §6.1 STREAM_CLOSED), so it produces no request feed, no detached
+dispatch and no request-streaming dispatch; it cancels nothing belonging to any
+*other* stream; it emits an RST_STREAM naming only this stream; and it puts the
+id back in drain mode, leaving every other stream's state untouched.
+
+This is the pure statement of per-stream error containment: the connection is
+not torn down, and nothing outside `frame.header.streamId` moves. -/
+private theorem processDataShared_inert_reset {registry : Registry} {state state' : State}
+    {frame : Frame} {result : SharedFrameResult}
+    (hinert : state.StreamInert frame.header.streamId)
     (hnotrej : state.rejectedAtHeaders frame.header.streamId = false)
-    {state' : State} {result : SharedFrameResult} :
-    processDataShared registry state frame ≠ .ok (state', result) := by
-  intro h
+    (h : processDataShared registry state frame = .ok (state', result)) :
+    result.requestFeeds = #[] ∧ result.detached = none ∧ result.requestStreaming = none
+      ∧ (∀ dispatch ∈ result.cancelDispatches, dispatch.streamId = frame.header.streamId)
+      ∧ state'.streams = removeStream state.streams frame.header.streamId
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams)
+      ∧ (∃ rst ∈ result.emitted,
+          rst.header.frameType = FrameType.rstStream
+            ∧ rst.header.streamId = frame.header.streamId) := by
   unfold processDataShared at h
   split at h
   next => cases h
@@ -2350,10 +2448,33 @@ private theorem processDataShared_inert_error {registry : Registry} {state : Sta
       rw [Array.find?_eq_none]
       intro x hx
       simp [hinert.notBuffered x hx]
-    rw [hactive] at h
-    unfold processUnaryRequestData at h
-    rw [hstream] at h
-    simp at h
+    rw [hactive, hstream] at h
+    simp only [] at h
+    rw [if_pos hinert.claimed] at h
+    unfold resetClosedStreamData at h
+    simp only [bind, Except.bind, pure, Except.pure] at h
+    split at h
+    next => cases h
+    next rst hrst =>
+      split at h
+      next => cases h
+      next pair hproc =>
+        obtain ⟨drained, updates⟩ := pair
+        cases h
+        obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
+        refine ⟨rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_⟩
+        · intro dispatch hd
+          have := (Array.mem_filter.mp hd).2
+          simpa using this
+        · rw [hs]
+          simp [ignoreInboundStreamBody, removeOutboundStreamState]
+        · rw [hl]; rfl
+        · intro active hmem
+          have hmem' := ha active hmem
+          simpa [ignoreInboundStreamBody, removeOutboundStreamState] using hmem'
+        · refine ⟨rst, Array.mem_push_self, ?_, ?_⟩
+          · exact RstStream.frame_frameType hrst
+          · exact RstStream.frame_streamId hrst
 
 
 /-- A pure trace of the shared kernel's DATA-frame steps: each listed frame
@@ -2376,7 +2497,8 @@ private theorem DataTrace.inert_no_dispatch {registry : Registry}
     final.StreamInert streamId
       ∧ ∀ step ∈ steps,
           (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
-            ∧ (step.2).requestStreaming = none ∧ (step.2).cancelDispatches = #[] := by
+            ∧ (step.2).requestStreaming = none
+            ∧ ∀ dispatch ∈ (step.2).cancelDispatches, dispatch.streamId = streamId := by
   induction steps generalizing state with
   | nil =>
       cases trace
@@ -2389,7 +2511,23 @@ private theorem DataTrace.inert_no_dispatch {registry : Registry}
           htarget (frame, result) List.mem_cons_self
         cases hrej : state.rejectedAtHeaders frame.header.streamId with
         | false =>
-            exact absurd h (processDataShared_inert_error (htargetHead.symm ▸ hinert) hrej)
+            obtain ⟨hfeeds, hdet, hstreaming, hcancel, hs, hl, ha, -⟩ :=
+              processDataShared_inert_reset (htargetHead.symm ▸ hinert) hrej h
+            have hmid : mid.StreamInert streamId := {
+              notBuffered := fun s hs' =>
+                htargetHead ▸ removeStream_not_mem _ _ s (hs ▸ hs'),
+              notActive := fun a ha' => hinert.notActive a (ha a ha'),
+              claimed := by rw [hl]; exact hinert.claimed
+            }
+            have ihres := ih htail
+              (fun step hstep => htarget step (List.mem_cons_of_mem _ hstep)) hmid
+            refine ⟨ihres.1, ?_⟩
+            intro step hstep
+            cases hstep with
+            | head =>
+                exact ⟨hfeeds, hdet, hstreaming,
+                  fun d hd => htargetHead ▸ hcancel d hd⟩
+            | tail _ hstep => exact ihres.2 step hstep
         | true =>
             obtain ⟨hfeeds, hdet, hstreaming, hcancel, hs, hl, ha⟩ :=
               processDataShared_rejected hrej h
@@ -2403,7 +2541,10 @@ private theorem DataTrace.inert_no_dispatch {registry : Registry}
             refine ⟨ihres.1, ?_⟩
             intro step hstep
             cases hstep with
-            | head => exact ⟨hfeeds, hdet, hstreaming, hcancel⟩
+            | head =>
+                refine ⟨hfeeds, hdet, hstreaming, ?_⟩
+                rw [hcancel]
+                simp
             | tail _ hstep => exact ihres.2 step hstep
 
 /-- Groundwork headline: when request-header authorization rejects a stream
@@ -2422,7 +2563,8 @@ private theorem rejectStreamAtHeaders_dataTrace_no_dispatch
     final.StreamInert streamId
       ∧ ∀ step ∈ steps,
           (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
-            ∧ (step.2).requestStreaming = none ∧ (step.2).cancelDispatches = #[] :=
+            ∧ (step.2).requestStreaming = none
+            ∧ ∀ dispatch ∈ (step.2).cancelDispatches, dispatch.streamId = streamId :=
   trace.inert_no_dispatch streamId htarget
     (rejectStreamAtHeaders_inert state streamId inboundHpack outboundHpack endStream
       hclaimed hactive)
@@ -2730,9 +2872,12 @@ private theorem processNonHeaderFrameShared_inert {registry : Registry} {state :
     have hsid : frame.header.streamId = streamId := hdata htype
     cases hrej : state.rejectedAtHeaders frame.header.streamId with
     | false =>
-        exact absurd h
-          (processDataShared_inert_error (state' := res.1) (result := res.2)
-            (hsid.symm ▸ hinert) hrej)
+        obtain ⟨hfeeds, hdet, hstr, -, hs, hl, ha, -⟩ :=
+          processDataShared_inert_reset (state' := res.1) (result := res.2)
+            (hsid.symm ▸ hinert) hrej h
+        refine ⟨?_, hfeeds, hdet, hstr⟩
+        exact hinert.of_fields
+          (fun s hmem => (Array.mem_filter.mp (hs ▸ hmem)).1) ha hl
     | true =>
         obtain ⟨hfeeds, hdet, hstr, _hcancel, hs, hl, ha⟩ :=
           processDataShared_rejected (state' := res.1) (result := res.2) hrej h
@@ -3572,6 +3717,10 @@ private theorem removeOutboundStreamState_same (state : State) (streamId : Nat) 
     SameOutbound (removeOutboundStreamState state streamId) state :=
   ⟨rfl, Nat.le_refl _, fun _ hw => mem_removeOutboundStreamWindow hw, rfl, rfl⟩
 
+private theorem ignoreInboundStreamBody_same (state : State) (streamId : Nat) :
+    SameOutbound (ignoreInboundStreamBody state streamId) state :=
+  ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
 private theorem processRstStreamShared_wellFormed {state : State} {frame : Frame}
     {res : State × SharedFrameResult} (h : WellFormed state)
     (heq : processRstStreamShared state frame = .ok res) : WellFormed res.1 := by
@@ -3837,6 +3986,31 @@ private theorem processUnaryRequestData_wellFormed {state : State} {frame : Fram
                 exact detachStreamForDispatch_wellFormed hbuffered hdet
             next => cases heq; exact hbuffered
 
+/-- Resetting a closed stream preserves well-formedness: it only drops the
+stream's bookkeeping and drains the frame, so no buffered stream and no
+outbound window is invented. -/
+private theorem resetClosedStreamData_wellFormed {state : State} {frame : Frame}
+    {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : resetClosedStreamData state frame = .ok res) : WellFormed res.1 := by
+  unfold resetClosedStreamData at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next pair hproc =>
+      obtain ⟨drained, updates⟩ := pair
+      cases heq
+      refine processIgnoredInboundData_wellFormed ?_ hproc
+      refine h.ofSame ?_ ?_ rfl
+      · exact SameOutbound.trans
+          (ignoreInboundStreamBody_same _ _) (removeOutboundStreamState_same _ _)
+      · intro s hs
+        have hs' : s ∈ removeStream (removeOutboundStreamState state frame.header.streamId).streams
+            frame.header.streamId := hs
+        exact (Array.mem_filter.mp hs').1
+
 /-- Every pure DATA step preserves well-formedness. -/
 private theorem processDataShared_wellFormed {registry : Registry} {state : State}
     {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
@@ -3855,7 +4029,13 @@ private theorem processDataShared_wellFormed {registry : Registry} {state : Stat
     next =>
       split at heq
       next => exact processActiveRequestData_wellFormed h heq
-      next => exact processUnaryRequestData_wellFormed h heq
+      next =>
+        split at heq
+        next => exact processUnaryRequestData_wellFormed h heq
+        next =>
+          split at heq
+          next => exact resetClosedStreamData_wellFormed h heq
+          next => exact processUnaryRequestData_wellFormed h heq
 
 /-- Every pure non-header frame step preserves well-formedness. -/
 private theorem processNonHeaderFrameShared_wellFormed {registry : Registry} {state : State}
