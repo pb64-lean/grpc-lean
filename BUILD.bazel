@@ -39,6 +39,7 @@ lean_library(
     name = "grpc_lean",
     srcs = [
         "Grpc.lean",
+        "Grpc/Bytes.lean",
         "Grpc/CancellationToken.lean",
         "Grpc/Client.lean",
         "Grpc/Framing.lean",

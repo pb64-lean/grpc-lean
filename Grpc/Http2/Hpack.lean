@@ -1,9 +1,12 @@
 module
 
+public import Grpc.Bytes
 public import Grpc.Http2.Frame
 public import Grpc.Metadata
 
 public section
+
+open Grpc.Bytes
 
 namespace Grpc
 namespace Http2
@@ -1291,15 +1294,6 @@ private theorem decodeBits_ones (out : ByteArray) : ∀ n k, n + k ≤ 7 ->
       rw [findHuffmanSymbol?_ones (by omega)]
       rw [if_neg (show ¬ (k + 1 > 30) from by omega)]
       exact ih (k + 1) (by omega)
-
-private theorem byteArray_push_eq_append (a : ByteArray) (x : UInt8) :
-    a.push x = a ++ ByteArray.empty.push x := by
-  have hdata : (a.push x).data = (a ++ ByteArray.empty.push x).data := by
-    rw [ByteArray.data_push, ByteArray.data_append]
-    exact Array.push_eq_append
-  cases ha : a.push x
-  cases hb : a ++ ByteArray.empty.push x
-  simp_all
 
 private theorem foldl_push_eq (l : List UInt8) : ∀ out : ByteArray,
     l.foldl ByteArray.push out = out ++ l.toByteArray := by
