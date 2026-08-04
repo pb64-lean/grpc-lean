@@ -742,6 +742,25 @@ private def requestStreamingDispatchForStream? (state : State)
           usesGzip := usesGzip
         })
 
+/-- Pure state transition for a request rejected at completed request
+headers: the buffered stream is dropped and the stream id is either forgotten
+entirely (the request already carried END_STREAM) or put in drain-only mode
+so later DATA is consumed without dispatch.  See the authorization-before-body
+groundwork section at the end of this file for the properties proved about
+this transition. -/
+def rejectStreamAtHeaders (state : State) (streamId : Nat)
+    (inboundHpack outboundHpack : Hpack.State) (endStream : Bool) : State :=
+  let state := {
+    state with
+    hpack := inboundHpack,
+    outboundHpack := outboundHpack,
+    streams := removeStream state.streams streamId
+  }
+  if endStream then
+    removeInboundStreamState state streamId
+  else
+    ignoreInboundStreamBody state streamId
+
 private def authorizeRequestHeadersForStream (registry : Registry) (state : State)
     (streamId : Nat) : IO (Except Status (State × Option (Array Frame))) := do
   let decoded : Except Status (StreamState × Frame × Transport.RequestHeadersFrames) := do
@@ -774,18 +793,8 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
           streams := replaceStream state.streams stream
         }, none))
     | .ok (.reject frames outboundHpack) =>
-        let state := {
-          state with
-          hpack := headers.hpack,
-          outboundHpack := outboundHpack,
-          streams := removeStream state.streams streamId
-        }
-        let state :=
-          if headers.endStream then
-            removeInboundStreamState state streamId
-          else
-            ignoreInboundStreamBody state streamId
-        pure (.ok (state, some frames))
+        pure (.ok (rejectStreamAtHeaders state streamId
+          headers.hpack outboundHpack headers.endStream, some frames))
 
 private def earlyRequestRejectionForStream? (registry : Registry) (state : State) (streamId : Nat) :
     IO (Except Status (State × Option SharedFrameResult)) := do
@@ -1967,6 +1976,339 @@ def processBytesEncoded (registry : Registry) (state : State) (chunk : ByteArray
       (fun bytes => bytesRef.modify fun out => out.append bytes)) with
   | .ok state => pure (.ok (state, ← bytesRef.get))
   | .error status => pure (.error status)
+
+/-!
+## Authorization-before-body groundwork
+
+Target trace property: over any frame sequence processed by a connection, a
+stream whose request headers were rejected (authorization failure, invalid
+headers, or unknown method) never feeds body bytes to a handler and never
+dispatches one.
+
+The rejection transition itself is the pure `rejectStreamAtHeaders` (used by
+`authorizeRequestHeadersForStream`), and the pure kernel of body processing
+is `processDataShared`.  Proved below, entirely against those real
+implementations:
+
+* `rejectStreamAtHeaders_rejected` / `rejectStreamAtHeaders_inert` — a
+  rejection puts the stream in drain-only mode and makes it *inert*: no
+  buffered frames, no incremental request feed, id already claimed.
+* `processDataShared_rejected` — DATA for a drain-mode stream produces no
+  request feed, no detached dispatch, no request-streaming dispatch and no
+  cancellations, and cannot make the stream dispatchable again.
+* `processDataShared_inert_error` — DATA for an inert stream that is not in
+  drain mode (e.g. after END_STREAM finished the drain) is a protocol error;
+  the connection tears down instead of dispatching.
+* `DataTrace.inert_no_dispatch` / `rejectStreamAtHeaders_dataTrace_no_dispatch`
+  — the trace-level statement: over any pure DATA trace for a rejected
+  stream, every step is dispatch-free and the stream ends inert.
+
+Remaining obligations for the full connection-level property (identified,
+not yet proved):
+
+* HEADERS/CONTINUATION steps: an inert stream id can never be reopened
+  because `requireNewClientStreamId` enforces id monotonicity and rejection
+  only happens for ids at or below `lastClientStreamId`; proving preservation
+  through `processHeadersShared` requires factoring its pure bookkeeping out
+  of the surrounding `IO` (the authorizer call), of which
+  `rejectStreamAtHeaders` is the first piece.
+* Non-DATA pure steps (SETTINGS, WINDOW_UPDATE, RST_STREAM, PING, PRIORITY,
+  GOAWAY) preserve inertness; SETTINGS routes through the `partial`
+  `flushOutbound`, which must be totalized (its recursion is structural in
+  `pendingOutbound.size`) before that lemma is provable.
+* The `IO` layer (`processFrameSharedWith`) only spawns dispatch tasks for
+  the `detached`/`requestStreaming`/`requestFeeds` artifacts shown empty
+  above, so the pure results extend to the task layer by inspection; making
+  that formal needs an `IO`-free event-trace refactor of the spawn sites.
+-/
+
+/-- `true` when the connection rejected the stream at request headers and is
+draining its remaining body without dispatch. -/
+def State.rejectedAtHeaders (state : State) (streamId : Nat) : Bool :=
+  containsStreamId state.ignoredInboundStreams streamId
+
+/-- A stream id that can never reach a handler in this connection state: no
+buffered header/body frames, no incremental request feed, and the id is
+already claimed, so HTTP/2 stream-id monotonicity forbids reopening it. -/
+structure State.StreamInert (state : State) (streamId : Nat) : Prop where
+  notBuffered : ∀ stream ∈ state.streams, stream.streamId ≠ streamId
+  notActive : ∀ active ∈ state.activeRequestStreams, active.streamId ≠ streamId
+  claimed : streamId ≤ state.lastClientStreamId
+
+private theorem containsStreamId_pushUniqueStreamId (l : Array Nat) (id : Nat) :
+    containsStreamId (pushUniqueStreamId l id) id = true := by
+  unfold pushUniqueStreamId
+  split
+  next h => exact h
+  next h => simp [containsStreamId]
+
+private theorem removeStream_not_mem (streams : Array StreamState) (id : Nat) :
+    ∀ s ∈ removeStream streams id, s.streamId ≠ id := by
+  intro s hs
+  have := (Array.mem_filter.mp hs).2
+  simpa [bne_iff_ne] using this
+
+private theorem removeActiveRequestStream_not_mem (streams : Array ActiveRequestStream)
+    (id : Nat) : ∀ s ∈ removeActiveRequestStream streams id, s.streamId ≠ id := by
+  intro s hs
+  have := (Array.mem_filter.mp hs).2
+  simpa [bne_iff_ne] using this
+
+/-- A rejection whose request body is still open leaves the stream in
+drain-only mode. -/
+theorem rejectStreamAtHeaders_rejected (state : State) (streamId : Nat)
+    (inboundHpack outboundHpack : Hpack.State) :
+    (rejectStreamAtHeaders state streamId inboundHpack outboundHpack false).rejectedAtHeaders
+      streamId = true := by
+  unfold rejectStreamAtHeaders ignoreInboundStreamBody State.rejectedAtHeaders
+  simp only [Bool.false_eq_true]
+  exact containsStreamId_pushUniqueStreamId _ _
+
+/-- Rejecting a stream at headers makes it inert: its buffered frames are
+gone, it never entered the incremental request path, and its id cannot be
+reopened. -/
+theorem rejectStreamAtHeaders_inert (state : State) (streamId : Nat)
+    (inboundHpack outboundHpack : Hpack.State) (endStream : Bool)
+    (hclaimed : streamId ≤ state.lastClientStreamId)
+    (hactive : ∀ active ∈ state.activeRequestStreams, active.streamId ≠ streamId) :
+    (rejectStreamAtHeaders state streamId inboundHpack outboundHpack
+      endStream).StreamInert streamId := by
+  unfold rejectStreamAtHeaders
+  split
+  · exact {
+      notBuffered := by
+        intro s hs
+        exact removeStream_not_mem _ _ s (by simpa [removeInboundStreamState] using hs)
+      notActive := by
+        intro s hs
+        exact removeActiveRequestStream_not_mem _ _ s
+          (by simpa [removeInboundStreamState] using hs)
+      claimed := hclaimed
+    }
+  · exact {
+      notBuffered := by
+        intro s hs
+        have hs' : s ∈ removeStream (removeStream state.streams streamId) streamId := by
+          simpa [ignoreInboundStreamBody] using hs
+        exact removeStream_not_mem _ _ s hs'
+      notActive := by
+        intro s hs
+        exact hactive s (by simpa [ignoreInboundStreamBody] using hs)
+      claimed := hclaimed
+    }
+
+
+private theorem consumeInboundDataWindow_ok {state state' : State} {frame : Frame}
+    (h : consumeInboundDataWindow state frame = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.ignoredInboundStreams = state.ignoredInboundStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold consumeInboundDataWindow at h
+  simp only [] at h
+  split at h
+  next =>
+    cases h
+    exact ⟨rfl, rfl, rfl, rfl⟩
+  next =>
+    split at h
+    next => cases h
+    next =>
+      split at h
+      next => cases h
+      next =>
+        cases h
+        simp [setInboundStreamWindow]
+
+private theorem replenishInboundDataWindow_fields (state : State) (frame : Frame) :
+    (replenishInboundDataWindow state frame).streams = state.streams
+      ∧ (replenishInboundDataWindow state frame).activeRequestStreams
+          = state.activeRequestStreams
+      ∧ (replenishInboundDataWindow state frame).ignoredInboundStreams
+          = state.ignoredInboundStreams
+      ∧ (replenishInboundDataWindow state frame).lastClientStreamId
+          = state.lastClientStreamId := by
+  unfold replenishInboundDataWindow
+  grind [setInboundStreamWindow]
+
+private theorem removeInboundStreamState_fields (state : State) (streamId : Nat) :
+    (removeInboundStreamState state streamId).streams = state.streams
+      ∧ (removeInboundStreamState state streamId).lastClientStreamId
+          = state.lastClientStreamId
+      ∧ (∀ active ∈ (removeInboundStreamState state streamId).activeRequestStreams,
+          active ∈ state.activeRequestStreams) := by
+  refine ⟨rfl, rfl, ?_⟩
+  intro active hactive
+  exact (Array.mem_filter.mp hactive).1
+
+private theorem processIgnoredInboundData_ok {state state' : State} {frame : Frame}
+    {updates : Array Frame}
+    (h : processIgnoredInboundData state frame = .ok (state', updates)) :
+    state'.streams = state.streams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams) := by
+  unfold processIgnoredInboundData at h
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst,
+    pure, Except.pure] at h
+  split at h
+  next => cases h
+  next s1 hcons =>
+    split at h
+    next => cases h
+    next updates1 hupd =>
+      split at h
+      next => cases h
+      next frame1 hstrip =>
+        split at h
+        next => cases h
+        next _u hnorm =>
+          cases h
+          obtain ⟨hs1, ha1, -, hl1⟩ := consumeInboundDataWindow_ok hcons
+          obtain ⟨hs2, ha2, -, hl2⟩ := replenishInboundDataWindow_fields s1 frame
+          split
+          · obtain ⟨hs3, hl3, ha3⟩ := removeInboundStreamState_fields
+              (replenishInboundDataWindow s1 frame) frame1.header.streamId
+            refine ⟨hs3.trans (hs2.trans hs1), hl3.trans (hl2.trans hl1), ?_⟩
+            intro active hmem
+            have hmem' := ha3 active hmem
+            rw [ha2, ha1] at hmem'
+            exact hmem'
+          · refine ⟨hs2.trans hs1, hl2.trans hl1, ?_⟩
+            intro active hmem
+            rw [ha2, ha1] at hmem
+            exact hmem
+
+
+/-- A DATA frame for a stream rejected at headers is drained: the step
+produces no request feed, no detached dispatch, no request-streaming
+dispatch, and no cancellations, and the stream cannot re-enter the
+dispatchable state. -/
+private theorem processDataShared_rejected {registry : Registry} {state state' : State}
+    {frame : Frame} {result : SharedFrameResult}
+    (hrej : state.rejectedAtHeaders frame.header.streamId = true)
+    (h : processDataShared registry state frame = .ok (state', result)) :
+    result.requestFeeds = #[] ∧ result.detached = none ∧ result.requestStreaming = none
+      ∧ result.cancelDispatches = #[]
+      ∧ state'.streams = state.streams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams) := by
+  unfold processDataShared at h
+  simp only [bind, Except.bind] at h
+  split at h
+  next => cases h
+  next _u _hreq =>
+    rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = true
+      from hrej] at h
+    simp only [if_true] at h
+    split at h
+    next => cases h
+    next pair hproc =>
+      obtain ⟨s2, updates⟩ := pair
+      cases h
+      obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
+      exact ⟨rfl, rfl, rfl, rfl, hs, hl, ha⟩
+
+/-- A DATA frame for an inert stream that is not in drain mode is a protocol
+error: the connection refuses it instead of dispatching. -/
+private theorem processDataShared_inert_error {registry : Registry} {state : State}
+    {frame : Frame} (hinert : state.StreamInert frame.header.streamId)
+    (hnotrej : state.rejectedAtHeaders frame.header.streamId = false)
+    {state' : State} {result : SharedFrameResult} :
+    processDataShared registry state frame ≠ .ok (state', result) := by
+  intro h
+  unfold processDataShared at h
+  simp only [bind, Except.bind] at h
+  split at h
+  next => cases h
+  next _u _hreq =>
+    rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = false
+      from hnotrej] at h
+    simp only [Bool.false_eq_true, if_false] at h
+    have hactive : findActiveRequestStream? state.activeRequestStreams
+        frame.header.streamId = none := by
+      unfold findActiveRequestStream?
+      rw [Array.find?_eq_none]
+      intro x hx
+      simp [hinert.notActive x hx]
+    have hstream : findStream? state.streams frame.header.streamId = none := by
+      unfold findStream?
+      rw [Array.find?_eq_none]
+      intro x hx
+      simp [hinert.notBuffered x hx]
+    rw [hactive, hstream] at h
+    simp at h
+
+
+/-- A pure trace of the shared kernel's DATA-frame steps: each listed frame
+is processed by `processDataShared` from the previous state and produces the
+recorded `SharedFrameResult`. -/
+private inductive DataTrace (registry : Registry) :
+    State -> List (Frame × SharedFrameResult) -> State -> Prop
+  | nil (state : State) : DataTrace registry state [] state
+  | step {state mid final : State} {frame : Frame} {result : SharedFrameResult}
+      {rest : List (Frame × SharedFrameResult)}
+      (h : processDataShared registry state frame = .ok (mid, result))
+      (htail : DataTrace registry mid rest final) :
+      DataTrace registry state ((frame, result) :: rest) final
+
+private theorem DataTrace.inert_no_dispatch {registry : Registry}
+    {state final : State} {steps : List (Frame × SharedFrameResult)}
+    (trace : DataTrace registry state steps final) (streamId : Nat)
+    (htarget : ∀ step ∈ steps, (step.1 : Frame).header.streamId = streamId)
+    (hinert : state.StreamInert streamId) :
+    final.StreamInert streamId
+      ∧ ∀ step ∈ steps,
+          (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
+            ∧ (step.2).requestStreaming = none ∧ (step.2).cancelDispatches = #[] := by
+  induction steps generalizing state with
+  | nil =>
+      cases trace
+      exact ⟨hinert, by simp⟩
+  | cons head rest ih =>
+      cases trace with
+      | step h htail =>
+        rename_i mid frame result
+        have htargetHead : frame.header.streamId = streamId :=
+          htarget (frame, result) List.mem_cons_self
+        cases hrej : state.rejectedAtHeaders frame.header.streamId with
+        | false =>
+            exact absurd h (processDataShared_inert_error (htargetHead.symm ▸ hinert) hrej)
+        | true =>
+            obtain ⟨hfeeds, hdet, hstreaming, hcancel, hs, hl, ha⟩ :=
+              processDataShared_rejected hrej h
+            have hmid : mid.StreamInert streamId := {
+              notBuffered := fun s hs' => hinert.notBuffered s (hs ▸ hs'),
+              notActive := fun a ha' => hinert.notActive a (ha a ha'),
+              claimed := by rw [hl]; exact hinert.claimed
+            }
+            have ihres := ih htail
+              (fun step hstep => htarget step (List.mem_cons_of_mem _ hstep)) hmid
+            refine ⟨ihres.1, ?_⟩
+            intro step hstep
+            cases hstep with
+            | head => exact ⟨hfeeds, hdet, hstreaming, hcancel⟩
+            | tail _ hstep => exact ihres.2 step hstep
+
+/-- Groundwork headline: when request-header authorization rejects a stream
+whose body is still open, any pure DATA trace for that stream drains without
+producing any dispatch work, and the stream ends (and stays) inert. -/
+private theorem rejectStreamAtHeaders_dataTrace_no_dispatch
+    {registry : Registry} {state final : State}
+    {steps : List (Frame × SharedFrameResult)}
+    (streamId : Nat) (inboundHpack outboundHpack : Hpack.State) (endStream : Bool)
+    (hclaimed : streamId ≤ state.lastClientStreamId)
+    (hactive : ∀ active ∈ state.activeRequestStreams, active.streamId ≠ streamId)
+    (trace : DataTrace registry
+      (rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream)
+      steps final)
+    (htarget : ∀ step ∈ steps, (step.1 : Frame).header.streamId = streamId) :
+    final.StreamInert streamId
+      ∧ ∀ step ∈ steps,
+          (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
+            ∧ (step.2).requestStreaming = none ∧ (step.2).cancelDispatches = #[] :=
+  trace.inert_no_dispatch streamId htarget
+    (rejectStreamAtHeaders_inert state streamId inboundHpack outboundHpack endStream
+      hclaimed hactive)
 
 end Connection
 end Http2
