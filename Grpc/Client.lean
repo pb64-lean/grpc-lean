@@ -481,6 +481,13 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
       Except.ok <$> nextReaderEvent connection
     catch err =>
       pure (Except.error (Status.ofIOError err))
+  -- `.stop` (this side closing the connection) and a peer EOF both end the
+  -- loop, but they are very different diagnoses, so they are not collapsed into
+  -- one status: a report of "connection closed" then always means the peer went
+  -- away, never that we shut ourselves down.
+  let localStop : Bool := match event with
+    | .ok .stop => true
+    | _ => false
   let chunk? : Except Status (Option ByteArray) := match event with
     | .error status => .error status
     | .ok .stop => .ok none
@@ -497,7 +504,11 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
     | other, _ => pure other
   match chunk? with
   | .error status => failConnection connection status
-  | .ok none => failConnection connection (Status.error .unavailable "connection closed")
+  | .ok none =>
+      if localStop then
+        failConnection connection (Status.error .unavailable "connection shut down locally")
+      else
+        failConnection connection (Status.error .unavailable "connection closed by peer")
   | .ok (some chunk) =>
       let frames? ← connection.state.atomically do
         let state ← get

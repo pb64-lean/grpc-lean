@@ -658,6 +658,10 @@ private def adjustOutboundWindows (oldInitial newInitial : Nat)
     (windows : Array OutboundStreamWindow) : Except Status (Array OutboundStreamWindow) :=
   windows.foldlM (init := #[]) (adjustOutboundWindowStep oldInitial newInitial)
 
+/-- Connection error.  RFC 9113 §6.5.2: "Values above the maximum flow-control
+window size of 2^31-1 MUST be treated as a connection error (Section 5.4.1) of
+type FLOW_CONTROL_ERROR."  A SETTINGS frame is connection-scoped, so there is no
+stream to reset. -/
 private def applyInitialWindowSize (state : State) (value : Nat) : Except Status State := do
   if value > maxStreamId then
     throw (Status.internal "HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE exceeds 31-bit length")
@@ -669,6 +673,9 @@ private def applyInitialWindowSize (state : State) (value : Nat) : Except Status
     outboundStreamWindows := windows
   }
 
+/-- Connection error.  RFC 9113 §6.5.2: SETTINGS_MAX_FRAME_SIZE "The initial
+value is 2^14 octets ... Values outside this range MUST be treated as a
+connection error (Section 5.4.1) of type PROTOCOL_ERROR." -/
 private def applyMaxFrameSize (state : State) (value : Nat) : Except Status State := do
   if value < defaultMaxFramePayloadLength || value > maxFramePayloadLength then
     throw (Status.internal "HTTP/2 SETTINGS_MAX_FRAME_SIZE is outside the allowed range")
@@ -682,6 +689,9 @@ private def applyPeerSetting (state : State) (setting : Setting) : Except Status
       if setting.value == 0 || setting.value == 1 then
         pure state
       else
+        -- Connection error.  RFC 9113 §6.5.2: SETTINGS_ENABLE_PUSH "Any value
+        -- other than 0 or 1 MUST be treated as a connection error
+        -- (Section 5.4.1) of type PROTOCOL_ERROR."
         throw (Status.internal "HTTP/2 SETTINGS_ENABLE_PUSH must be 0 or 1")
   | .initialWindowSize =>
       applyInitialWindowSize state setting.value
@@ -1965,9 +1975,7 @@ point of this section.
   not affect processing of other streams".  It is reported with RST_STREAM and
   the connection keeps serving.
 
-`streamErrorResult` is the single mechanism for the second kind.  It emits the
-RST_STREAM the RFC prescribes, drops every trace of the stream from the request
-tables, cancels a dispatch already running for it, and leaves the id in
+Two transitions implement the second kind, and both end with the stream id in
 drain-only mode (`ignoredInboundStreams`) — because §5.4.2 continues: "after
 sending the RST_STREAM, the sending endpoint MUST be prepared to receive and
 process additional frames sent on the stream that might have been sent by the
@@ -1976,24 +1984,22 @@ flow-controlled bytes to stay accounted for.  Drain-only mode is exactly the
 mode already used for a stream rejected at headers, so its inertness is covered
 by `State.StreamInert` and the trace theorems below.
 
+* `resetClosedStreamData` (here) — DATA for a stream that has already closed.
+* `rejectStreamAtHeaders` (above, reused by `authorizeRequestHeadersForStream`)
+  — a stream refused at completed request headers, whether by the authorizer or
+  by `SETTINGS_MAX_CONCURRENT_STREAMS`.
+
 One constraint shapes every decision here: a stream error may only be raised
 once the frame's field block (if any) has been decoded.  RFC 9113 §4.3 —
-"A decoding error in a field block MUST be treated as a connection error of
-type COMPRESSION_ERROR" — makes the HPACK dynamic table connection-wide state,
-so skipping a block desynchronises the decoder for every later stream.  That is
-why the failures detected *before* HPACK decoding (padding, truncated priority
-section, oversized header block, CONTINUATION sequencing) stay connection-fatal
-even where an RFC rule in isolation would allow a stream error. -/
-private def streamErrorResult (state : State) (streamId : Nat) (code : ErrorCode)
-    (emitted : Array Frame := #[]) : Except Status (State × SharedFrameResult) := do
-  let rst ← RstStream.frame streamId code
-  let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
-  let state := removeOutboundStreamState {
-    state with
-    activeRequestStreams := removeActiveRequestStream state.activeRequestStreams streamId
-  } streamId
-  pure (ignoreInboundStreamBody state streamId,
-    { emitted := emitted.push rst, cancelDispatches := cancelDispatches })
+"A receiver MUST terminate the connection with a connection error
+(Section 5.4.1) of type COMPRESSION_ERROR if it does not decompress a field
+block" — makes the HPACK dynamic table connection-wide state, so skipping a
+block desynchronises the decoder for every later stream.  That is why the
+failures detected *before* HPACK decoding (padding, truncated priority section,
+oversized header block, CONTINUATION sequencing) stay connection-fatal even
+where an RFC rule in isolation would allow a stream error, and why the
+concurrency refusal is deferred until the block has been read.
+-/
 
 /-- A DATA frame naming a stream id that was opened earlier and has since
 closed.
