@@ -190,6 +190,287 @@ def decodeBytes (value : String) : Except String ByteArray := do
   let value ← paddedInput value
   decodeLoop value.toList ByteArray.empty
 
+/-!
+### Codec laws
+
+`decodeBytes_encodeBytes` and `decodeBytes_encodeBytesUnpadded`: base64
+decoding inverts both the padded and the unpadded encoder, so `-bin`
+metadata values survive a wire roundtrip.
+-/
+
+set_option maxRecDepth 8192 in
+private theorem decodeChar?_alphabetChar {n : Nat} (h : n < 64) :
+    decodeChar? (alphabetChar n) = some n :=
+  (by decide : ∀ i : Fin 64, decodeChar? (alphabetChar i.val) = some i.val) ⟨n, h⟩
+
+set_option maxRecDepth 8192 in
+private theorem alphabetChar_beq_pad {n : Nat} (h : n < 64) :
+    (alphabetChar n == '=') = false :=
+  (by decide : ∀ i : Fin 64, (alphabetChar i.val == '=') = false) ⟨n, h⟩
+
+private theorem alphabetChar_ne_pad {n : Nat} (h : n < 64) : alphabetChar n ≠ '=' := by
+  have := alphabetChar_beq_pad h
+  simpa using this
+
+private theorem byteArray_push_eq_append (a : ByteArray) (x : UInt8) :
+    a.push x = a ++ ByteArray.empty.push x := by
+  have hdata : (a.push x).data = (a ++ ByteArray.empty.push x).data := by
+    rw [ByteArray.data_push, ByteArray.data_append]
+    exact Array.push_eq_append
+  cases ha : a.push x
+  cases hb : a ++ ByteArray.empty.push x
+  simp_all
+
+private theorem append_push (a b : ByteArray) (x : UInt8) :
+    a ++ b.push x = (a ++ b).push x := by
+  have hdata : (a ++ b.push x).data = ((a ++ b).push x).data := by
+    rw [ByteArray.data_append, ByteArray.data_push, ByteArray.data_push,
+      ByteArray.data_append, Array.push_eq_append, Array.push_eq_append,
+      Array.append_assoc]
+  cases ha : a ++ b.push x
+  cases hb : (a ++ b).push x
+  simp_all
+
+private theorem extract_singleton {bytes : ByteArray} {i : Nat} (h : i < bytes.size) :
+    bytes.extract i (i + 1) = ByteArray.empty.push bytes[i] := by
+  apply ByteArray.ext_getElem
+  · rw [ByteArray.size_extract]
+    show min (i + 1) bytes.size - i = 1
+    omega
+  · intro j hj hj'
+    rw [ByteArray.getElem_extract]
+    have hj0 : j = 0 := by
+      rw [ByteArray.size_extract] at hj
+      omega
+    subst hj0
+    rfl
+
+/-- Moving one decoded byte from the accumulator into the residual slice. -/
+private theorem push_extract_step {bytes : ByteArray} {i : Nat} (h : i < bytes.size)
+    (out : ByteArray) :
+    out.push bytes[i] ++ bytes.extract (i + 1) bytes.size
+      = out ++ bytes.extract i bytes.size := by
+  rw [byteArray_push_eq_append, ByteArray.append_assoc,
+    show ByteArray.empty.push bytes[i] = bytes.extract i (i + 1) from (extract_singleton h).symm,
+    ByteArray.extract_append_extract,
+    show min i (i + 1) = i from by omega,
+    show max (i + 1) bytes.size = bytes.size from by omega]
+
+private theorem extract_eq_empty {bytes : ByteArray} {i : Nat} (h : bytes.size ≤ i) :
+    bytes.extract i bytes.size = ByteArray.empty :=
+  ByteArray.extract_eq_empty_iff.mpr (by omega)
+
+private theorem ofNat_toNat_of_eq {x : UInt8} {n : Nat} (h : n = x.toNat) :
+    UInt8.ofNat n = x := by
+  rw [h, UInt8.ofNat_toNat]
+
+/-- Three decoded bytes moved from the accumulator into the residual slice. -/
+private theorem push3_extract_step {bytes : ByteArray} {i : Nat} (h2 : i + 2 < bytes.size)
+    (out : ByteArray) :
+    ((out.push bytes[i]).push bytes[i + 1]).push bytes[i + 2]
+        ++ bytes.extract (i + 3) bytes.size
+      = out ++ bytes.extract i bytes.size := by
+  have h1 : i + 1 < bytes.size := by omega
+  have h : i < bytes.size := by omega
+  rw [show i + 3 = i + 2 + 1 from by omega, push_extract_step h2,
+    show i + 2 = i + 1 + 1 from by omega, push_extract_step h1, push_extract_step h]
+
+/-- Base64 decoding recovers every byte an encoding pass emitted, appended to
+whatever the accumulator already held. -/
+private theorem decodeLoop_encodeLoop (bytes : ByteArray) (i : Nat) :
+    ∀ out, decodeLoop (encodeLoop bytes i) out = .ok (out ++ bytes.extract i bytes.size) := by
+  fun_induction encodeLoop bytes i
+  next i h h1 h2 ih =>
+    intro out
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    have b1 : bytes[i + 1].toNat < 256 := UInt8.toNat_lt bytes[i + 1]
+    have b2 : bytes[i + 2].toNat < 256 := UInt8.toNat_lt bytes[i + 2]
+    rw [decodeLoop]
+    simp only [decodeChar?_alphabetChar (show bytes[i].toNat / 4 < 64 by omega),
+      decodeChar?_alphabetChar
+        (show bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16 < 64 by omega),
+      decodeChar?_alphabetChar
+        (show bytes[i + 1].toNat % 16 * 4 + bytes[i + 2].toNat / 64 < 64 by omega),
+      decodeChar?_alphabetChar (show bytes[i + 2].toNat % 64 < 64 by omega),
+      alphabetChar_beq_pad
+        (show bytes[i + 1].toNat % 16 * 4 + bytes[i + 2].toNat / 64 < 64 by omega),
+      alphabetChar_beq_pad (show bytes[i + 2].toNat % 64 < 64 by omega),
+      Bool.false_eq_true, Bool.false_and, Bool.and_false, Bool.false_or, if_false,
+      Option.isNone_some, Bool.and_true, decodeQuad, append_push, ByteArray.append_empty]
+    rw [ih]
+    rw [ofNat_toNat_of_eq
+        (show bytes[i].toNat / 4 * 4 + (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16) / 16
+          = bytes[i].toNat by omega),
+      ofNat_toNat_of_eq
+        (show (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16) % 16 * 16
+            + (bytes[i + 1].toNat % 16 * 4 + bytes[i + 2].toNat / 64) / 4
+          = bytes[i + 1].toNat by omega),
+      ofNat_toNat_of_eq
+        (show (bytes[i + 1].toNat % 16 * 4 + bytes[i + 2].toNat / 64) % 4 * 64
+            + bytes[i + 2].toNat % 64
+          = bytes[i + 2].toNat by omega),
+      push3_extract_step h2]
+  next i h h1 h2 =>
+    intro out
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    have b1 : bytes[i + 1].toNat < 256 := UInt8.toNat_lt bytes[i + 1]
+    rw [decodeLoop]
+    simp only [decodeChar?_alphabetChar (show bytes[i].toNat / 4 < 64 by omega),
+      decodeChar?_alphabetChar
+        (show bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16 < 64 by omega),
+      decodeChar?_alphabetChar (show bytes[i + 1].toNat % 16 * 4 < 64 by omega),
+      alphabetChar_beq_pad (show bytes[i + 1].toNat % 16 * 4 < 64 by omega),
+      Bool.false_eq_true, Bool.false_and, Bool.and_false, Bool.false_or, if_false,
+      Option.isNone_some, Bool.and_true, Bool.not_true, Bool.true_and, Bool.and_self,
+      List.isEmpty_nil, if_true, beq_self_eq_true, bne_self_eq_false, Option.isNone_none,
+      decodeLoop, decodeQuad, append_push, ByteArray.append_empty]
+    rw [ofNat_toNat_of_eq
+        (show bytes[i].toNat / 4 * 4 + (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16) / 16
+          = bytes[i].toNat by omega),
+      ofNat_toNat_of_eq
+        (show (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16) % 16 * 16
+            + bytes[i + 1].toNat % 16 * 4 / 4
+          = bytes[i + 1].toNat by omega)]
+    rw [← push_extract_step h out, ← push_extract_step h1 (out.push bytes[i]),
+      extract_eq_empty (show bytes.size ≤ i + 1 + 1 by omega), ByteArray.append_empty]
+  next i h h1 =>
+    intro out
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    rw [decodeLoop]
+    simp only [decodeChar?_alphabetChar (show bytes[i].toNat / 4 < 64 by omega),
+      decodeChar?_alphabetChar (show bytes[i].toNat % 4 * 16 < 64 by omega),
+      Bool.false_eq_true, Bool.false_and, Bool.and_false, Bool.false_or, if_false,
+      Option.isNone_some, Bool.and_true, Bool.not_true, Bool.true_and, Bool.and_self,
+      List.isEmpty_nil, if_true, beq_self_eq_true, bne_self_eq_false, Option.isNone_none,
+      decodeLoop, decodeQuad, append_push, ByteArray.append_empty]
+    rw [← push_extract_step h out, extract_eq_empty (show bytes.size ≤ i + 1 by omega),
+      ByteArray.append_empty,
+      ofNat_toNat_of_eq
+        (show bytes[i].toNat / 4 * 4 + bytes[i].toNat % 4 * 16 / 16 = bytes[i].toNat by omega)]
+  next i h =>
+    intro out
+    rw [decodeLoop, extract_eq_empty (by omega), ByteArray.append_empty]
+
+private theorem encodeLoop_length_mod (bytes : ByteArray) (i : Nat) :
+    (encodeLoop bytes i).length % 4 = 0 := by
+  fun_induction encodeLoop bytes i <;> simp_all <;> omega
+
+/-- Base64 decoding inverts the padded encoder. -/
+theorem decodeBytes_encodeBytes (bytes : ByteArray) :
+    decodeBytes (encodeBytes bytes) = .ok bytes := by
+  have hpad : paddedInput (encodeBytes bytes) = .ok (encodeBytes bytes) := by
+    unfold paddedInput encodeBytes
+    rw [String.toList_ofList, encodeLoop_length_mod]
+    rfl
+  unfold decodeBytes
+  simp only [bind, Except.bind, hpad]
+  rw [encodeBytes, String.toList_ofList, decodeLoop_encodeLoop, ByteArray.extract_zero_size,
+    ByteArray.empty_append]
+
+private theorem dropLeadingPadding_cons_ne {c : Char} (hc : c ≠ '=') (l : List Char) :
+    dropLeadingPadding (c :: l) = c :: l := by
+  rw [dropLeadingPadding.eq_def]
+  split <;> simp_all
+
+private theorem dropLeadingPadding_replicate_append (k : Nat) (l : List Char)
+    (h : ∀ c ∈ l, c ≠ '=') : dropLeadingPadding (List.replicate k '=' ++ l) = l := by
+  induction k with
+  | zero =>
+      cases l with
+      | nil => rfl
+      | cons c rest => exact dropLeadingPadding_cons_ne (h c (by simp)) rest
+  | succ k ih =>
+      rw [List.replicate_succ, List.cons_append, dropLeadingPadding]
+      exact ih
+
+/-- An encoding pass emits a padding-free body followed by at most two `=`
+padding characters, and the two together are a multiple of four long. -/
+private theorem encodeLoop_split (bytes : ByteArray) (i : Nat) :
+    ∃ front k, encodeLoop bytes i = front ++ List.replicate k '=' ∧ k ≤ 2
+      ∧ (∀ c ∈ front, c ≠ '=') ∧ (front.length + k) % 4 = 0 := by
+  fun_induction encodeLoop bytes i
+  next i h h1 h2 ih =>
+    obtain ⟨front, k, heq, hk, hne, hlen⟩ := ih
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    have b1 : bytes[i + 1].toNat < 256 := UInt8.toNat_lt bytes[i + 1]
+    have b2 : bytes[i + 2].toNat < 256 := UInt8.toNat_lt bytes[i + 2]
+    refine ⟨alphabetChar (bytes[i].toNat / 4)
+        :: alphabetChar (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16)
+        :: alphabetChar (bytes[i + 1].toNat % 16 * 4 + bytes[i + 2].toNat / 64)
+        :: alphabetChar (bytes[i + 2].toNat % 64) :: front, k, by rw [heq]; rfl, hk, ?_, ?_⟩
+    · intro c hc
+      simp only [List.mem_cons] at hc
+      rcases hc with rfl | rfl | rfl | rfl | hc
+      · exact alphabetChar_ne_pad (by omega)
+      · exact alphabetChar_ne_pad (by omega)
+      · exact alphabetChar_ne_pad (by omega)
+      · exact alphabetChar_ne_pad (by omega)
+      · exact hne c hc
+    · simp only [List.length_cons]
+      omega
+  next i h h1 h2 =>
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    have b1 : bytes[i + 1].toNat < 256 := UInt8.toNat_lt bytes[i + 1]
+    refine ⟨[alphabetChar (bytes[i].toNat / 4),
+        alphabetChar (bytes[i].toNat % 4 * 16 + bytes[i + 1].toNat / 16),
+        alphabetChar (bytes[i + 1].toNat % 16 * 4)], 1, rfl, by omega, ?_, by simp⟩
+    intro c hc
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+    rcases hc with rfl | rfl | rfl
+    · exact alphabetChar_ne_pad (by omega)
+    · exact alphabetChar_ne_pad (by omega)
+    · exact alphabetChar_ne_pad (by omega)
+  next i h h1 =>
+    have b0 : bytes[i].toNat < 256 := UInt8.toNat_lt bytes[i]
+    refine ⟨[alphabetChar (bytes[i].toNat / 4), alphabetChar (bytes[i].toNat % 4 * 16)], 2,
+      rfl, by omega, ?_, by simp⟩
+    intro c hc
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+    rcases hc with rfl | rfl
+    · exact alphabetChar_ne_pad (by omega)
+    · exact alphabetChar_ne_pad (by omega)
+  next i h =>
+    exact ⟨[], 0, rfl, by omega, by simp, by simp⟩
+
+/-- Base64 decoding inverts the unpadded encoder used for `-bin` metadata:
+the decoder restores the stripped `=` padding before decoding. -/
+theorem decodeBytes_encodeBytesUnpadded (bytes : ByteArray) :
+    decodeBytes (encodeBytesUnpadded bytes) = .ok bytes := by
+  obtain ⟨front, k, heq, hk, hne, hlen⟩ := encodeLoop_split bytes 0
+  have hunpadded : encodeBytesUnpadded bytes = String.ofList front := by
+    unfold encodeBytesUnpadded encodeBytes
+    rw [String.toList_ofList, heq, List.reverse_append, List.reverse_replicate,
+      dropLeadingPadding_replicate_append k front.reverse
+        (fun c hc => hne c (List.mem_reverse.mp hc)),
+      List.reverse_reverse]
+  have hpad : ∃ s, paddedInput (encodeBytesUnpadded bytes) = .ok s
+      ∧ s.toList = encodeLoop bytes 0 := by
+    rw [hunpadded]
+    unfold paddedInput
+    rw [String.toList_ofList]
+    match k, hk, hlen with
+    | 0, _, hlen =>
+        refine ⟨String.ofList front, ?_, ?_⟩
+        · rw [show front.length % 4 = 0 from by omega]
+          rfl
+        · rw [String.toList_ofList, heq, List.replicate_zero, List.append_nil]
+    | 1, _, hlen =>
+        refine ⟨String.ofList front ++ "=", ?_, ?_⟩
+        · rw [show front.length % 4 = 3 from by omega]
+          rfl
+        · rw [String.toList_append, String.toList_ofList, heq]
+          rfl
+    | 2, _, hlen =>
+        refine ⟨String.ofList front ++ "==", ?_, ?_⟩
+        · rw [show front.length % 4 = 2 from by omega]
+          rfl
+        · rw [String.toList_append, String.toList_ofList, heq]
+          rfl
+  obtain ⟨s, hs, hlist⟩ := hpad
+  unfold decodeBytes
+  simp only [bind, Except.bind, hs]
+  rw [hlist, decodeLoop_encodeLoop, ByteArray.extract_zero_size, ByteArray.empty_append]
+
 end Base64
 
 namespace Metadata

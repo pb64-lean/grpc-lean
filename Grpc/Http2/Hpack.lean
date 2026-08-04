@@ -130,13 +130,15 @@ private def huffmanCodeLengths : Array Nat := #[
   30
 ]
 
-private partial def findHuffmanSymbol? (code bits i : Nat) : Option Nat :=
+private def findHuffmanSymbol? (code bits i : Nat) : Option Nat :=
   if i >= huffmanCodes.size then
     none
   else if huffmanCodes[i]! == code && huffmanCodeLengths[i]! == bits then
     some i
   else
     findHuffmanSymbol? code bits (i + 1)
+  termination_by huffmanCodes.size - i
+  decreasing_by omega
 
 private def bitAt (byte : UInt8) (bit : Nat) : Nat :=
   (byte.toNat / (2 ^ bit)) % 2
@@ -144,7 +146,8 @@ private def bitAt (byte : UInt8) (bit : Nat) : Nat :=
 private def validHuffmanPadding (code bits : Nat) : Bool :=
   bits == 0 || (bits <= 7 && code == prefixMax bits)
 
-private partial def decodeHuffmanBits
+set_option maxRecDepth 4096 in
+private def decodeHuffmanBits
     (bytes : ByteArray) (offset bit code bits : Nat) (out : ByteArray) :
     Except Status ByteArray := do
   if offset >= bytes.size then
@@ -168,20 +171,26 @@ private partial def decodeHuffmanBits
             throw (Status.internal "invalid HPACK Huffman code")
           else
             pure (code, bits, out)
-    if bit == 0 then
+    if bit = 0 then
       decodeHuffmanBits bytes (offset + 1) 7 code bits out
     else
       decodeHuffmanBits bytes offset (bit - 1) code bits out
+  termination_by (bytes.size - offset) * 8 + bit
+  decreasing_by
+    · omega
+    · omega
 
 def decodeHuffman (bytes : ByteArray) : Except Status ByteArray :=
   decodeHuffmanBits bytes 0 7 0 0 ByteArray.empty
 
-private partial def encodeHuffmanFlush (acc bits : Nat) (out : ByteArray) : Nat × Nat × ByteArray :=
+private def encodeHuffmanFlush (acc bits : Nat) (out : ByteArray) : Nat × Nat × ByteArray :=
   if bits >= 8 then
-    let shift := bits - 8
-    encodeHuffmanFlush (acc % (2 ^ shift)) shift (out.push (UInt8.ofNat (acc / (2 ^ shift))))
+    encodeHuffmanFlush (acc % (2 ^ (bits - 8))) (bits - 8)
+      (out.push (UInt8.ofNat (acc / (2 ^ (bits - 8)))))
   else
     (acc, bits, out)
+  termination_by bits
+  decreasing_by omega
 
 def encodeHuffman (bytes : ByteArray) : ByteArray :=
   let (acc, bits, out) := bytes.foldl
@@ -351,7 +360,7 @@ def get? (state : State) (index : Nat) : Option Header :=
   else
     state.dynamic[index - staticEntries.size - 1]?
 
-private partial def findExactIn (entries : Array Header) (header : Header) (i start : Nat) : Option Nat :=
+private def findExactIn (entries : Array Header) (header : Header) (i start : Nat) : Option Nat :=
   if i >= entries.size then
     none
   else
@@ -360,8 +369,10 @@ private partial def findExactIn (entries : Array Header) (header : Header) (i st
       some (start + i)
     else
       findExactIn entries header (i + 1) start
+  termination_by entries.size - i
+  decreasing_by omega
 
-private partial def findNameIn (entries : Array Header) (name : String) (i start : Nat) : Option Nat :=
+private def findNameIn (entries : Array Header) (name : String) (i start : Nat) : Option Nat :=
   if i >= entries.size then
     none
   else
@@ -370,6 +381,8 @@ private partial def findNameIn (entries : Array Header) (name : String) (i start
       some (start + i)
     else
       findNameIn entries name (i + 1) start
+  termination_by entries.size - i
+  decreasing_by omega
 
 def findExact? (state : State) (header : Header) : Option Nat :=
   match findExactIn staticEntries header 0 1 with
