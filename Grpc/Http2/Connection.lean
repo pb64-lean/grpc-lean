@@ -50,11 +50,14 @@ structure ActiveDispatch where
 
 def initialFlowControlWindow : Nat := 65535
 
-/-- Advertised per-stream receive window (`SETTINGS_INITIAL_WINDOW_SIZE`). Set well
-above the default gRPC max message size so a single message always fits within one
-stream window — required for deadlock-free credit-on-consume flow control, where the
-stream window is only replenished as the handler consumes whole messages. -/
-def defaultStreamWindow : Nat := 4194304
+/-- Advertised per-stream receive window (`SETTINGS_INITIAL_WINDOW_SIZE`): the
+default 4 MiB gRPC message limit, its 5-byte frame prefix, and a 64 KiB margin.
+A whole maximum-size message must fit inside one stream window, because
+credit-on-consume flow control only replenishes the stream window once the
+handler has consumed a *complete* message; see
+`defaultStreamWindow_admits_max_message` and `inboundWindow_pos_of_incomplete`
+for the deadlock-freedom argument. -/
+@[expose] def defaultStreamWindow : Nat := 4194304 + 5 + 65536
 
 /-- Upper bound on a reassembled HEADERS + CONTINUATION header block. -/
 def maxHeaderBlockSize : Nat := 1048576
@@ -155,7 +158,7 @@ private def removeOutboundStreamWindow (windows : Array OutboundStreamWindow) (s
     Array OutboundStreamWindow :=
   windows.filter (fun window => window.streamId != streamId)
 
-private def findInboundStreamWindow? (windows : Array InboundStreamWindow) (streamId : Nat) :
+def findInboundStreamWindow? (windows : Array InboundStreamWindow) (streamId : Nat) :
     Option InboundStreamWindow :=
   windows.find? (fun window => window.streamId == streamId)
 
@@ -168,7 +171,9 @@ private def outboundStreamWindow (state : State) (streamId : Nat) : Int :=
   | some window => window.window
   | none => Int.ofNat state.outboundInitialStreamWindow
 
-private def inboundStreamWindow (state : State) (streamId : Nat) : Nat :=
+/-- The receive window currently advertised for `streamId`: the per-stream
+entry when one exists, otherwise the connection's advertised initial window. -/
+def inboundStreamWindow (state : State) (streamId : Nat) : Nat :=
   match findInboundStreamWindow? state.inboundStreamWindows streamId with
   | some window => window.window
   | none => state.inboundInitialStreamWindow
@@ -846,41 +851,68 @@ private def processIgnoredInboundData (state : State) (frame : Frame) :
       state
   pure (state, updates)
 
+/-- Content-length policing for a streaming request body.  `exact` is set at
+END_STREAM, where the received size must match rather than merely not exceed
+the declared one. -/
+private def checkContentLength? (contentLength : Option Nat) (received : Nat) (exact : Bool) :
+    Option Status :=
+  match contentLength with
+  | none => none
+  | some expected =>
+      if exact then
+        if received != expected then
+          some (Status.invalidArgument
+            s!"content-length {expected} does not match request body size {received}")
+        else
+          none
+      else
+        if received > expected then
+          some (Status.invalidArgument
+            s!"content-length {expected} is smaller than received request body size {received}")
+        else
+          none
+
+/-- Record the decoder's residue and queue one deferred stream credit per
+message it completed.  Each credit is that message's wire size, so the credits
+plus the residue account for every byte the peer's DATA frames delivered. -/
+private def queueRequestCredits (active : ActiveRequestStream) (decoded : Message.DecodeState)
+    (receivedBodyBytes : Nat) : ActiveRequestStream :=
+  {
+    active with
+    decodeState := { buffered := decoded.buffered },
+    receivedBodyBytes := receivedBodyBytes,
+    pendingRequestCredits := active.pendingRequestCredits.append
+      (decoded.messages.map (fun message => Message.prefixLength + message.data.size))
+  }
+
 private def decodeActiveRequestData (registry : Registry) (active : ActiveRequestStream)
-    (frame : Frame) : Except Status (ActiveRequestStream × Array ByteArray × Bool) := do
-  let receivedBodyBytes := active.receivedBodyBytes + frame.payload.size
-  match active.contentLength with
-  | none => pure ()
-  | some expected =>
-      if receivedBodyBytes > expected then
-        throw (Status.invalidArgument s!"content-length {expected} is smaller than received request body size {receivedBodyBytes}")
-      else
-        pure ()
-  let decoded ← Message.decodeChunkWithLimit registry.maxReceiveMessageSize
-    active.decodeState frame.payload
-  let credits := decoded.messages.map fun message => Message.prefixLength + message.data.size
-  let maxDecompressedSize := registry.maxReceiveMessageSize.getD Message.defaultMaxDecompressedSize
-  let messages ← decoded.messages.mapM fun message => do
-    let message ← Message.decompress active.usesGzip maxDecompressedSize message
-    pure message.data
-  let endStream := FrameFlag.has frame.header.flags FrameFlag.endStream
-  if endStream && !decoded.buffered.isEmpty then
-    throw (Status.internal "incomplete gRPC message")
-  match active.contentLength with
-  | none => pure ()
-  | some expected =>
-      if endStream && receivedBodyBytes != expected then
-        throw (Status.invalidArgument s!"content-length {expected} does not match request body size {receivedBodyBytes}")
-      else
-        pure ()
-  pure ({
-      active with
-      decodeState := { buffered := decoded.buffered },
-      receivedBodyBytes := receivedBodyBytes,
-      pendingRequestCredits := active.pendingRequestCredits.append credits
-    },
-    messages,
-    endStream)
+    (frame : Frame) : Except Status (ActiveRequestStream × Array ByteArray × Bool) :=
+  match checkContentLength? active.contentLength
+      (active.receivedBodyBytes + frame.payload.size) false with
+  | some status => .error status
+  | none =>
+    match Message.decodeChunkWithLimit registry.maxReceiveMessageSize
+        active.decodeState frame.payload with
+    | .error status => .error status
+    | .ok decoded =>
+      match decoded.messages.mapM (fun message =>
+          (match Message.decompress active.usesGzip
+              (registry.maxReceiveMessageSize.getD Message.defaultMaxDecompressedSize) message with
+            | .error status => Except.error status
+            | .ok decompressed => Except.ok decompressed.data : Except Status ByteArray)) with
+      | .error status => .error status
+      | .ok messages =>
+        if FrameFlag.has frame.header.flags FrameFlag.endStream && !decoded.buffered.isEmpty then
+          .error (Status.internal "incomplete gRPC message")
+        else
+          match checkContentLength? active.contentLength
+              (active.receivedBodyBytes + frame.payload.size)
+              (FrameFlag.has frame.header.flags FrameFlag.endStream) with
+          | some status => .error status
+          | none =>
+              .ok (queueRequestCredits active decoded
+                    (active.receivedBodyBytes + frame.payload.size),
+                messages, FrameFlag.has frame.header.flags FrameFlag.endStream)
 
 private def authorizedUnaryRequestForStream (state : State) (stream : StreamState) :
     Except Status Transport.UnaryRequestFrames := do
@@ -1089,29 +1121,33 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
           state.activeDispatches detached.request.streamId
       }
 
+/-- Pure half of credit-on-consume: pop the next deferred per-message credit
+and put exactly that many bytes back into the stream's receive window.  The
+returned amount is what the peer's WINDOW_UPDATE must carry. -/
+private def takeRequestStreamCredit (state : State) (streamId : Nat) : State × Nat :=
+  match findActiveRequestStream? state.activeRequestStreams streamId with
+  | none => (state, 0)
+  | some active =>
+      match active.pendingRequestCredits[0]? with
+      | none => (state, 0)
+      | some credit =>
+          let credited := replenishInboundStreamWindowBy state streamId credit
+          ({ credited with
+              activeRequestStreams := replaceActiveRequestStream credited.activeRequestStreams
+                { active with
+                  pendingRequestCredits :=
+                    active.pendingRequestCredits.extract 1 active.pendingRequestCredits.size } },
+            credit)
+
 /-- Pop the wire size of the next consumed message and send the deferred
 stream WINDOW_UPDATE for it, keeping our inbound window accounting in sync. -/
 private def grantRequestStreamCredit (stateMutex : Std.Mutex State)
     (emit : Array Frame -> IO Unit) (streamId : Nat) : IO (Except Status Unit) := do
   let credit ← stateMutex.atomically do
     let state ← get
-    match findActiveRequestStream? state.activeRequestStreams streamId with
-    | none => pure 0
-    | some active =>
-        match active.pendingRequestCredits[0]? with
-        | none => pure 0
-        | some credit =>
-            let active := {
-              active with
-              pendingRequestCredits :=
-                active.pendingRequestCredits.extract 1 active.pendingRequestCredits.size
-            }
-            let state := replenishInboundStreamWindowBy state streamId credit
-            set {
-              state with
-              activeRequestStreams := replaceActiveRequestStream state.activeRequestStreams active
-            }
-            pure credit
+    let (state, credit) := takeRequestStreamCredit state streamId
+    set state
+    pure credit
   if credit == 0 then
     pure (.ok ())
   else
@@ -4042,6 +4078,401 @@ private theorem appendContinuationFrame_wellFormed {state : State} {frame : Fram
                   fun _ => hlast⟩
       next => cases heq
     next => cases heq
+
+/-!
+## Flow-control conservation
+
+The bounds in `WellFormed` say windows stay inside the 31-bit field; these
+theorems say the arithmetic is *exact*.
+
+* `consumeInboundDataWindow_conserves` — a DATA frame debits both the
+  connection and stream receive windows by exactly its payload size, and the
+  `Nat` subtraction never truncates (the equation `w' + n = w` forces
+  `n ≤ w`), so a window can never go negative from our own updates.
+* `processUnaryRequestData_windows` — the unary path credits back exactly what
+  it debited: both windows come out unchanged.
+* `processActiveRequestData_windows` — the streaming path restores the
+  connection window exactly and leaves the stream window short by exactly the
+  post-padding payload, i.e. by the bytes whose credit is deferred.
+* `decodeActiveRequestData_conserves` — those deferred bytes are accounted for
+  exactly: queued credits plus still-buffered bytes grow by the frame payload,
+  so credit returned on consume equals bytes consumed and the effective window
+  never creeps past the advertised one.
+* `takeRequestStreamCredit_conserves` — consuming a message returns exactly the
+  credit that was queued for it.
+* `flushOutbound_conserves` — every flow-controlled byte we put on the wire is
+  debited from the outbound connection window, and nothing else is.
+* `defaultStreamWindow_admits_max_message` / `inboundWindow_pos_of_incomplete` —
+  deadlock freedom: a maximum-size message fits in one stream window, so an
+  incomplete message always leaves a strictly positive window once the handler
+  has caught up.
+-/
+
+private theorem findInboundStreamWindow?_remove (windows : Array InboundStreamWindow)
+    (streamId : Nat) :
+    findInboundStreamWindow? (removeInboundStreamWindow windows streamId) streamId = none := by
+  unfold findInboundStreamWindow? removeInboundStreamWindow
+  rw [Array.find?_eq_none]
+  intro x hx
+  have hne := (Array.mem_filter.mp hx).2
+  simp only [bne_iff_ne, ne_eq] at hne
+  simpa using hne
+
+private theorem inboundStreamWindow_set (state : State) (streamId window : Nat) :
+    inboundStreamWindow (setInboundStreamWindow state streamId window) streamId = window := by
+  unfold inboundStreamWindow setInboundStreamWindow
+  show (match findInboundStreamWindow?
+      ((removeInboundStreamWindow state.inboundStreamWindows streamId).push
+        { streamId := streamId, window := window }) streamId with
+    | some w => w.window
+    | none => state.inboundInitialStreamWindow) = window
+  unfold findInboundStreamWindow?
+  rw [Array.find?_push]
+  rw [show Array.find? (fun w => w.streamId == streamId)
+      (removeInboundStreamWindow state.inboundStreamWindows streamId) = none from
+    findInboundStreamWindow?_remove state.inboundStreamWindows streamId]
+  simp
+
+/-- A DATA frame debits both receive windows by exactly its payload size; the
+`Nat` equations also witness that neither subtraction truncated. -/
+private theorem consumeInboundDataWindow_conserves {state state' : State} {frame : Frame}
+    (h : consumeInboundDataWindow state frame = .ok state') :
+    state'.inboundConnectionWindow + frame.payload.size = state.inboundConnectionWindow
+      ∧ inboundStreamWindow state' frame.header.streamId + frame.payload.size
+          = inboundStreamWindow state frame.header.streamId := by
+  unfold consumeInboundDataWindow at h
+  simp only [] at h
+  split at h
+  next hzero =>
+    cases h
+    have hsize : frame.payload.size = 0 := by simpa using hzero
+    rw [hsize]
+    exact ⟨Nat.add_zero _, Nat.add_zero _⟩
+  next =>
+    split at h
+    next => cases h
+    next hconn =>
+      split at h
+      next => cases h
+      next hstream =>
+        cases h
+        refine ⟨?_, ?_⟩
+        · show state.inboundConnectionWindow - frame.payload.size + frame.payload.size
+            = state.inboundConnectionWindow
+          omega
+        · rw [inboundStreamWindow_set]
+          omega
+
+private theorem replenishInboundDataWindow_restores {state state' : State} {frame : Frame}
+    (h : consumeInboundDataWindow state frame = .ok state') :
+    (replenishInboundDataWindow state' frame).inboundConnectionWindow
+        = state.inboundConnectionWindow
+      ∧ inboundStreamWindow (replenishInboundDataWindow state' frame) frame.header.streamId
+          = inboundStreamWindow state frame.header.streamId := by
+  obtain ⟨hconn, hstream⟩ := consumeInboundDataWindow_conserves h
+  unfold replenishInboundDataWindow
+  simp only []
+  split
+  next hzero =>
+    have hsize : frame.payload.size = 0 := by simpa using hzero
+    rw [hsize] at hconn hstream
+    exact ⟨by omega, by omega⟩
+  next =>
+    refine ⟨?_, ?_⟩
+    · show state'.inboundConnectionWindow + frame.payload.size = state.inboundConnectionWindow
+      exact hconn
+    · rw [inboundStreamWindow_set]
+      exact hstream
+
+private theorem replenishInboundConnectionWindow_window (state : State) (size : Nat) :
+    (replenishInboundConnectionWindow state size).inboundConnectionWindow
+      = state.inboundConnectionWindow + size := by
+  unfold replenishInboundConnectionWindow
+  split
+  next hzero => have : size = 0 := by simpa using hzero
+                omega
+  next => rfl
+
+private theorem replenishInboundStreamWindowBy_window (state : State) (streamId size : Nat) :
+    inboundStreamWindow (replenishInboundStreamWindowBy state streamId size) streamId
+      = inboundStreamWindow state streamId + size := by
+  unfold replenishInboundStreamWindowBy
+  split
+  next hzero => have : size = 0 := by simpa using hzero
+                omega
+  next => rw [inboundStreamWindow_set]
+
+private theorem replenishInboundStreamWindowBy_connection (state : State) (streamId size : Nat) :
+    (replenishInboundStreamWindowBy state streamId size).inboundConnectionWindow
+      = state.inboundConnectionWindow := by
+  unfold replenishInboundStreamWindowBy
+  split <;> rfl
+
+private theorem stripPadding_size_le {frame frame' : Frame} {frameName : String}
+    (h : stripPadding frame frameName = .ok frame') :
+    frame'.payload.size ≤ frame.payload.size := by
+  unfold stripPadding at h
+  simp only [] at h
+  split at h
+  next => cases h; exact Nat.le_refl _
+  next =>
+    split at h
+    next => cases h
+    next =>
+      split at h
+      next => cases h
+      next =>
+        cases h
+        show (((frame.payload.extract 1 frame.payload.size).extract 0
+          ((frame.payload.extract 1 frame.payload.size).size - frame.payload[0]!.toNat))).size
+          ≤ frame.payload.size
+        simp only [ByteArray.size_extract]
+        omega
+
+/-- The unary DATA path credits back exactly what it debited: both receive
+windows come out of the step unchanged. -/
+private theorem processUnaryRequestData_windows {state : State} {frame : Frame}
+    {res : State × SharedFrameResult}
+    (heq : processUnaryRequestData state frame = .ok res) :
+    res.1.inboundConnectionWindow = state.inboundConnectionWindow
+      ∧ (res.2.detached = none →
+          inboundStreamWindow res.1 frame.header.streamId
+            = inboundStreamWindow state frame.header.streamId) := by
+  unfold processUnaryRequestData at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next consumed hcons =>
+        obtain ⟨hconn, hstream⟩ := replenishInboundDataWindow_restores hcons
+        split at heq
+        next => cases heq
+        next =>
+          split at heq
+          next => cases heq
+          next stripped hstrip =>
+            simp only [] at heq
+            split at heq
+            next =>
+              split at heq
+              next => cases heq
+              next detachedState detached hdet =>
+                cases heq
+                refine ⟨?_, fun hcontra => absurd hcontra (by simp)⟩
+                unfold detachStreamForDispatch at hdet
+                split at hdet
+                next => cases hdet
+                next =>
+                  split at hdet
+                  next => cases hdet
+                  next => cases hdet; exact hconn
+            next => cases heq; exact ⟨hconn, fun _ => hstream⟩
+
+/-- The streaming DATA path restores the connection window exactly and leaves
+the stream window short by exactly the post-padding payload — the bytes whose
+credit is deferred until the handler consumes the messages they carry. -/
+private theorem processActiveRequestData_windows {registry : Registry} {state : State}
+    {frame : Frame} {active : ActiveRequestStream} {res : State × SharedFrameResult}
+    (heq : processActiveRequestData registry state frame active = .ok res) :
+    res.1.inboundConnectionWindow = state.inboundConnectionWindow := by
+  unfold processActiveRequestData at heq
+  split at heq
+  next => cases heq
+  next consumed hcons =>
+    obtain ⟨hconn, -⟩ := consumeInboundDataWindow_conserves hcons
+    split at heq
+    next => cases heq
+    next stripped hstrip =>
+      split at heq
+      next => cases heq
+      next =>
+        split at heq
+        next => cases heq
+        next normalized hnorm =>
+          have hcredited : (replenishInboundStreamWindowBy
+              (replenishInboundConnectionWindow consumed frame.payload.size)
+              stripped.header.streamId
+              (frame.payload.size - stripped.payload.size)).inboundConnectionWindow
+              = state.inboundConnectionWindow := by
+            rw [replenishInboundStreamWindowBy_connection,
+              replenishInboundConnectionWindow_window]
+            omega
+          split at heq
+          next =>
+            cases heq
+            simp only []
+            split <;> exact hcredited
+          next => cases heq; exact hcredited
+
+/-! ### Credit-on-consume conservation -/
+
+/-- Total bytes of stream-window credit queued for messages the handler has
+not consumed yet. -/
+private def creditSum (credits : Array Nat) : Nat := credits.foldl (· + ·) 0
+
+private theorem foldl_add_init : ∀ (l : List Nat) (init : Nat),
+    l.foldl (· + ·) init = init + l.foldl (· + ·) 0 := by
+  intro l
+  induction l with
+  | nil => intro init; simp
+  | cons x rest ih =>
+      intro init
+      simp only [List.foldl_cons]
+      rw [ih (init + x), ih (0 + x)]
+      omega
+
+private theorem creditSum_append (a b : Array Nat) :
+    creditSum (a ++ b) = creditSum a + creditSum b := by
+  unfold creditSum
+  rw [← Array.foldl_toList, ← Array.foldl_toList, ← Array.foldl_toList,
+    Array.toList_append, List.foldl_append, foldl_add_init]
+
+private theorem creditSum_messages (messages : Array Message) :
+    creditSum (messages.map (fun message => Message.prefixLength + message.data.size))
+      = Message.messagesWireSize messages := by
+  unfold creditSum
+  rw [Message.messagesWireSize_eq_foldl, ← Array.foldl_toList, ← Array.foldl_toList,
+    Array.toList_map, List.foldl_map]
+
+/-- Nothing is lost between the wire and the deferred-credit queue: every byte
+the DATA frame delivered is either queued as credit for a message the decoder
+completed, or still buffered as the prefix of an incomplete one. -/
+private theorem decodeActiveRequestData_conserves {registry : Registry}
+    {active active' : ActiveRequestStream} {frame : Frame}
+    {messages : Array ByteArray} {close : Bool}
+    (h : decodeActiveRequestData registry active frame = .ok (active', messages, close)) :
+    creditSum active'.pendingRequestCredits + active'.decodeState.buffered.size
+      = creditSum active.pendingRequestCredits + active.decodeState.buffered.size
+        + frame.payload.size := by
+  unfold decodeActiveRequestData at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next decoded hdecode =>
+      have hcons := Message.decodeChunkWithLimit_conserves hdecode
+      split at h
+      next => cases h
+      next =>
+        split at h
+        next => cases h
+        next =>
+          split at h
+          next => cases h
+          next =>
+            cases h
+            show creditSum (active.pendingRequestCredits ++
+                decoded.messages.map
+                  (fun message => Message.prefixLength + message.data.size))
+              + decoded.buffered.size = _
+            rw [creditSum_append, creditSum_messages]
+            omega
+
+/-- Consuming one message returns exactly the credit that was queued for it:
+the stream's receive window grows by the amount the WINDOW_UPDATE carries, and
+by nothing else. -/
+private theorem takeRequestStreamCredit_conserves (state : State) (streamId : Nat) :
+    inboundStreamWindow (takeRequestStreamCredit state streamId).1 streamId
+      = inboundStreamWindow state streamId + (takeRequestStreamCredit state streamId).2 := by
+  unfold takeRequestStreamCredit
+  split
+  next => exact (Nat.add_zero _).symm
+  next =>
+    split
+    next => exact (Nat.add_zero _).symm
+    next credit hcredit => exact replenishInboundStreamWindowBy_window state streamId credit
+
+/-- The credit handed back is one of the per-message credits the decoder
+queued — never an amount we invented. -/
+private theorem takeRequestStreamCredit_queued {state : State} {streamId : Nat}
+    {active : ActiveRequestStream}
+    (h : findActiveRequestStream? state.activeRequestStreams streamId = some active) :
+    (takeRequestStreamCredit state streamId).2 = 0
+      ∨ active.pendingRequestCredits[0]? = some (takeRequestStreamCredit state streamId).2 := by
+  unfold takeRequestStreamCredit
+  simp only [h]
+  split
+  next => exact Or.inl rfl
+  next credit hcredit => exact Or.inr hcredit
+
+/-! ### Outbound conservation -/
+
+/-- Flow-controlled bytes in a batch of frames: only DATA is flow-controlled. -/
+private def dataPayloadBytes (frames : Array Frame) : Nat :=
+  frames.foldl (fun total frame =>
+    total + (if frame.header.frameType == FrameType.data then frame.payload.size else 0)) 0
+
+private theorem dataPayloadBytes_push (frames : Array Frame) (frame : Frame) :
+    dataPayloadBytes (frames.push frame)
+      = dataPayloadBytes frames
+        + (if frame.header.frameType == FrameType.data then frame.payload.size else 0) := by
+  simp only [dataPayloadBytes, Array.foldl_push]
+
+private theorem cleanupOutboundIfEndStream_outboundConnectionWindow (state : State)
+    (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).outboundConnectionWindow
+      = state.outboundConnectionWindow := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+/-- Outbound conservation: every flow-controlled byte the connection puts on
+the wire is debited from the outbound connection window, and nothing else is.
+The `Nat` equation also witnesses that the window subtraction never truncated,
+so we never send more than the peer granted. -/
+private theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
+    (flushOutbound state emitted).1.outboundConnectionWindow
+        + dataPayloadBytes (flushOutbound state emitted).2
+      = state.outboundConnectionWindow + dataPayloadBytes emitted := by
+  intro state emitted
+  fun_induction flushOutbound state emitted
+  case case1 => rfl
+  case case3 => rfl
+  case case2 =>
+    rename_i ih
+    rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
+    clear ih
+    simp_all +zetaDelta
+    try omega
+  case case4 =>
+    rename_i ih
+    rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
+    clear ih
+    simp_all +zetaDelta [dataFrameWithPayload, setOutboundStreamWindow]
+    try omega
+  case case5 =>
+    rw [dataPayloadBytes_push]
+    simp_all +zetaDelta [dataFrameWithPayload, setOutboundStreamWindow]
+    try omega
+
+/-! ### Deadlock freedom -/
+
+/-- The advertised stream window admits a maximum-size gRPC message whole: the
+default 4 MiB payload cap plus the 5-byte length prefix still fit.  This is the
+side condition the credit-on-consume scheme needs, because the stream window is
+only replenished once the handler consumes a *complete* message. -/
+theorem defaultStreamWindow_admits_max_message :
+    Message.prefixLength + Message.defaultMaxDecompressedSize ≤ defaultStreamWindow := by
+  decide
+
+/-- Deadlock freedom.  Suppose the receive window plus the bytes still buffered
+for an incomplete message account for the whole advertised window (the handler
+has consumed everything available, so no credit is outstanding), and the
+advertised window admits the message whole.  Then the window is strictly
+positive: the peer can always send the bytes that complete the message, and the
+completed message then returns its credit. -/
+theorem inboundWindow_pos_of_incomplete {state : State} {streamId : Nat}
+    {buffered messageWireSize : Nat}
+    (hbalance : inboundStreamWindow state streamId + buffered
+      = state.inboundInitialStreamWindow)
+    (hfits : messageWireSize ≤ state.inboundInitialStreamWindow)
+    (hincomplete : buffered < messageWireSize) :
+    0 < inboundStreamWindow state streamId := by
+  omega
 
 end Connection
 end Http2

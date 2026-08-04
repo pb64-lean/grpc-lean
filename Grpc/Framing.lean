@@ -38,7 +38,7 @@ namespace Message
 def maxWireLength : Nat := 4294967295
 
 /-- Length of the per-message wire prefix: 1 compressed-flag byte + 4 length bytes. -/
-def prefixLength : Nat := 5
+@[expose] def prefixLength : Nat := 5
 
 private def uint32BE (n : Nat) : ByteArray :=
   ByteArray.mk #[
@@ -473,6 +473,11 @@ def messagesWireSize (messages : Array Message) : Nat :=
 
 @[simp] theorem messagesWireSize_empty : messagesWireSize #[] = 0 := by rfl
 
+theorem messagesWireSize_eq_foldl (messages : Array Message) :
+    messagesWireSize messages
+      = messages.foldl (fun total message => total + (prefixLength + message.data.size)) 0 := by
+  rfl
+
 theorem messagesWireSize_push (messages : Array Message) (message : Message) :
     messagesWireSize (messages.push message)
       = messagesWireSize messages + wireSize message := by
@@ -537,7 +542,7 @@ theorem decodeChunkWithLimit_conserves {maxDataSize? : Option Nat} {state : Deco
   exact this
 
 /-- Default cap on the inflated size of a single gzip-compressed message. -/
-def defaultMaxDecompressedSize : Nat := 4194304
+@[expose] def defaultMaxDecompressedSize : Nat := 4194304
 
 /-- Messages at or above this size are gzip-compressed when response
 compression is negotiated; smaller messages keep the identity flag. -/
