@@ -51,45 +51,58 @@ bounded because the connection preserves request ordering while it runs.
 abbrev RequestHeaderAuthorizer :=
   MethodName -> Metadata -> GrpcM HeaderAuthorization
 
-structure ServiceMethod where
-  name : MethodName
-  unary : UnaryHandler
+/--
+The seven RPC shapes a registered method handler may have.  The `*Stream`
+shapes consume or produce incremental `MessageStream`s; the others use
+aggregate request/response values.
+-/
+inductive RpcShape where
+  | unary
+  | serverStreaming
+  | serverStreamingStream
+  | clientStreaming
+  | clientStreamingStream
+  | bidirectionalStreaming
+  | bidirectionalStreamingStream
+  deriving Repr, DecidableEq, Inhabited
 
-structure ServerStreamingMethod where
-  name : MethodName
-  stream : ServerStreamingHandler
+/--
+The handler type for each RPC shape.  Indexing handlers by shape lets a
+registry entry carry exactly one correctly shaped handler, so shape agreement
+between registration, authorization, and dispatch is structural rather than a
+runtime check.
+-/
+@[expose] def Handler : RpcShape -> Type
+  | .unary => UnaryHandler
+  | .serverStreaming => ServerStreamingHandler
+  | .serverStreamingStream => ServerStreamingStreamHandler
+  | .clientStreaming => ClientStreamingHandler
+  | .clientStreamingStream => ClientStreamingStreamHandler
+  | .bidirectionalStreaming => BidirectionalStreamingHandler
+  | .bidirectionalStreamingStream => BidirectionalStreamingStreamHandler
 
-structure ServerStreamingStreamMethod where
+/-- A registered RPC method: a name, a shape, and a handler of exactly that
+shape.  A handler of the wrong shape for the entry is unrepresentable. -/
+structure MethodEntry where
   name : MethodName
-  stream : ServerStreamingStreamHandler
+  shape : RpcShape
+  handler : Handler shape
 
-structure ClientStreamingMethod where
-  name : MethodName
-  collect : ClientStreamingHandler
+/-- The handler of `entry` at `shape`, when `entry` has that shape. -/
+def MethodEntry.handlerFor? (entry : MethodEntry) (shape : RpcShape) :
+    Option (Handler shape) :=
+  if h : entry.shape = shape then some (h ▸ entry.handler) else none
 
-structure ClientStreamingStreamMethod where
+/-- Registration rejected because the method name is already registered. -/
+structure DuplicateMethod where
   name : MethodName
-  stream : ClientStreamingStreamHandler
-
-structure BidirectionalStreamingMethod where
-  name : MethodName
-  bidi : BidirectionalStreamingHandler
-
-structure BidirectionalStreamingStreamMethod where
-  name : MethodName
-  bidi : BidirectionalStreamingStreamHandler
+  deriving Repr, DecidableEq
 
 structure Registry where
   maxReceiveMessageSize : Option Nat := none
   maxSendMessageSize : Option Nat := none
   requestHeaderAuthorizer : RequestHeaderAuthorizer := fun _ _ => pure .accept
-  methods : Array ServiceMethod := #[]
-  serverStreamingMethods : Array ServerStreamingMethod := #[]
-  serverStreamingStreamMethods : Array ServerStreamingStreamMethod := #[]
-  clientStreamingMethods : Array ClientStreamingMethod := #[]
-  clientStreamingStreamMethods : Array ClientStreamingStreamMethod := #[]
-  bidirectionalStreamingMethods : Array BidirectionalStreamingMethod := #[]
-  bidirectionalStreamingStreamMethods : Array BidirectionalStreamingStreamMethod := #[]
+  entries : Array MethodEntry := #[]
 
 namespace Registry
 
@@ -110,54 +123,46 @@ def authorizeRequestHeaders (registry : Registry) (method : MethodName)
     (metadata : Metadata) : GrpcM HeaderAuthorization :=
   registry.requestHeaderAuthorizer method metadata
 
+/-- Append a method entry.  Lookup is first-match-wins, so an entry never
+shadows an earlier registration of the same name. -/
+def register (registry : Registry) (entry : MethodEntry) : Registry :=
+  { registry with entries := registry.entries.push entry }
+
+/-- Registration that rejects duplicate method names instead of appending a
+shadowed entry.  `Registry.WellFormed` is preserved by construction. -/
+def registerChecked (registry : Registry) (entry : MethodEntry) :
+    Except DuplicateMethod Registry :=
+  if registry.entries.any (fun existing => existing.name == entry.name) then
+    .error { name := entry.name }
+  else
+    .ok (registry.register entry)
+
 def registerUnary (registry : Registry) (name : MethodName) (handler : UnaryHandler) : Registry :=
-  { registry with methods := registry.methods.push { name := name, unary := handler } }
+  registry.register { name := name, shape := .unary, handler := handler }
 
 def registerServerStreaming (registry : Registry) (name : MethodName)
     (handler : ServerStreamingHandler) : Registry :=
-  {
-    registry with
-    serverStreamingMethods := registry.serverStreamingMethods.push { name := name, stream := handler }
-  }
+  registry.register { name := name, shape := .serverStreaming, handler := handler }
 
 def registerServerStreamingStream (registry : Registry) (name : MethodName)
     (handler : ServerStreamingStreamHandler) : Registry :=
-  {
-    registry with
-    serverStreamingStreamMethods :=
-      registry.serverStreamingStreamMethods.push { name := name, stream := handler }
-  }
+  registry.register { name := name, shape := .serverStreamingStream, handler := handler }
 
 def registerClientStreaming (registry : Registry) (name : MethodName)
     (handler : ClientStreamingHandler) : Registry :=
-  {
-    registry with
-    clientStreamingMethods := registry.clientStreamingMethods.push { name := name, collect := handler }
-  }
+  registry.register { name := name, shape := .clientStreaming, handler := handler }
 
 def registerClientStreamingStream (registry : Registry) (name : MethodName)
     (handler : ClientStreamingStreamHandler) : Registry :=
-  {
-    registry with
-    clientStreamingStreamMethods :=
-      registry.clientStreamingStreamMethods.push { name := name, stream := handler }
-  }
+  registry.register { name := name, shape := .clientStreamingStream, handler := handler }
 
 def registerBidirectionalStreaming (registry : Registry) (name : MethodName)
     (handler : BidirectionalStreamingHandler) : Registry :=
-  {
-    registry with
-    bidirectionalStreamingMethods :=
-      registry.bidirectionalStreamingMethods.push { name := name, bidi := handler }
-  }
+  registry.register { name := name, shape := .bidirectionalStreaming, handler := handler }
 
 def registerBidirectionalStreamingStream (registry : Registry) (name : MethodName)
     (handler : BidirectionalStreamingStreamHandler) : Registry :=
-  {
-    registry with
-    bidirectionalStreamingStreamMethods :=
-      registry.bidirectionalStreamingStreamMethods.push { name := name, bidi := handler }
-  }
+  registry.register { name := name, shape := .bidirectionalStreamingStream, handler := handler }
 
 def registerUnaryCodec [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
@@ -300,37 +305,40 @@ def registerBidirectionalStreamingStreamCodec [ToString ε] (registry : Registry
       status := Status.ok
     }
 
+/-- The first registered entry with the given name, regardless of shape. -/
+def findEntry? (registry : Registry) (name : MethodName) : Option MethodEntry :=
+  registry.entries.find? (fun entry => entry.name == name)
+
+/-- The first registered handler with the given name and shape. -/
+def findHandler? (registry : Registry) (shape : RpcShape) (name : MethodName) :
+    Option (Handler shape) :=
+  registry.entries.findSome? fun entry =>
+    if entry.name == name then entry.handlerFor? shape else none
+
 def findUnary? (registry : Registry) (name : MethodName) : Option UnaryHandler :=
-  registry.methods.findSome? fun method =>
-    if method.name == name then some method.unary else none
+  registry.findHandler? .unary name
 
 def findServerStreaming? (registry : Registry) (name : MethodName) : Option ServerStreamingHandler :=
-  registry.serverStreamingMethods.findSome? fun method =>
-    if method.name == name then some method.stream else none
+  registry.findHandler? .serverStreaming name
 
 def findServerStreamingStream? (registry : Registry) (name : MethodName) :
     Option ServerStreamingStreamHandler :=
-  registry.serverStreamingStreamMethods.findSome? fun method =>
-    if method.name == name then some method.stream else none
+  registry.findHandler? .serverStreamingStream name
 
 def findClientStreaming? (registry : Registry) (name : MethodName) : Option ClientStreamingHandler :=
-  registry.clientStreamingMethods.findSome? fun method =>
-    if method.name == name then some method.collect else none
+  registry.findHandler? .clientStreaming name
 
 def findClientStreamingStream? (registry : Registry) (name : MethodName) :
     Option ClientStreamingStreamHandler :=
-  registry.clientStreamingStreamMethods.findSome? fun method =>
-    if method.name == name then some method.stream else none
+  registry.findHandler? .clientStreamingStream name
 
 def findBidirectionalStreaming? (registry : Registry) (name : MethodName) :
     Option BidirectionalStreamingHandler :=
-  registry.bidirectionalStreamingMethods.findSome? fun method =>
-    if method.name == name then some method.bidi else none
+  registry.findHandler? .bidirectionalStreaming name
 
 def findBidirectionalStreamingStream? (registry : Registry) (name : MethodName) :
     Option BidirectionalStreamingStreamHandler :=
-  registry.bidirectionalStreamingStreamMethods.findSome? fun method =>
-    if method.name == name then some method.bidi else none
+  registry.findHandler? .bidirectionalStreamingStream name
 
 private inductive DeadlineResult (α : Type) where
   | completed : Except Status α -> DeadlineResult α

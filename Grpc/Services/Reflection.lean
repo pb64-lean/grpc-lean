@@ -363,27 +363,9 @@ private def uniqueStrings (values : Array String) : Array String :=
   values.foldl pushUniqueString #[]
 
 private def registryServiceNames (registry : Registry) : Array String :=
-  let names := registry.methods.foldl
+  registry.entries.foldl
     (init := #[])
-    (fun names method => pushUniqueString names method.name.service)
-  let names := registry.serverStreamingMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
-  let names := registry.serverStreamingStreamMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
-  let names := registry.clientStreamingMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
-  let names := registry.clientStreamingStreamMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
-  let names := registry.bidirectionalStreamingMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
-  registry.bidirectionalStreamingStreamMethods.foldl
-    (init := names)
-    (fun names method => pushUniqueString names method.name.service)
+    (fun names entry => pushUniqueString names entry.name.service)
 
 private def configServiceNames (config : Config) (registry : Registry) : Array String :=
   let names := uniqueStrings (registryServiceNames registry ++ config.serviceNames)
