@@ -19,7 +19,7 @@ def maxFramePayloadLength : Nat := 16777215
 
 def defaultMaxFramePayloadLength : Nat := 16384
 
-def maxStreamId : Nat := 2147483647
+@[expose] def maxStreamId : Nat := 2147483647
 
 inductive FrameType where
   | data

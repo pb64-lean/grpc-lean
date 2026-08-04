@@ -829,7 +829,7 @@ private theorem fromUTF8?_toUTF8 (s : String) : String.fromUTF8? s.toUTF8 = some
 #### Dynamic-table size invariant
 -/
 
-private theorem dynamicSize_empty : dynamicSize #[] = 0 := rfl
+theorem dynamicSize_empty : dynamicSize #[] = 0 := by rfl
 
 private theorem dynamicSize_evictTo_le (maxSize : Nat) (entries : Array Header) :
     dynamicSize (evictTo maxSize entries) ≤ maxSize := by
@@ -874,6 +874,9 @@ theorem dynamicSize_resizeChecked_le {state state' : State} {maxSize : Nat}
 
 /-- After acknowledging a peer's maximum, the accounted dynamic-table size
 fits the new maximum. -/
+theorem maxSize_setMaxAllowedSize (state : State) (maxSize : Nat) :
+    (setMaxAllowedSize state maxSize).maxSize = maxSize := by rfl
+
 theorem dynamicSize_setMaxAllowedSize_le (state : State) (maxSize : Nat) :
     dynamicSize (setMaxAllowedSize state maxSize).dynamic ≤ maxSize :=
   dynamicSize_resize_le state maxSize

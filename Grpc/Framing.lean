@@ -455,6 +455,87 @@ theorem decodeAllWithLimit_size_le {maxDataSize : Nat} {bytes : ByteArray}
         exact parseBuffered_size_le hstate (fun m hm => by simp at hm)
     next => cases h
 
+/-! ### Wire-byte conservation
+
+The HTTP/2 receive window is charged in wire bytes, but stream flow-control
+credit is only returned once a whole gRPC message has been decoded and
+consumed.  The lemmas below are what make that accounting exact: every byte
+handed to the decoder is either accounted for by a completed message (its
+`wireSize`) or is still sitting in the decoder's buffer.  `Grpc.Http2.Connection`
+turns this into the credit-on-consume conservation law. -/
+
+/-- Wire bytes one message occupies: the 5-byte length prefix plus its data. -/
+def wireSize (message : Message) : Nat := prefixLength + message.data.size
+
+/-- Total wire bytes of a batch of decoded messages. -/
+def messagesWireSize (messages : Array Message) : Nat :=
+  messages.foldl (fun total message => total + wireSize message) 0
+
+@[simp] theorem messagesWireSize_empty : messagesWireSize #[] = 0 := by rfl
+
+theorem messagesWireSize_push (messages : Array Message) (message : Message) :
+    messagesWireSize (messages.push message)
+      = messagesWireSize messages + wireSize message := by
+  simp only [messagesWireSize, Array.foldl_push]
+
+/-- Parsing one message off the front of the buffer consumes exactly that
+message's wire size. -/
+private theorem parseFrame?_conserves {maxDataSize? : Option Nat} {buffered : ByteArray}
+    {message : Message} {rest : ByteArray}
+    (h : parseFrame? maxDataSize? buffered = .ok (some (message, rest))) :
+    rest.size + wireSize message = buffered.size := by
+  unfold parseFrame? at h
+  split at h
+  next => cases h
+  next h5 =>
+    split at h
+    next => cases h
+    next =>
+      split at h
+      next => cases h
+      next =>
+        split at h
+        next => cases h
+        next hfit =>
+          cases h
+          simp only [wireSize, prefixLength, ByteArray.size_extract]
+          omega
+
+/-- Whatever the decoder does with a buffer, no byte is lost: the residual
+buffer plus the wire size of every message it produced is exactly the input. -/
+private theorem parseBuffered_conserves {maxDataSize? : Option Nat} {buffered : ByteArray}
+    {messages : Array Message} {state : DecodeState}
+    (h : parseBuffered maxDataSize? buffered messages = .ok state) :
+    state.buffered.size + messagesWireSize state.messages
+      = buffered.size + messagesWireSize messages := by
+  revert h
+  fun_induction parseBuffered maxDataSize? buffered messages
+  next => exact fun h => nomatch h
+  next =>
+    intro h
+    injection h with h
+    subst h
+    rfl
+  next hcase ih =>
+    intro h
+    have hstep := parseFrame?_conserves hcase
+    have hih := ih h
+    rw [messagesWireSize_push] at hih
+    omega
+
+/-- Feeding a chunk to the message decoder conserves bytes: the bytes still
+buffered plus the wire size of the messages just completed equal the bytes that
+were buffered plus the chunk. -/
+theorem decodeChunkWithLimit_conserves {maxDataSize? : Option Nat} {state : DecodeState}
+    {chunk : ByteArray} {state' : DecodeState}
+    (h : decodeChunkWithLimit maxDataSize? state chunk = .ok state') :
+    state'.buffered.size + messagesWireSize state'.messages
+      = state.buffered.size + chunk.size := by
+  unfold decodeChunkWithLimit at h
+  have := parseBuffered_conserves h
+  rw [messagesWireSize_empty, Nat.add_zero, append_eq, ByteArray.size_append] at this
+  exact this
+
 /-- Default cap on the inflated size of a single gzip-compressed message. -/
 def defaultMaxDecompressedSize : Nat := 4194304
 

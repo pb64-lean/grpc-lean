@@ -139,11 +139,10 @@ private def removeStream (streams : Array StreamState) (streamId : Nat) : Array 
   streams.filter (fun stream => stream.streamId != streamId)
 
 private def appendStreamFrame (streams : Array StreamState) (frame : Frame) : Array StreamState :=
-  let streamId := frame.header.streamId
-  let stream := match findStream? streams streamId with
+  (removeStream streams frame.header.streamId).push <|
+    match findStream? streams frame.header.streamId with
     | some stream => { stream with frames := stream.frames.push frame }
-    | none => { streamId := streamId, frames := #[frame] }
-  (removeStream streams streamId).push stream
+    | none => { streamId := frame.header.streamId, frames := #[frame] }
 
 private def replaceStream (streams : Array StreamState) (stream : StreamState) : Array StreamState :=
   (removeStream streams stream.streamId).push stream
@@ -270,7 +269,8 @@ private def ignoreInboundStreamBody (state : State) (streamId : Nat) : State :=
     ignoredInboundStreams := pushUniqueStreamId state.ignoredInboundStreams streamId
   }
 
-private def isClientStreamId (streamId : Nat) : Bool :=
+/-- Client-initiated stream ids are the odd ones (RFC 9113 §5.1.1). -/
+def isClientStreamId (streamId : Nat) : Bool :=
   streamId % 2 == 1
 
 private def requireClientStreamId (streamId : Nat) (frameName : String) : Except Status Unit := do
@@ -315,15 +315,16 @@ private def streamHeaderComplete (stream : StreamState) : Bool :=
   | some frame => headerComplete frame
   | none => false
 
+/-- The stream's header block is still open: its first frame is a HEADERS frame
+without END_HEADERS, so only CONTINUATION frames for this stream may follow. -/
+def streamHeaderPending (stream : StreamState) : Bool :=
+  match stream.frames[0]? with
+  | some frame => frame.header.frameType == FrameType.headers && !headerComplete frame
+  | none => false
+
 private def pendingHeaderStream? (streams : Array StreamState) : Option Nat :=
   streams.findSome? fun stream =>
-    match stream.frames[0]? with
-    | some frame =>
-        if frame.header.frameType == FrameType.headers && !headerComplete frame then
-          some stream.streamId
-        else
-          none
-    | none => none
+    if streamHeaderPending stream then some stream.streamId else none
 
 private def appendContinuationFrame (streams : Array StreamState) (frame : Frame) :
     Except Status (Array StreamState) := do
@@ -577,16 +578,28 @@ private def processWindowUpdate (state : State) (frame : Frame) : Except Status 
 private def adjustWindow (oldInitial newInitial : Nat) (current : Int) : Int :=
   current + Int.ofNat newInitial - Int.ofNat oldInitial
 
+/-- Re-base every outbound stream window on a new SETTINGS_INITIAL_WINDOW_SIZE,
+rejecting any window that would leave the 31-bit range.  Written as an explicit
+`foldlM` (rather than `mapM`) so the bound on the result is provable by list
+induction. -/
+private def adjustOutboundWindowStep (oldInitial newInitial : Nat)
+    (accumulated : Array OutboundStreamWindow) (window : OutboundStreamWindow) :
+    Except Status (Array OutboundStreamWindow) :=
+  if adjustWindow oldInitial newInitial window.window > Int.ofNat maxStreamId then
+    throw (Status.internal "HTTP/2 stream flow-control window exceeds 31-bit length")
+  else
+    pure (accumulated.push
+      { window with window := adjustWindow oldInitial newInitial window.window })
+
+private def adjustOutboundWindows (oldInitial newInitial : Nat)
+    (windows : Array OutboundStreamWindow) : Except Status (Array OutboundStreamWindow) :=
+  windows.foldlM (init := #[]) (adjustOutboundWindowStep oldInitial newInitial)
+
 private def applyInitialWindowSize (state : State) (value : Nat) : Except Status State := do
   if value > maxStreamId then
     throw (Status.internal "HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE exceeds 31-bit length")
-  let oldInitial := state.outboundInitialStreamWindow
-  let windows ← state.outboundStreamWindows.mapM fun window => do
-    let adjusted := adjustWindow oldInitial value window.window
-    if adjusted > Int.ofNat maxStreamId then
-      throw (Status.internal "HTTP/2 stream flow-control window exceeds 31-bit length")
-    else
-      pure { window with window := adjusted }
+  let windows ← adjustOutboundWindows state.outboundInitialStreamWindow value
+    state.outboundStreamWindows
   pure {
     state with
     outboundInitialStreamWindow := value,
@@ -895,21 +908,20 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
   }
 
 private def detachStreamForDispatch (state : State) (streamId : Nat) :
-    Except Status (State × DetachedDispatch) := do
-  let stream ← match findStream? state.streams streamId with
-    | some stream => pure stream
-    | none => throw (Status.internal s!"unknown HTTP/2 stream {streamId}")
-  let request ← authorizedUnaryRequestForStream state stream
-  let state := {
-    state with
-    streams := removeStream state.streams streamId
-  }
-  let state := removeInboundStreamState state streamId
-  pure (state, {
-    request := request,
-    outboundHpack := state.outboundHpack,
-    maxDataFrameSize := state.outboundMaxFramePayloadLength
-  })
+    Except Status (State × DetachedDispatch) :=
+  match findStream? state.streams streamId with
+  | none => .error (Status.internal s!"unknown HTTP/2 stream {streamId}")
+  | some stream =>
+    match authorizedUnaryRequestForStream state stream with
+    | .error status => .error status
+    | .ok request =>
+        let detachedState := removeInboundStreamState
+          { state with streams := removeStream state.streams streamId } streamId
+        .ok (detachedState, {
+          request := request,
+          outboundHpack := detachedState.outboundHpack,
+          maxDataFrameSize := detachedState.outboundMaxFramePayloadLength
+        })
 
 private def framePayloadBytes (frames : Array Frame) : Nat :=
   frames.foldl (fun total frame => total + frame.payload.size) 0
@@ -1743,81 +1755,110 @@ private def processContinuationShared (registry : Registry) (state : State) (fra
     else
       pure (.ok (state, {}))
 
-private def processDataShared (registry : Registry) (state : State) (frame : Frame) :
-    Except Status (State × SharedFrameResult) := do
-  requireClientStreamId frame.header.streamId "DATA"
-  if containsStreamId state.ignoredInboundStreams frame.header.streamId then
-    let (state, updates) ← processIgnoredInboundData state frame
-    pure (state, { emitted := updates })
-  else match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
-  | some active =>
-      let originalSize := frame.payload.size
-      let state ← consumeInboundDataWindow state frame
-      let frame ← stripPadding frame "DATA"
-      let paddingBytes := originalSize - frame.payload.size
-      let updates ← activeDataWindowUpdates frame.header.streamId originalSize paddingBytes
-      let state := replenishInboundConnectionWindow state originalSize
-      let state := replenishInboundStreamWindowBy state frame.header.streamId paddingBytes
-      let frame ← Transport.normalizeDataFrame frame
-      match decodeActiveRequestData registry active frame with
-      | .ok (active, messages, close) =>
-          let state :=
-            if close then
-              {
-                state with
-                streams := removeStream state.streams frame.header.streamId,
+/-- DATA for a streaming request body.  The connection window is credited for
+the whole frame immediately (so one stalled stream cannot starve the
+connection); the stream window is credited only for padding, because the
+payload's stream credit is deferred until the handler consumes each message. -/
+private def processActiveRequestData (registry : Registry) (state : State) (frame : Frame)
+    (active : ActiveRequestStream) : Except Status (State × SharedFrameResult) :=
+  match consumeInboundDataWindow state frame with
+  | .error status => .error status
+  | .ok consumed =>
+    match stripPadding frame "DATA" with
+    | .error status => .error status
+    | .ok stripped =>
+      match activeDataWindowUpdates stripped.header.streamId frame.payload.size
+          (frame.payload.size - stripped.payload.size) with
+      | .error status => .error status
+      | .ok updates =>
+        match Transport.normalizeDataFrame stripped with
+        | .error status => .error status
+        | .ok normalized =>
+          let credited := replenishInboundStreamWindowBy
+            (replenishInboundConnectionWindow consumed frame.payload.size)
+            stripped.header.streamId (frame.payload.size - stripped.payload.size)
+          match decodeActiveRequestData registry active normalized with
+          | .ok (active, messages, close) =>
+              let closedState := removeInboundStreamState {
+                credited with
+                streams := removeStream credited.streams normalized.header.streamId,
                 activeRequestStreams := removeActiveRequestStream
-                  state.activeRequestStreams frame.header.streamId
+                  credited.activeRequestStreams normalized.header.streamId
+              } normalized.header.streamId
+              let openState := {
+                credited with
+                activeRequestStreams := replaceActiveRequestStream
+                  credited.activeRequestStreams active
               }
+              .ok (if close then closedState else openState, {
+                emitted := updates,
+                requestFeeds := #[{
+                  producer := active.producer,
+                  messages := messages,
+                  close := close
+                }]
+              })
+          | .error status =>
+              let resetState := removeInboundStreamState {
+                credited with
+                streams := removeStream credited.streams normalized.header.streamId,
+                activeRequestStreams := removeActiveRequestStream
+                  credited.activeRequestStreams normalized.header.streamId
+              } normalized.header.streamId
+              .ok (resetState, {
+                emitted := updates,
+                requestFeeds := #[{
+                  producer := active.producer,
+                  error := some status
+                }]
+              })
+
+/-- DATA for a unary request: the body is buffered on the stream and both
+windows are credited immediately, since the whole request is dispatched at
+END_STREAM. -/
+private def processUnaryRequestData (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) :=
+  match findStream? state.streams frame.header.streamId with
+  | none => .error (Status.internal "HTTP/2 DATA frame arrived before request HEADERS")
+  | some stream =>
+    if !streamHeaderComplete stream then
+      .error (Status.internal "HTTP/2 DATA frame arrived before END_HEADERS")
+    else
+      match consumeInboundDataWindow state frame with
+      | .error status => .error status
+      | .ok consumed =>
+        match dataWindowUpdates frame with
+        | .error status => .error status
+        | .ok updates =>
+          match stripPadding frame "DATA" with
+          | .error status => .error status
+          | .ok stripped =>
+            let buffered := {
+              replenishInboundDataWindow consumed frame with
+              streams := appendStreamFrame
+                (replenishInboundDataWindow consumed frame).streams stripped
+            }
+            if FrameFlag.has stripped.header.flags FrameFlag.endStream then
+              match detachStreamForDispatch buffered stripped.header.streamId with
+              | .error status => .error status
+              | .ok (detachedState, detached) =>
+                  .ok (detachedState, { emitted := updates, detached := some detached })
             else
-              {
-                state with
-                activeRequestStreams := replaceActiveRequestStream state.activeRequestStreams active
-              }
-          let state :=
-            if close then
-              removeInboundStreamState state frame.header.streamId
-            else
-              state
-          pure (state, {
-            emitted := updates,
-            requestFeeds := #[{
-              producer := active.producer,
-              messages := messages,
-              close := close
-            }]
-          })
-      | .error status =>
-          let state := {
-            state with
-            streams := removeStream state.streams frame.header.streamId,
-            activeRequestStreams := removeActiveRequestStream
-              state.activeRequestStreams frame.header.streamId
-          }
-          let state := removeInboundStreamState state frame.header.streamId
-          pure (state, {
-            emitted := updates,
-            requestFeeds := #[{
-              producer := active.producer,
-              error := some status
-            }]
-          })
-  | none =>
-      let stream ← match findStream? state.streams frame.header.streamId with
-        | some stream => pure stream
-        | none => throw (Status.internal "HTTP/2 DATA frame arrived before request HEADERS")
-      if !streamHeaderComplete stream then
-        throw (Status.internal "HTTP/2 DATA frame arrived before END_HEADERS")
-      let state ← consumeInboundDataWindow state frame
-      let updates ← dataWindowUpdates frame
-      let state := replenishInboundDataWindow state frame
-      let frame ← stripPadding frame "DATA"
-      let state := { state with streams := appendStreamFrame state.streams frame }
-      if FrameFlag.has frame.header.flags FrameFlag.endStream then
-        let (state, detached) ← detachStreamForDispatch state frame.header.streamId
-        pure (state, { emitted := updates, detached := some detached })
-      else
-        pure (state, { emitted := updates })
+              .ok (buffered, { emitted := updates })
+
+private def processDataShared (registry : Registry) (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) :=
+  match requireClientStreamId frame.header.streamId "DATA" with
+  | .error status => .error status
+  | .ok () =>
+    if containsStreamId state.ignoredInboundStreams frame.header.streamId then
+      match processIgnoredInboundData state frame with
+      | .error status => .error status
+      | .ok (drained, updates) => .ok (drained, { emitted := updates })
+    else
+      match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
+      | some active => processActiveRequestData registry state frame active
+      | none => processUnaryRequestData state frame
 
 /-- The pure shared-kernel step for every frame type that does not require the
 `IO` authorizer (i.e. everything except HEADERS/CONTINUATION).  Factored out of
@@ -2234,17 +2275,15 @@ private theorem processDataShared_rejected {registry : Registry} {state state' :
       ∧ state'.lastClientStreamId = state.lastClientStreamId
       ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams) := by
   unfold processDataShared at h
-  simp only [bind, Except.bind] at h
   split at h
   next => cases h
-  next _u _hreq =>
+  next =>
     rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = true
       from hrej] at h
     simp only [if_true] at h
     split at h
     next => cases h
-    next pair hproc =>
-      obtain ⟨s2, updates⟩ := pair
+    next drained updates hproc =>
       cases h
       obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
       exact ⟨rfl, rfl, rfl, rfl, hs, hl, ha⟩
@@ -2258,10 +2297,9 @@ private theorem processDataShared_inert_error {registry : Registry} {state : Sta
     processDataShared registry state frame ≠ .ok (state', result) := by
   intro h
   unfold processDataShared at h
-  simp only [bind, Except.bind] at h
   split at h
   next => cases h
-  next _u _hreq =>
+  next =>
     rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = false
       from hnotrej] at h
     simp only [Bool.false_eq_true, if_false] at h
@@ -2276,7 +2314,9 @@ private theorem processDataShared_inert_error {registry : Registry} {state : Sta
       rw [Array.find?_eq_none]
       intro x hx
       simp [hinert.notBuffered x hx]
-    rw [hactive, hstream] at h
+    rw [hactive] at h
+    unfold processUnaryRequestData at h
+    rw [hstream] at h
     simp at h
 
 
@@ -2865,6 +2905,1143 @@ private theorem processContinuationShared_inert_error (registry : Registry) {sta
   refine ⟨status, ?_⟩
   unfold processContinuationShared
   rw [herr]
+
+/-!
+## Connection well-formedness
+
+`WellFormed` is the pure structural invariant of a served connection: the
+stream-id discipline (client parity, monotone claiming, so a closed stream is
+never reactivated), CONTINUATION sequencing (at most one header block is open,
+and it belongs to the newest stream), the 31-bit bounds on every outbound
+flow-control window, and the HPACK dynamic tables staying inside their
+negotiated limits.
+
+It is preserved by all three pure frame transitions:
+
+* `processNonHeaderFrameShared_wellFormed` — SETTINGS, DATA, RST_STREAM,
+  WINDOW_UPDATE, PING, PRIORITY, GOAWAY and unknown frames;
+* `prepareHeadersShared_wellFormed` — the pure bookkeeping of a HEADERS frame;
+* `appendContinuationFrame_wellFormed` — a CONTINUATION frame.
+
+The `IO` halves of the HEADERS/CONTINUATION steps (header decoding,
+authorization, dispatch spawning) are outside this statement.
+-/
+
+/-- Pure well-formedness of a server connection state. -/
+structure WellFormed (state : State) : Prop where
+  /-- Every buffered stream is client-initiated and has already been claimed,
+  so its id can never be opened again (`requireNewClientStreamId` demands a
+  strictly larger id). -/
+  streamIds : ∀ stream ∈ state.streams,
+    isClientStreamId stream.streamId = true ∧ stream.streamId ≤ state.lastClientStreamId
+  /-- CONTINUATION sequencing: an open header block can only belong to the most
+  recently opened stream, so at most one is open at a time. -/
+  pendingHeaders : ∀ stream ∈ state.streams,
+    streamHeaderPending stream = true → stream.streamId = state.lastClientStreamId
+  /-- The advertised initial window fits the 31-bit field. -/
+  outboundInitial : state.outboundInitialStreamWindow ≤ maxStreamId
+  /-- The outbound connection window fits the 31-bit field. -/
+  outboundConnection : state.outboundConnectionWindow ≤ maxStreamId
+  /-- Every outbound stream window fits the 31-bit field.  (It may be negative:
+  RFC 9113 §6.9.2 allows SETTINGS to shrink a window below zero.) -/
+  outboundStreams : ∀ window ∈ state.outboundStreamWindows,
+    window.window ≤ (maxStreamId : Int)
+  /-- The peer's HPACK dynamic table is within the size we encode against. -/
+  outboundTable : Hpack.dynamicSize state.outboundHpack.dynamic ≤ state.outboundHpack.maxSize
+  /-- Our HPACK dynamic table is within the size we advertised. -/
+  inboundTable : Hpack.dynamicSize state.hpack.dynamic ≤ state.hpack.maxSize
+
+/-- A fresh connection state is well formed. -/
+theorem initialState_wellFormed (maxConcurrentStreams maxHeaderListSize : Option Nat)
+    (initialWindowSize : Nat) :
+    WellFormed (initialState maxConcurrentStreams maxHeaderListSize initialWindowSize) where
+  streamIds := by
+    intro s hs
+    rw [show (initialState maxConcurrentStreams maxHeaderListSize initialWindowSize).streams
+        = #[] from rfl] at hs
+    simp at hs
+  pendingHeaders := by
+    intro s hs
+    rw [show (initialState maxConcurrentStreams maxHeaderListSize initialWindowSize).streams
+        = #[] from rfl] at hs
+    simp at hs
+  outboundInitial := by
+    show initialFlowControlWindow ≤ maxStreamId
+    unfold initialFlowControlWindow maxStreamId
+    decide
+  outboundConnection := by
+    show initialFlowControlWindow ≤ maxStreamId
+    unfold initialFlowControlWindow maxStreamId
+    decide
+  outboundStreams := by
+    intro w hw
+    rw [show (initialState maxConcurrentStreams maxHeaderListSize
+        initialWindowSize).outboundStreamWindows = #[] from rfl] at hw
+    simp at hw
+  outboundTable := by
+    show Hpack.dynamicSize #[] ≤ _
+    rw [Hpack.dynamicSize_empty]
+    exact Nat.zero_le _
+  inboundTable := by
+    show Hpack.dynamicSize #[] ≤ _
+    rw [Hpack.dynamicSize_empty]
+    exact Nat.zero_le _
+
+/-! ### Membership lemmas for the stream containers -/
+
+private theorem mem_removeStream {streams : Array StreamState} {streamId : Nat}
+    {s : StreamState} (h : s ∈ removeStream streams streamId) : s ∈ streams :=
+  (Array.mem_filter.mp h).1
+
+private theorem findStream?_streamId {streams : Array StreamState} {streamId : Nat}
+    {s : StreamState} (h : findStream? streams streamId = some s) :
+    s ∈ streams ∧ s.streamId = streamId := by
+  unfold findStream? at h
+  refine ⟨Array.mem_of_find?_eq_some h, ?_⟩
+  have := Array.find?_eq_some_iff_getElem.mp h
+  exact eq_of_beq this.1
+
+/-- Appending a frame to an existing stream leaves every other stream alone and
+replaces that one by the same record with the frame pushed. -/
+private theorem mem_appendStreamFrame_of_found {streams : Array StreamState} {frame : Frame}
+    {old : StreamState} (hfind : findStream? streams frame.header.streamId = some old)
+    {s : StreamState} (h : s ∈ appendStreamFrame streams frame) :
+    s ∈ streams ∨ s = { old with frames := old.frames.push frame } := by
+  unfold appendStreamFrame at h
+  rw [hfind] at h
+  cases Array.mem_push.mp h with
+  | inl hmem => exact Or.inl (mem_removeStream hmem)
+  | inr heq => exact Or.inr heq
+
+/-- Appending a frame for a stream id that is not buffered yet creates exactly
+that one new stream. -/
+private theorem mem_appendStreamFrame_of_new {streams : Array StreamState} {frame : Frame}
+    (hfind : findStream? streams frame.header.streamId = none)
+    {s : StreamState} (h : s ∈ appendStreamFrame streams frame) :
+    s ∈ streams ∨ s = { streamId := frame.header.streamId, frames := #[frame] } := by
+  unfold appendStreamFrame at h
+  rw [hfind] at h
+  cases Array.mem_push.mp h with
+  | inl hmem => exact Or.inl (mem_removeStream hmem)
+  | inr heq => exact Or.inr heq
+
+private theorem mem_replaceStream {streams : Array StreamState} {stream : StreamState}
+    {s : StreamState} (h : s ∈ replaceStream streams stream) :
+    s ∈ streams ∨ s = stream := by
+  unfold replaceStream at h
+  cases Array.mem_push.mp h with
+  | inl hmem => exact Or.inl (mem_removeStream hmem)
+  | inr heq => exact Or.inr heq
+
+private theorem mem_removeOutboundStreamWindow {windows : Array OutboundStreamWindow}
+    {streamId : Nat} {w : OutboundStreamWindow}
+    (h : w ∈ removeOutboundStreamWindow windows streamId) : w ∈ windows :=
+  (Array.mem_filter.mp h).1
+
+private theorem mem_setOutboundStreamWindow {state : State} {streamId : Nat} {window : Int}
+    {w : OutboundStreamWindow}
+    (h : w ∈ (setOutboundStreamWindow state streamId window).outboundStreamWindows) :
+    w ∈ state.outboundStreamWindows ∨ w.window = window := by
+  simp only [setOutboundStreamWindow] at h
+  cases Array.mem_push.mp h with
+  | inl hmem => exact Or.inl (mem_removeOutboundStreamWindow hmem)
+  | inr heq => exact Or.inr (by rw [heq])
+
+/-- No stream is buffered with an open header block. -/
+private theorem streamHeaderPending_of_pendingHeaderStream?_none
+    {streams : Array StreamState} (h : pendingHeaderStream? streams = none)
+    {s : StreamState} (hs : s ∈ streams) : streamHeaderPending s = false := by
+  unfold pendingHeaderStream? at h
+  have hnone := Array.findSome?_eq_none_iff.mp h s hs
+  cases hp : streamHeaderPending s with
+  | false => rfl
+  | true =>
+      rw [hp] at hnone
+      simp at hnone
+
+/-! ### Decomposing the invariant
+
+Most pure steps touch only the inbound bookkeeping.  `SameOutbound` records
+that a step left every field `WellFormed` constrains outside the stream table
+alone, which turns preservation for those steps into one lemma. -/
+
+/-- The step left the outbound flow-control bookkeeping and both HPACK dynamic
+tables at or below where they were: the initial window and the tables are
+unchanged, the connection window did not grow, and no stream window was
+invented. -/
+private def SameOutbound (state' state : State) : Prop :=
+  state'.outboundInitialStreamWindow = state.outboundInitialStreamWindow
+    ∧ state'.outboundConnectionWindow ≤ state.outboundConnectionWindow
+    ∧ (∀ w ∈ state'.outboundStreamWindows, w ∈ state.outboundStreamWindows)
+    ∧ state'.outboundHpack = state.outboundHpack
+    ∧ state'.hpack = state.hpack
+
+private theorem SameOutbound.refl (state : State) : SameOutbound state state :=
+  ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem SameOutbound.trans {a b c : State} (hab : SameOutbound a b)
+    (hbc : SameOutbound b c) : SameOutbound a c :=
+  ⟨hab.1.trans hbc.1, Nat.le_trans hab.2.1 hbc.2.1,
+    fun w hw => hbc.2.2.1 w (hab.2.2.1 w hw),
+    hab.2.2.2.1.trans hbc.2.2.2.1, hab.2.2.2.2.trans hbc.2.2.2.2⟩
+
+/-- The general preservation shape: the outbound side only shrank, and every
+buffered stream of the new state satisfies the stream-id and CONTINUATION laws
+against the old claimed id. -/
+private theorem WellFormed.ofStreams {state state' : State} (h : WellFormed state)
+    (hsame : SameOutbound state' state)
+    (hlast : state'.lastClientStreamId = state.lastClientStreamId)
+    (hstreams : ∀ s ∈ state'.streams,
+      (isClientStreamId s.streamId = true ∧ s.streamId ≤ state.lastClientStreamId)
+        ∧ (streamHeaderPending s = true → s.streamId = state.lastClientStreamId)) :
+    WellFormed state' where
+  streamIds := by
+    intro s hs
+    obtain ⟨⟨hid, hle⟩, -⟩ := hstreams s hs
+    exact ⟨hid, by rw [hlast]; exact hle⟩
+  pendingHeaders := by
+    intro s hs hp
+    rw [hlast]
+    exact (hstreams s hs).2 hp
+  outboundInitial := by rw [hsame.1]; exact h.outboundInitial
+  outboundConnection := Nat.le_trans hsame.2.1 h.outboundConnection
+  outboundStreams := fun w hw => h.outboundStreams w (hsame.2.2.1 w hw)
+  outboundTable := by rw [hsame.2.2.2.1]; exact h.outboundTable
+  inboundTable := by rw [hsame.2.2.2.2]; exact h.inboundTable
+
+/-- Preservation for any step that leaves the outbound side alone and never
+invents a buffered stream or lowers the claimed id. -/
+private theorem WellFormed.ofSame {state state' : State} (h : WellFormed state)
+    (hsame : SameOutbound state' state)
+    (hsub : ∀ s ∈ state'.streams, s ∈ state.streams)
+    (hlast : state'.lastClientStreamId = state.lastClientStreamId) :
+    WellFormed state' :=
+  h.ofStreams hsame hlast fun s hs =>
+    ⟨h.streamIds s (hsub s hs), h.pendingHeaders s (hsub s hs)⟩
+
+/-- Preservation for a step that only rewrites fields the invariant ignores. -/
+private theorem WellFormed.ofFields {state state' : State} (h : WellFormed state)
+    (hsame : SameOutbound state' state)
+    (hstreams : state'.streams = state.streams)
+    (hlast : state'.lastClientStreamId = state.lastClientStreamId) :
+    WellFormed state' :=
+  h.ofSame hsame (fun _ hs => hstreams ▸ hs) hlast
+
+/-! ### Outbound flow-control bounds -/
+
+private theorem outboundStreamWindow_le {state : State} (h : WellFormed state) (streamId : Nat) :
+    outboundStreamWindow state streamId ≤ (maxStreamId : Int) := by
+  unfold outboundStreamWindow
+  split
+  next w hw => exact h.outboundStreams w (Array.mem_of_find?_eq_some hw)
+  next => exact Int.ofNat_le.mpr h.outboundInitial
+
+private theorem cleanupOutboundIfEndStream_same (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).outboundInitialStreamWindow
+        = state.outboundInitialStreamWindow
+      ∧ (cleanupOutboundIfEndStream state frame).outboundConnectionWindow
+        = state.outboundConnectionWindow
+      ∧ (∀ w ∈ (cleanupOutboundIfEndStream state frame).outboundStreamWindows,
+          w ∈ state.outboundStreamWindows)
+      ∧ (cleanupOutboundIfEndStream state frame).outboundHpack = state.outboundHpack
+      ∧ (cleanupOutboundIfEndStream state frame).hpack = state.hpack := by
+  unfold cleanupOutboundIfEndStream
+  split
+  · exact ⟨rfl, rfl, fun w hw => mem_removeOutboundStreamWindow hw, rfl, rfl⟩
+  · exact ⟨rfl, rfl, fun _ hw => hw, rfl, rfl⟩
+
+/-- Setting one outbound stream window to a bounded value keeps the whole
+table bounded. -/
+private theorem setOutboundStreamWindow_bounded {state : State} {streamId : Nat} {window : Int}
+    (hwin : ∀ w ∈ state.outboundStreamWindows, w.window ≤ (maxStreamId : Int))
+    (hw : window ≤ (maxStreamId : Int)) :
+    ∀ w ∈ (setOutboundStreamWindow state streamId window).outboundStreamWindows,
+      w.window ≤ (maxStreamId : Int) := by
+  intro w hmem
+  rcases mem_setOutboundStreamWindow hmem with hmem' | heq
+  · exact hwin w hmem'
+  · rw [heq]; exact hw
+
+private theorem outboundStreamWindow_le' {state : State}
+    (hinit : state.outboundInitialStreamWindow ≤ maxStreamId)
+    (hwin : ∀ w ∈ state.outboundStreamWindows, w.window ≤ (maxStreamId : Int))
+    (streamId : Nat) : outboundStreamWindow state streamId ≤ (maxStreamId : Int) := by
+  unfold outboundStreamWindow
+  split
+  next w hw => exact hwin w (Array.mem_of_find?_eq_some hw)
+  next => exact Int.ofNat_le.mpr hinit
+
+private theorem sub_le_maxStreamId {a : Int} {n : Nat} (h : a ≤ (maxStreamId : Int)) :
+    a - (n : Int) ≤ (maxStreamId : Int) := by omega
+
+/-- Flushing the outbound queue keeps every outbound window inside the 31-bit
+range: it only ever debits windows. -/
+private theorem flushOutbound_bounded : ∀ (state : State) (emitted : Array Frame),
+    state.outboundInitialStreamWindow ≤ maxStreamId →
+    state.outboundConnectionWindow ≤ maxStreamId →
+    (∀ w ∈ state.outboundStreamWindows, w.window ≤ (maxStreamId : Int)) →
+    (flushOutbound state emitted).1.outboundInitialStreamWindow ≤ maxStreamId
+      ∧ (flushOutbound state emitted).1.outboundConnectionWindow ≤ maxStreamId
+      ∧ (∀ w ∈ (flushOutbound state emitted).1.outboundStreamWindows,
+          w.window ≤ (maxStreamId : Int)) := by
+  intro state emitted
+  fun_induction flushOutbound state emitted
+  case case1 => intro hinit hconn hwin; exact ⟨hinit, hconn, hwin⟩
+  case case3 => intro hinit hconn hwin; exact ⟨hinit, hconn, hwin⟩
+  case case2 =>
+    rename_i ih
+    intro hinit hconn hwin
+    refine ih ?_ ?_ ?_ <;> simp +zetaDelta only [cleanupOutboundIfEndStream] <;> split
+    · exact hinit
+    · exact hinit
+    · exact hconn
+    · exact hconn
+    · intro w hmem; exact hwin w (mem_removeOutboundStreamWindow hmem)
+    · exact hwin
+  case case4 =>
+    rename_i ih
+    intro hinit hconn hwin
+    have hbound := outboundStreamWindow_le' hinit hwin
+    refine ih ?_ ?_ ?_ <;> simp +zetaDelta only [cleanupOutboundIfEndStream] <;> split
+    · exact hinit
+    · exact hinit
+    · exact Nat.le_trans (Nat.sub_le _ _) hconn
+    · exact Nat.le_trans (Nat.sub_le _ _) hconn
+    · intro w hmem
+      exact setOutboundStreamWindow_bounded hwin (sub_le_maxStreamId (hbound _)) w
+        (mem_removeOutboundStreamWindow hmem)
+    · exact setOutboundStreamWindow_bounded hwin (sub_le_maxStreamId (hbound _))
+  case case5 =>
+    intro hinit hconn hwin
+    have hbound := outboundStreamWindow_le' hinit hwin
+    exact ⟨hinit, Nat.le_trans (Nat.sub_le _ _) hconn,
+      setOutboundStreamWindow_bounded hwin (sub_le_maxStreamId (hbound _))⟩
+
+private theorem cleanupOutboundIfEndStream_outboundHpack (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).outboundHpack = state.outboundHpack := by
+  unfold cleanupOutboundIfEndStream; split <;> rfl
+
+private theorem cleanupOutboundIfEndStream_hpack (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).hpack = state.hpack := by
+  unfold cleanupOutboundIfEndStream; split <;> rfl
+
+private theorem flushOutbound_tables (state : State) (emitted : Array Frame) :
+    (flushOutbound state emitted).1.outboundHpack = state.outboundHpack
+      ∧ (flushOutbound state emitted).1.hpack = state.hpack := by
+  fun_induction flushOutbound state emitted <;>
+    simp_all +zetaDelta [cleanupOutboundIfEndStream_outboundHpack,
+      cleanupOutboundIfEndStream_hpack, setOutboundStreamWindow]
+
+private theorem flushOutbound_wellFormed {state : State} (h : WellFormed state)
+    (emitted : Array Frame) : WellFormed (flushOutbound state emitted).1 := by
+  obtain ⟨hi, hc, hw⟩ := flushOutbound_bounded state emitted h.outboundInitial
+    h.outboundConnection h.outboundStreams
+  obtain ⟨ho, hin⟩ := flushOutbound_tables state emitted
+  obtain ⟨hs, -, hl⟩ := flushOutbound_fields state emitted
+  exact {
+    streamIds := by
+      intro s hs'
+      rw [hs] at hs'
+      obtain ⟨hid, hle⟩ := h.streamIds s hs'
+      exact ⟨hid, by rw [hl]; exact hle⟩
+    pendingHeaders := by
+      intro s hs' hp
+      rw [hs] at hs'
+      rw [hl]
+      exact h.pendingHeaders s hs' hp
+    outboundInitial := hi
+    outboundConnection := hc
+    outboundStreams := hw
+    outboundTable := by rw [ho]; exact h.outboundTable
+    inboundTable := by rw [hin]; exact h.inboundTable
+  }
+
+/-! ### Single-field updates -/
+
+private theorem WellFormed.withOutboundConnection {state : State} (h : WellFormed state)
+    {window : Nat} (hw : window ≤ maxStreamId) :
+    WellFormed { state with outboundConnectionWindow := window } where
+  streamIds := h.streamIds
+  pendingHeaders := h.pendingHeaders
+  outboundInitial := h.outboundInitial
+  outboundConnection := hw
+  outboundStreams := h.outboundStreams
+  outboundTable := h.outboundTable
+  inboundTable := h.inboundTable
+
+private theorem WellFormed.withOutboundStreamWindow {state : State} (h : WellFormed state)
+    (streamId : Nat) {window : Int} (hw : window ≤ (maxStreamId : Int)) :
+    WellFormed (setOutboundStreamWindow state streamId window) where
+  streamIds := h.streamIds
+  pendingHeaders := h.pendingHeaders
+  outboundInitial := h.outboundInitial
+  outboundConnection := h.outboundConnection
+  outboundStreams := setOutboundStreamWindow_bounded h.outboundStreams hw
+  outboundTable := h.outboundTable
+  inboundTable := h.inboundTable
+
+/-! ### SETTINGS and WINDOW_UPDATE -/
+
+private theorem adjustOutboundWindowStep_le {old new : Nat}
+    {acc acc' : Array OutboundStreamWindow} {window : OutboundStreamWindow}
+    (h : adjustOutboundWindowStep old new acc window = .ok acc')
+    (hacc : ∀ x ∈ acc, x.window ≤ (maxStreamId : Int)) :
+    ∀ x ∈ acc', x.window ≤ (maxStreamId : Int) := by
+  unfold adjustOutboundWindowStep at h
+  split at h
+  next => cases h
+  next hle =>
+    cases h
+    intro x hx
+    cases Array.mem_push.mp hx with
+    | inl hm => exact hacc x hm
+    | inr heq => rw [heq]; exact Int.not_lt.mp hle
+
+private theorem adjustOutboundWindows_le {old new : Nat}
+    {windows windows' : Array OutboundStreamWindow}
+    (h : adjustOutboundWindows old new windows = .ok windows') :
+    ∀ x ∈ windows', x.window ≤ (maxStreamId : Int) := by
+  unfold adjustOutboundWindows at h
+  rw [← Array.foldlM_toList] at h
+  generalize windows.toList = l at h
+  suffices hgen : ∀ (l : List OutboundStreamWindow) (acc : Array OutboundStreamWindow),
+      (∀ x ∈ acc, x.window ≤ (maxStreamId : Int)) →
+      l.foldlM (adjustOutboundWindowStep old new) acc = .ok windows' →
+      ∀ x ∈ windows', x.window ≤ (maxStreamId : Int) from
+    hgen l #[] (by intro x hx; simp at hx) h
+  intro l
+  induction l with
+  | nil =>
+      intro acc hacc hfold
+      simp only [List.foldlM_nil, pure, Except.pure] at hfold
+      cases hfold
+      exact hacc
+  | cons w rest ih =>
+      intro acc hacc hfold
+      simp only [List.foldlM_cons, bind, Except.bind] at hfold
+      split at hfold
+      next => cases hfold
+      next mid hmid => exact ih mid (adjustOutboundWindowStep_le hmid hacc) hfold
+
+private theorem applyInitialWindowSize_wellFormed {state state' : State} {value : Nat}
+    (h : WellFormed state) (heq : applyInitialWindowSize state value = .ok state') :
+    WellFormed state' := by
+  unfold applyInitialWindowSize at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next hle =>
+    split at heq
+    next => cases heq
+    next windows hadj =>
+      cases heq
+      exact {
+        streamIds := h.streamIds
+        pendingHeaders := h.pendingHeaders
+        outboundInitial := Nat.not_lt.mp hle
+        outboundConnection := h.outboundConnection
+        outboundStreams := adjustOutboundWindows_le hadj
+        outboundTable := h.outboundTable
+        inboundTable := h.inboundTable
+      }
+
+private theorem applyMaxFrameSize_wellFormed {state state' : State} {value : Nat}
+    (h : WellFormed state) (heq : applyMaxFrameSize state value = .ok state') :
+    WellFormed state' := by
+  unfold applyMaxFrameSize at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    cases heq
+    exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+
+private theorem applyPeerSetting_wellFormed {state state' : State} {setting : Setting}
+    (h : WellFormed state) (heq : applyPeerSetting state setting = .ok state') :
+    WellFormed state' := by
+  unfold applyPeerSetting at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next =>
+      cases heq
+      exact {
+        streamIds := h.streamIds
+        pendingHeaders := h.pendingHeaders
+        outboundInitial := h.outboundInitial
+        outboundConnection := h.outboundConnection
+        outboundStreams := h.outboundStreams
+        outboundTable := by
+          rw [Hpack.maxSize_setMaxAllowedSize]
+          exact Hpack.dynamicSize_setMaxAllowedSize_le state.outboundHpack setting.value
+        inboundTable := h.inboundTable
+      }
+  next =>
+      split at heq
+      next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+      next => cases heq
+  next => exact applyInitialWindowSize_wellFormed h heq
+  next => exact applyMaxFrameSize_wellFormed h heq
+  next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+  next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+  next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+
+private theorem applyPeerSettings_wellFormed {settings : Array Setting} {state state' : State}
+    (h : WellFormed state) (heq : applyPeerSettings state settings = .ok state') :
+    WellFormed state' := by
+  unfold applyPeerSettings at heq
+  rw [← Array.foldlM_toList] at heq
+  generalize settings.toList = l at heq
+  induction l generalizing state with
+  | nil =>
+      simp only [List.foldlM_nil, pure, Except.pure] at heq
+      cases heq
+      exact h
+  | cons setting rest ih =>
+      simp only [List.foldlM_cons, bind, Except.bind] at heq
+      split at heq
+      next => cases heq
+      next mid hmid => exact ih (applyPeerSetting_wellFormed h hmid) heq
+
+private theorem processSettings_wellFormed {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : WellFormed state)
+    (heq : processSettings state frame = .ok res) : WellFormed res.1 := by
+  unfold processSettings at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next =>
+      split at heq
+      next => cases heq
+      next => cases heq; exact h
+    next =>
+      split at heq
+      next => cases heq
+      next s1 happ =>
+        split at heq
+        next => cases heq
+        next =>
+          cases heq
+          have h1 := applyPeerSettings_wellFormed h happ
+          have h2 : WellFormed { s1 with clientSettingsReceived := true } :=
+            h1.ofSame (SameOutbound.refl s1) (fun _ hs => hs) rfl
+          exact flushOutbound_wellFormed h2 #[]
+
+private theorem applyWindowUpdate_wellFormed {state state' : State} {frame : Frame}
+    (h : WellFormed state) (heq : applyWindowUpdate state frame = .ok state') :
+    WellFormed state' := by
+  unfold applyWindowUpdate at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next increment hdec =>
+    split at heq
+    next =>
+      unfold addOutboundConnectionWindow at heq
+      simp only [bind, Except.bind, pure, Except.pure] at heq
+      split at heq
+      next => cases heq
+      next hv =>
+        cases heq
+        split at hv
+        next => cases hv
+        next hle => cases hv; exact h.withOutboundConnection (Nat.not_lt.mp hle)
+    next =>
+      unfold addOutboundStreamWindow at heq
+      simp only [bind, Except.bind, pure, Except.pure] at heq
+      split at heq
+      next => cases heq
+      next hv =>
+        cases heq
+        split at hv
+        next => cases hv
+        next hle =>
+          cases hv
+          exact h.withOutboundStreamWindow frame.header.streamId (Int.not_lt.mp hle)
+
+private theorem processWindowUpdate_wellFormed {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : WellFormed state)
+    (heq : processWindowUpdate state frame = .ok res) : WellFormed res.1 := by
+  unfold processWindowUpdate at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next s1 hupd =>
+        cases heq
+        exact flushOutbound_wellFormed (applyWindowUpdate_wellFormed h hupd) #[]
+  next =>
+    split at heq
+    next => cases heq
+    next s1 hupd =>
+      cases heq
+      exact flushOutbound_wellFormed (applyWindowUpdate_wellFormed h hupd) #[]
+
+/-! ### PING, GOAWAY, PRIORITY, RST_STREAM -/
+
+private theorem processPing_wellFormed {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : WellFormed state)
+    (heq : processPing state frame = .ok res) : WellFormed res.1 := by
+  unfold processPing at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next =>
+      cases heq
+      split
+      · split
+        · exact h.ofFields (SameOutbound.refl _) rfl rfl
+        · exact h
+      · exact h
+    next =>
+      split at heq
+      next => cases heq
+      next => cases heq; exact h
+
+private theorem processGoAway_wellFormed {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : WellFormed state)
+    (heq : processGoAway state frame = .ok res) : WellFormed res.1 := by
+  unfold processGoAway at heq
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at heq
+  split at heq
+  next => cases heq
+  next => cases heq; exact h
+
+private theorem processPriority_wellFormed {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : WellFormed state)
+    (heq : processPriority state frame = .ok res) : WellFormed res.1 := by
+  unfold processPriority at heq
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next => cases heq; exact h
+
+private theorem removeInboundStreamState_same (state : State) (streamId : Nat) :
+    SameOutbound (removeInboundStreamState state streamId) state :=
+  ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem removeOutboundStreamState_same (state : State) (streamId : Nat) :
+    SameOutbound (removeOutboundStreamState state streamId) state :=
+  ⟨rfl, Nat.le_refl _, fun _ hw => mem_removeOutboundStreamWindow hw, rfl, rfl⟩
+
+private theorem processRstStreamShared_wellFormed {state : State} {frame : Frame}
+    {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : processRstStreamShared state frame = .ok res) : WellFormed res.1 := by
+  obtain ⟨hsub, -, hlast, -⟩ := processRstStreamShared_ok heq
+  refine h.ofSame ?_ hsub hlast
+  unfold processRstStreamShared at heq
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      cases heq
+      exact SameOutbound.trans (removeOutboundStreamState_same _ _)
+        (removeInboundStreamState_same _ _)
+
+/-! ### DATA -/
+
+private theorem consumeInboundDataWindow_same {state state' : State} {frame : Frame}
+    (heq : consumeInboundDataWindow state frame = .ok state') : SameOutbound state' state := by
+  unfold consumeInboundDataWindow at heq
+  simp only [] at heq
+  split at heq
+  next => cases heq; exact SameOutbound.refl _
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next => cases heq; exact ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem replenishInboundDataWindow_same (state : State) (frame : Frame) :
+    SameOutbound (replenishInboundDataWindow state frame) state := by
+  unfold replenishInboundDataWindow
+  simp only []
+  split
+  · exact SameOutbound.refl _
+  · exact ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem replenishInboundConnectionWindow_fields (state : State) (size : Nat) :
+    (replenishInboundConnectionWindow state size).streams = state.streams
+      ∧ (replenishInboundConnectionWindow state size).lastClientStreamId
+          = state.lastClientStreamId := by
+  unfold replenishInboundConnectionWindow
+  split <;> exact ⟨rfl, rfl⟩
+
+private theorem replenishInboundStreamWindowBy_fields (state : State) (streamId size : Nat) :
+    (replenishInboundStreamWindowBy state streamId size).streams = state.streams
+      ∧ (replenishInboundStreamWindowBy state streamId size).lastClientStreamId
+          = state.lastClientStreamId := by
+  unfold replenishInboundStreamWindowBy
+  split <;> exact ⟨rfl, rfl⟩
+
+private theorem replenishInboundConnectionWindow_same (state : State) (size : Nat) :
+    SameOutbound (replenishInboundConnectionWindow state size) state := by
+  unfold replenishInboundConnectionWindow
+  split
+  · exact SameOutbound.refl _
+  · exact ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem replenishInboundStreamWindowBy_same (state : State) (streamId size : Nat) :
+    SameOutbound (replenishInboundStreamWindowBy state streamId size) state := by
+  unfold replenishInboundStreamWindowBy
+  split
+  · exact SameOutbound.refl _
+  · exact ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem processIgnoredInboundData_wellFormed {state state' : State} {frame : Frame}
+    {updates : Array Frame} (h : WellFormed state)
+    (heq : processIgnoredInboundData state frame = .ok (state', updates)) :
+    WellFormed state' := by
+  obtain ⟨hstreams, hlast, -⟩ := processIgnoredInboundData_ok heq
+  refine h.ofFields ?_ hstreams hlast
+  unfold processIgnoredInboundData at heq
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst,
+    pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next s1 hcons =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next =>
+        split at heq
+        next => cases heq
+        next =>
+          cases heq
+          have hbase := SameOutbound.trans (replenishInboundDataWindow_same s1 frame)
+            (consumeInboundDataWindow_same hcons)
+          split
+          · exact SameOutbound.trans (removeInboundStreamState_same _ _) hbase
+          · exact hbase
+
+private theorem stripPadding_streamId {frame frame' : Frame} {frameName : String}
+    (heq : stripPadding frame frameName = .ok frame') :
+    frame'.header.streamId = frame.header.streamId := by
+  unfold stripPadding at heq
+  simp only [] at heq
+  split at heq
+  next => cases heq; rfl
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next => cases heq; rfl
+
+private theorem streamHeaderPending_push {stream : StreamState} (frame : Frame)
+    (hcomplete : streamHeaderComplete stream = true) :
+    streamHeaderPending { stream with frames := stream.frames.push frame } = false := by
+  unfold streamHeaderComplete at hcomplete
+  unfold streamHeaderPending
+  split at hcomplete
+  next headersFrame hfirst =>
+    have hpos : 0 < stream.frames.size := (Array.getElem?_eq_some_iff.mp hfirst).1
+    have hpush : (stream.frames.push frame)[0]? = some headersFrame := by
+      rw [Array.getElem?_push_lt hpos]
+      rw [(Array.getElem?_eq_some_iff.mp hfirst).2]
+    show (match (stream.frames.push frame)[0]? with
+      | some f => f.header.frameType == FrameType.headers && !headerComplete f
+      | none => false) = false
+    rw [hpush]
+    simp [hcomplete]
+  next => exact absurd hcomplete (by simp)
+
+/-- The unary DATA path appends to a stream that is already past END_HEADERS,
+so the stream-id and CONTINUATION laws survive. -/
+private theorem appendStreamFrame_wellFormed {state : State} (h : WellFormed state)
+    {frame appended : Frame} {old : StreamState}
+    (hfind : findStream? state.streams frame.header.streamId = some old)
+    (hcomplete : streamHeaderComplete old = true)
+    (hid : appended.header.streamId = frame.header.streamId) :
+    ∀ s ∈ appendStreamFrame state.streams appended,
+      (isClientStreamId s.streamId = true ∧ s.streamId ≤ state.lastClientStreamId)
+        ∧ (streamHeaderPending s = true → s.streamId = state.lastClientStreamId) := by
+  have hfind' : findStream? state.streams appended.header.streamId = some old := by
+    rw [hid]; exact hfind
+  intro s hs
+  rcases mem_appendStreamFrame_of_found hfind' hs with hmem | heq
+  · exact ⟨h.streamIds s hmem, h.pendingHeaders s hmem⟩
+  · obtain ⟨hold, holdId⟩ := findStream?_streamId hfind
+    subst heq
+    refine ⟨?_, ?_⟩
+    · exact h.streamIds old hold
+    · intro hp
+      rw [streamHeaderPending_push appended hcomplete] at hp
+      exact absurd hp (by simp)
+
+private theorem detachStreamForDispatch_wellFormed {state state' : State} {streamId : Nat}
+    {detached : DetachedDispatch} (h : WellFormed state)
+    (heq : detachStreamForDispatch state streamId = .ok (state', detached)) :
+    WellFormed state' := by
+  unfold detachStreamForDispatch at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      cases heq
+      refine h.ofSame (removeInboundStreamState_same _ _) ?_ rfl
+      intro s hs
+      exact mem_removeStream hs
+
+/-- A streaming-request DATA step preserves well-formedness. -/
+private theorem processActiveRequestData_wellFormed {registry : Registry} {state : State}
+    {frame : Frame} {active : ActiveRequestStream} {res : State × SharedFrameResult}
+    (h : WellFormed state)
+    (heq : processActiveRequestData registry state frame active = .ok res) :
+    WellFormed res.1 := by
+  unfold processActiveRequestData at heq
+  split at heq
+  next => cases heq
+  next consumed hcons =>
+    split at heq
+    next => cases heq
+    next stripped hstrip =>
+      split at heq
+      next => cases heq
+      next =>
+        split at heq
+        next => cases heq
+        next normalized hnorm =>
+          have hcredited : WellFormed
+              (replenishInboundStreamWindowBy
+                (replenishInboundConnectionWindow consumed frame.payload.size)
+                stripped.header.streamId (frame.payload.size - stripped.payload.size)) :=
+            h.ofFields
+              (SameOutbound.trans (replenishInboundStreamWindowBy_same _ _ _)
+                (SameOutbound.trans (replenishInboundConnectionWindow_same _ _)
+                  (consumeInboundDataWindow_same hcons)))
+              ((replenishInboundStreamWindowBy_fields _ _ _).1.trans
+                ((replenishInboundConnectionWindow_fields _ _).1.trans
+                  (consumeInboundDataWindow_ok hcons).1))
+              ((replenishInboundStreamWindowBy_fields _ _ _).2.trans
+                ((replenishInboundConnectionWindow_fields _ _).2.trans
+                  (consumeInboundDataWindow_ok hcons).2.2.2))
+          split at heq
+          next =>
+            cases heq
+            simp only []
+            split
+            · exact hcredited.ofSame (removeInboundStreamState_same _ _)
+                (fun s hs => mem_removeStream hs) rfl
+            · exact hcredited.ofSame (SameOutbound.refl _) (fun _ hs => hs) rfl
+          next =>
+            cases heq
+            exact hcredited.ofSame (removeInboundStreamState_same _ _)
+              (fun s hs => mem_removeStream hs) rfl
+
+/-- A unary-request DATA step preserves well-formedness: the frame is appended
+to a stream that is already past END_HEADERS, so no header block reopens. -/
+private theorem processUnaryRequestData_wellFormed {state : State} {frame : Frame}
+    {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : processUnaryRequestData state frame = .ok res) : WellFormed res.1 := by
+  unfold processUnaryRequestData at heq
+  split at heq
+  next => cases heq
+  next stream hfind =>
+    split at heq
+    next => cases heq
+    next hnot =>
+      have hcomplete : streamHeaderComplete stream = true := by
+        simpa using hnot
+      split at heq
+      next => cases heq
+      next consumed hcons =>
+        split at heq
+        next => cases heq
+        next =>
+          split at heq
+          next => cases heq
+          next stripped hstrip =>
+            have hbuffered : WellFormed {
+                replenishInboundDataWindow consumed frame with
+                streams := appendStreamFrame
+                  (replenishInboundDataWindow consumed frame).streams stripped } := by
+              obtain ⟨hs, -, -, hl⟩ := consumeInboundDataWindow_ok hcons
+              obtain ⟨hs2, -, -, hl2⟩ := replenishInboundDataWindow_fields consumed frame
+              refine h.ofStreams
+                (SameOutbound.trans (replenishInboundDataWindow_same consumed frame)
+                  (consumeInboundDataWindow_same hcons))
+                (hl2.trans hl) ?_
+              intro s hmem
+              replace hmem : s ∈ appendStreamFrame
+                (replenishInboundDataWindow consumed frame).streams stripped := hmem
+              rw [hs2.trans hs] at hmem
+              exact appendStreamFrame_wellFormed h hfind hcomplete
+                (stripPadding_streamId hstrip) s hmem
+            simp only [] at heq
+            split at heq
+            next =>
+              split at heq
+              next => cases heq
+              next detachedState detached hdet =>
+                cases heq
+                exact detachStreamForDispatch_wellFormed hbuffered hdet
+            next => cases heq; exact hbuffered
+
+/-- Every pure DATA step preserves well-formedness. -/
+private theorem processDataShared_wellFormed {registry : Registry} {state : State}
+    {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : processDataShared registry state frame = .ok res) : WellFormed res.1 := by
+  unfold processDataShared at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next =>
+      split at heq
+      next => cases heq
+      next drained updates hproc =>
+        cases heq
+        exact processIgnoredInboundData_wellFormed h hproc
+    next =>
+      split at heq
+      next => exact processActiveRequestData_wellFormed h heq
+      next => exact processUnaryRequestData_wellFormed h heq
+
+/-- Every pure non-header frame step preserves well-formedness. -/
+private theorem processNonHeaderFrameShared_wellFormed {registry : Registry} {state : State}
+    {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : processNonHeaderFrameShared registry state frame = .ok res) :
+    WellFormed res.1 := by
+  unfold processNonHeaderFrameShared at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next =>
+    split at heq
+    next => cases heq
+    next pair hset => obtain ⟨s1, emitted⟩ := pair; cases heq; exact processSettings_wellFormed h hset
+  next => exact processDataShared_wellFormed h heq
+  next => exact processRstStreamShared_wellFormed h heq
+  next =>
+    split at heq
+    next => cases heq
+    next pair hupd =>
+      obtain ⟨s1, emitted⟩ := pair; cases heq; exact processWindowUpdate_wellFormed h hupd
+  next =>
+    split at heq
+    next => cases heq
+    next pair hping =>
+      obtain ⟨s1, emitted⟩ := pair; cases heq; exact processPing_wellFormed h hping
+  next =>
+    split at heq
+    next => cases heq
+    next pair hprio =>
+      obtain ⟨s1, emitted⟩ := pair; cases heq; exact processPriority_wellFormed h hprio
+  next =>
+    split at heq
+    next => cases heq
+    next pair hgo =>
+      obtain ⟨s1, emitted⟩ := pair; cases heq; exact processGoAway_wellFormed h hgo
+  next => cases heq
+  next => cases heq; exact h
+  next => cases heq
+  next => cases heq
+
+/-! ### HEADERS and CONTINUATION -/
+
+private theorem requireClientStreamId_ok {streamId : Nat} {frameName : String} {u : Unit}
+    (h : requireClientStreamId streamId frameName = .ok u) :
+    isClientStreamId streamId = true := by
+  unfold requireClientStreamId at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next hc => simpa using hc
+
+private theorem requireNewClientStreamId_ok {state : State} {streamId : Nat} {u : Unit}
+    (h : requireNewClientStreamId state streamId = .ok u) :
+    isClientStreamId streamId = true ∧ state.lastClientStreamId < streamId := by
+  unfold requireNewClientStreamId at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next _u hreq =>
+    split at h
+    next => cases h
+    next hcond => exact ⟨requireClientStreamId_ok hreq, Nat.lt_of_not_le hcond⟩
+
+/-- A HEADERS frame is only accepted with a stream id strictly above every id
+the connection has already claimed. -/
+private theorem prepareHeadersShared_gt_lastClientStreamId {state : State} {frame : Frame}
+    {res : State × Option Frame} (heq : prepareHeadersShared state frame = .ok res) :
+    state.lastClientStreamId < frame.header.streamId := by
+  unfold prepareHeadersShared at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next _u hnew => exact (requireNewClientStreamId_ok hnew).2
+
+/-- Closed streams stay closed.  Every id the connection has claimed is at or
+below `lastClientStreamId`, and a HEADERS frame is only accepted strictly
+above it, so a stream that was reset, drained or dispatched away can never be
+reopened on the same connection. -/
+private theorem prepareHeadersShared_no_reopen {state : State} {frame : Frame}
+    {res : State × Option Frame} (heq : prepareHeadersShared state frame = .ok res)
+    {claimed : Nat} (hclaimed : claimed ≤ state.lastClientStreamId) :
+    frame.header.streamId ≠ claimed := by
+  intro hcontra
+  have := prepareHeadersShared_gt_lastClientStreamId heq
+  omega
+
+/-- `SETTINGS_MAX_CONCURRENT_STREAMS` is enforced on inbound streams: a HEADERS
+frame that opens a new stream is only accepted while the number of active
+inbound streams is strictly below the advertised limit. -/
+private theorem prepareHeadersShared_concurrency {state state' : State} {frame : Frame}
+    {limit : Nat} (hlimit : state.inboundMaxConcurrentStreams = some limit)
+    (heq : prepareHeadersShared state frame = .ok (state', none)) :
+    activeInboundStreamCount state < limit := by
+  unfold prepareHeadersShared at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next =>
+        split at heq
+        next => cases heq
+        next reject hreject =>
+          split at heq
+          next => cases heq
+          next =>
+            split at heq
+            next => cases heq
+            next v hcap =>
+              unfold requireInboundStreamCapacity at hcap
+              simp only [bind, Except.bind, pure, Except.pure, hlimit] at hcap
+              split at hcap
+              next => cases hcap
+              next hlt => exact Nat.lt_of_not_le hlt
+
+/-- The pure bookkeeping of a HEADERS frame preserves well-formedness: the new
+stream carries the id it just claimed, and the CONTINUATION guard rules out a
+second open header block. -/
+private theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
+    {res : State × Option Frame} (h : WellFormed state)
+    (hpending : pendingHeaderStream? state.streams = none)
+    (heq : prepareHeadersShared state frame = .ok res) : WellFormed res.1 := by
+  unfold prepareHeadersShared at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next => cases heq
+    next hnotfound =>
+      have hfindnone : findStream? state.streams frame.header.streamId = none := by
+        cases hcase : findStream? state.streams frame.header.streamId with
+        | none => rfl
+        | some s => exact absurd (by rw [hcase]; rfl) hnotfound
+      split at heq
+      next => cases heq
+      next _u hnew =>
+        obtain ⟨hclient, hlt⟩ := requireNewClientStreamId_ok hnew
+        split at heq
+        next => cases heq
+        next reject hreject =>
+          split at heq
+          next => cases heq; exact h
+          next =>
+            split at heq
+            next => cases heq
+            next =>
+              cases heq
+              exact {
+                streamIds := by
+                  intro s hs
+                  rcases mem_appendStreamFrame_of_new hfindnone hs with hmem | hnew'
+                  · obtain ⟨hid, hle⟩ := h.streamIds s hmem
+                    exact ⟨hid, Nat.le_of_lt (Nat.lt_of_le_of_lt hle hlt)⟩
+                  · rw [hnew']; exact ⟨hclient, Nat.le_refl _⟩
+                pendingHeaders := by
+                  intro s hs hp
+                  rcases mem_appendStreamFrame_of_new hfindnone hs with hmem | hnew'
+                  · rw [streamHeaderPending_of_pendingHeaderStream?_none hpending hmem] at hp
+                    exact absurd hp (by simp)
+                  · rw [hnew']
+                outboundInitial := h.outboundInitial
+                outboundConnection := h.outboundConnection
+                outboundStreams := h.outboundStreams
+                outboundTable := h.outboundTable
+                inboundTable := h.inboundTable
+              }
+
+/-- Merging a CONTINUATION fragment preserves well-formedness: the stream keeps
+its id, and its header block was already the open one, so it is still the newest
+stream. -/
+private theorem appendContinuationFrame_wellFormed {state : State} {frame : Frame}
+    {streams' : Array StreamState} (h : WellFormed state)
+    (heq : appendContinuationFrame state.streams frame = .ok streams') :
+    WellFormed { state with streams := streams' } := by
+  unfold appendContinuationFrame at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next =>
+    split at heq
+    next stream hfind =>
+      split at heq
+      next headersFrame hfirst =>
+        split at heq
+        next => cases heq
+        next hty =>
+          split at heq
+          next => cases heq
+          next hopen =>
+            split at heq
+            next => cases heq
+            next =>
+              cases heq
+              obtain ⟨hmemStream, hidStream⟩ := findStream?_streamId hfind
+              have hpendingStream : streamHeaderPending stream = true := by
+                simp only [streamHeaderPending, hfirst, Bool.and_eq_true, Bool.not_eq_true']
+                exact ⟨by simpa using hty, by simpa using hopen⟩
+              have hlast : stream.streamId = state.lastClientStreamId :=
+                h.pendingHeaders stream hmemStream hpendingStream
+              refine h.ofStreams (SameOutbound.refl _) rfl ?_
+              intro s hs
+              rcases mem_replaceStream hs with hmem | hrepl
+              · exact ⟨h.streamIds s hmem, h.pendingHeaders s hmem⟩
+              · rw [hrepl]
+                exact ⟨⟨(h.streamIds stream hmemStream).1, Nat.le_of_eq hlast⟩,
+                  fun _ => hlast⟩
+      next => cases heq
+    next => cases heq
 
 end Connection
 end Http2
