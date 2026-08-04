@@ -244,9 +244,11 @@ holds today:
     residual bytes (`decodeHeader_encodeHeader_append`,
     `decodeAll_encode_append`);
   - `Grpc.Http2.Hpack` — integer roundtrip (`decodeInteger_encodeInteger`),
-    raw literal-string roundtrip (`decodeString_encodeString_raw`), the
-    dynamic-table size invariant (`dynamicSize_*_le`), and prefix-freeness
-    of the 257-entry Huffman table (`huffmanPrefixFree`);
+    literal-string roundtrip in both representations
+    (`decodeString_encodeString`), the Huffman coder roundtrip
+    (`decodeHuffman_encodeHuffman`, resting on prefix-freeness of the
+    257-entry table, `huffmanPrefixFree`), and the dynamic-table size
+    invariant (`dynamicSize_*_le`);
   - `Grpc.Protocol` — `grpc-timeout` render/parse (`Timeout.parse?_render`)
     and `grpc-message` percent-coding (`Percent.decode_encode`);
   - `Grpc.Metadata` — base64 roundtrips behind `-bin` metadata
@@ -254,8 +256,8 @@ holds today:
   - `Grpc.Server` — registry well-formedness and lookup uniqueness;
     `Grpc.Http2.Connection` — rejected streams stay inert.
 
-  The Huffman *coder* roundtrip (decode ∘ encode) is not proved yet; only
-  the table's prefix-freeness is.
+  Not proved: the HPACK header-block loop, the connection state machine,
+  flow control, and everything above the codecs.
 - **C in the trusted computing base**: the zlib shim
   (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) and, via
   `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
