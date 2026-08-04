@@ -269,10 +269,33 @@ holds today:
   - `Grpc.Metadata` — base64 roundtrips behind `-bin` metadata
     (`Base64.decodeBytes_encodeBytes`, `…_encodeBytesUnpadded`);
   - `Grpc.Server` — registry well-formedness and lookup uniqueness;
-    `Grpc.Http2.Connection` — rejected streams stay inert.
+  - `Grpc.Http2.Connection` — rejected streams stay inert;
+    `Connection.WellFormed`, the pure connection invariant (client stream-id
+    parity and monotone claiming, CONTINUATION sequencing, 31-bit outbound
+    window bounds, HPACK tables inside their negotiated limits), holds of
+    `initialState` and is preserved by every pure frame transition —
+    `prepareHeadersShared_wellFormed`, `appendContinuationFrame_wellFormed`
+    and `processNonHeaderFrameShared_wellFormed` (SETTINGS, DATA,
+    RST_STREAM, WINDOW_UPDATE, PING, PRIORITY, GOAWAY, unknown), with
+    `prepareHeadersShared_no_reopen` (a claimed stream id can never be
+    reopened) and `prepareHeadersShared_concurrency`
+    (`MAX_CONCURRENT_STREAMS` gates admission) as corollaries;
+  - `Grpc.Http2.Connection` flow control — conservation, not just bounds:
+    `consumeInboundDataWindow_conserves` (a DATA frame debits both receive
+    windows by exactly its payload, and the `Nat` equation witnesses that
+    neither subtraction truncated), `processUnaryRequestData_windows` and
+    `processActiveRequestData_windows`, `decodeActiveRequestData_conserves`
+    plus `takeRequestStreamCredit_conserves` (credit returned on consume
+    equals bytes consumed, so the effective window never creeps past the
+    advertised one), `flushOutbound_conserves` (bytes put on the wire are
+    exactly what the outbound connection window is debited), and
+    `defaultStreamWindow_admits_max_message` /
+    `inboundWindow_pos_of_incomplete` — the deadlock-freedom argument for
+    credit-on-consume, previously only a code comment.
 
-  Not proved: the HPACK header-block loop, the connection state machine,
-  flow control, and everything above the codecs.
+  Not proved: the HPACK header-block loop, the `IO` halves of the
+  HEADERS/CONTINUATION steps (header decoding, authorization, dispatch
+  spawning), and everything above the codecs.
 - **C in the trusted computing base**: the zlib shim
   (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) and, via
   `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
