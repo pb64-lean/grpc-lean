@@ -2031,23 +2031,36 @@ implementations:
   — the trace-level statement: over any pure DATA trace for a rejected
   stream, every step is dispatch-free and the stream ends inert.
 
-Remaining obligations for the full connection-level property (identified,
-not yet proved):
+Beyond the DATA-only trace, the shared kernel's remaining frame paths are
+covered further below (`flushOutbound` is now total, so SETTINGS and
+WINDOW_UPDATE steps are provable):
 
-* HEADERS/CONTINUATION steps: an inert stream id can never be reopened
-  because `requireNewClientStreamId` enforces id monotonicity and rejection
-  only happens for ids at or below `lastClientStreamId`; proving preservation
-  through `processHeadersShared` requires factoring its pure bookkeeping out
-  of the surrounding `IO` (the authorizer call), of which
-  `rejectStreamAtHeaders` is the first piece.
-* Non-DATA pure steps (SETTINGS, WINDOW_UPDATE, RST_STREAM, PING, PRIORITY,
-  GOAWAY) preserve inertness; SETTINGS routes through the `partial`
-  `flushOutbound`, which must be totalized (its recursion is structural in
-  `pendingOutbound.size`) before that lemma is provable.
+* `processNonHeaderFrameShared_inert` / `FrameTrace.inert_no_dispatch` /
+  `rejectStreamAtHeaders_frameTrace_no_dispatch` — the generalized trace:
+  over any successful sequence of SETTINGS, DATA, RST_STREAM, WINDOW_UPDATE,
+  PING, PRIORITY, GOAWAY, and unknown steps whose DATA frames target the
+  rejected stream, the stream stays inert and no step produces a request
+  feed, detached dispatch, or request-streaming dispatch.
+* `prepareHeadersShared_inert_error` / `processHeadersShared_inert_error` —
+  a HEADERS frame naming an inert stream id is a connection error in the
+  pure bookkeeping (`prepareHeadersShared`, factored out of the `IO`
+  authorizer call): `requireNewClientStreamId` enforces id monotonicity and
+  an inert id is already at or below `lastClientStreamId`.  The kernel tears
+  the connection down without running the authorizer or dispatching.
+* `appendContinuationFrame_inert_error` /
+  `processContinuationShared_inert_error` — a CONTINUATION frame naming an
+  inert stream id is likewise a connection error (no buffered header block).
+
+Remaining obligation for the full connection-level property (identified, not
+yet proved):
+
 * The `IO` layer (`processFrameSharedWith`) only spawns dispatch tasks for
   the `detached`/`requestStreaming`/`requestFeeds` artifacts shown empty
   above, so the pure results extend to the task layer by inspection; making
   that formal needs an `IO`-free event-trace refactor of the spawn sites.
+* DATA frames for *other* (live) streams legitimately produce request feeds
+  for those streams; extending the trace conclusion to arbitrary interleaved
+  DATA needs stream identity attached to `RequestStreamFeed` artifacts.
 -/
 
 /-- `true` when the connection rejected the stream at request headers and is
@@ -2337,6 +2350,521 @@ private theorem rejectStreamAtHeaders_dataTrace_no_dispatch
   trace.inert_no_dispatch streamId htarget
     (rejectStreamAtHeaders_inert state streamId inboundHpack outboundHpack endStream
       hclaimed hactive)
+
+/-!
+### Non-header frame steps
+
+Every pure shared-kernel step other than HEADERS/CONTINUATION —
+`processNonHeaderFrameShared`, covering SETTINGS, DATA, RST_STREAM,
+WINDOW_UPDATE, PING, PRIORITY, GOAWAY, unknown — preserves the inertness of a
+rejected stream and creates no dispatch work.  The field-preservation lemmas
+below track the three inertness-relevant fields (`streams`,
+`activeRequestStreams`, `lastClientStreamId`) through each processor,
+including the totalized `flushOutbound`.
+-/
+
+private theorem State.StreamInert.of_fields {state state' : State} {streamId : Nat}
+    (hinert : state.StreamInert streamId)
+    (hstreams : ∀ s ∈ state'.streams, s ∈ state.streams)
+    (hactive : ∀ a ∈ state'.activeRequestStreams, a ∈ state.activeRequestStreams)
+    (hlast : state'.lastClientStreamId = state.lastClientStreamId) :
+    state'.StreamInert streamId := {
+  notBuffered := fun s hs => hinert.notBuffered s (hstreams s hs)
+  notActive := fun a ha => hinert.notActive a (hactive a ha)
+  claimed := by rw [hlast]; exact hinert.claimed
+}
+
+private theorem cleanupOutboundIfEndStream_streams (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).streams = state.streams := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+private theorem cleanupOutboundIfEndStream_activeRequestStreams (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).activeRequestStreams
+      = state.activeRequestStreams := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+private theorem cleanupOutboundIfEndStream_lastClientStreamId (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).lastClientStreamId = state.lastClientStreamId := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+private theorem flushOutbound_fields (state : State) (emitted : Array Frame) :
+    (flushOutbound state emitted).1.streams = state.streams
+      ∧ (flushOutbound state emitted).1.activeRequestStreams = state.activeRequestStreams
+      ∧ (flushOutbound state emitted).1.lastClientStreamId = state.lastClientStreamId := by
+  fun_induction flushOutbound state emitted <;>
+    simp_all +zetaDelta [cleanupOutboundIfEndStream_streams,
+      cleanupOutboundIfEndStream_activeRequestStreams,
+      cleanupOutboundIfEndStream_lastClientStreamId, setOutboundStreamWindow]
+
+private theorem applyInitialWindowSize_ok {state state' : State} {value : Nat}
+    (h : applyInitialWindowSize state value = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold applyInitialWindowSize at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next windows hmap =>
+      cases h
+      exact ⟨rfl, rfl, rfl⟩
+
+private theorem applyMaxFrameSize_ok {state state' : State} {value : Nat}
+    (h : applyMaxFrameSize state value = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold applyMaxFrameSize at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    cases h
+    exact ⟨rfl, rfl, rfl⟩
+
+private theorem applyPeerSetting_ok {state state' : State} {setting : Setting}
+    (h : applyPeerSetting state setting = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold applyPeerSetting at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
+  next =>
+    split at h
+    next => cases h; exact ⟨rfl, rfl, rfl⟩
+    next => cases h
+  next => exact applyInitialWindowSize_ok h
+  next => exact applyMaxFrameSize_ok h
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
+
+private theorem applyPeerSettings_ok {settings : Array Setting} {state state' : State}
+    (h : applyPeerSettings state settings = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold applyPeerSettings at h
+  rw [← Array.foldlM_toList] at h
+  generalize settings.toList = l at h
+  induction l generalizing state with
+  | nil =>
+      simp only [List.foldlM_nil, pure, Except.pure] at h
+      cases h
+      exact ⟨rfl, rfl, rfl⟩
+  | cons s rest ih =>
+      simp only [List.foldlM_cons, bind, Except.bind] at h
+      split at h
+      next => cases h
+      next mid hmid =>
+        obtain ⟨h1, h2, h3⟩ := applyPeerSetting_ok hmid
+        obtain ⟨g1, g2, g3⟩ := ih h
+        exact ⟨g1.trans h1, g2.trans h2, g3.trans h3⟩
+
+private theorem processSettings_ok {state : State} {frame : Frame} {res : State × Array Frame}
+    (h : processSettings state frame = .ok res) :
+    res.1.streams = state.streams
+      ∧ res.1.activeRequestStreams = state.activeRequestStreams
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId := by
+  unfold processSettings at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next settings hdec =>
+    split at h
+    next =>
+      split at h
+      next => cases h
+      next => cases h; exact ⟨rfl, rfl, rfl⟩
+    next =>
+      split at h
+      next => cases h
+      next s1 happ =>
+        split at h
+        next => cases h
+        next ack hack =>
+          cases h
+          obtain ⟨a1, a2, a3⟩ := applyPeerSettings_ok happ
+          obtain ⟨f1, f2, f3⟩ :=
+            flushOutbound_fields { s1 with clientSettingsReceived := true } #[]
+          exact ⟨f1.trans a1, f2.trans a2, f3.trans a3⟩
+
+private theorem applyWindowUpdate_ok {state state' : State} {frame : Frame}
+    (h : applyWindowUpdate state frame = .ok state') :
+    state'.streams = state.streams
+      ∧ state'.activeRequestStreams = state.activeRequestStreams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId := by
+  unfold applyWindowUpdate at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next increment hdec =>
+    split at h
+    next =>
+      unfold addOutboundConnectionWindow at h
+      simp only [bind, Except.bind, pure, Except.pure] at h
+      split at h
+      next => cases h
+      next => cases h; exact ⟨rfl, rfl, rfl⟩
+    next =>
+      unfold addOutboundStreamWindow at h
+      simp only [bind, Except.bind, pure, Except.pure] at h
+      split at h
+      next => cases h
+      next => cases h; exact ⟨rfl, rfl, rfl⟩
+
+private theorem processWindowUpdate_ok {state : State} {frame : Frame}
+    {res : State × Array Frame} (h : processWindowUpdate state frame = .ok res) :
+    res.1.streams = state.streams
+      ∧ res.1.activeRequestStreams = state.activeRequestStreams
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId := by
+  unfold processWindowUpdate at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  -- The outer split is on the `streamId != 0` guard; each branch then splits
+  -- on `requireClientStreamId` (first branch only) and `applyWindowUpdate`.
+  split at h
+  next =>
+    split at h
+    next => cases h
+    next =>
+      split at h
+      next => cases h
+      next s1 hupd =>
+        cases h
+        obtain ⟨a1, a2, a3⟩ := applyWindowUpdate_ok hupd
+        obtain ⟨f1, f2, f3⟩ := flushOutbound_fields s1 #[]
+        exact ⟨f1.trans a1, f2.trans a2, f3.trans a3⟩
+  next =>
+    split at h
+    next => cases h
+    next s1 hupd =>
+      cases h
+      obtain ⟨a1, a2, a3⟩ := applyWindowUpdate_ok hupd
+      obtain ⟨f1, f2, f3⟩ := flushOutbound_fields s1 #[]
+      exact ⟨f1.trans a1, f2.trans a2, f3.trans a3⟩
+
+private theorem processPing_ok {state : State} {frame : Frame} {res : State × Array Frame}
+    (h : processPing state frame = .ok res) :
+    res.1.streams = state.streams
+      ∧ res.1.activeRequestStreams = state.activeRequestStreams
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId := by
+  unfold processPing at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next payload hdec =>
+    split at h
+    next =>
+      cases h
+      refine ⟨?_, ?_, ?_⟩ <;> (split <;> first | rfl | (split <;> rfl))
+    next =>
+      split at h
+      next => cases h
+      next => cases h; exact ⟨rfl, rfl, rfl⟩
+
+private theorem processGoAway_ok {state : State} {frame : Frame} {res : State × Array Frame}
+    (h : processGoAway state frame = .ok res) :
+    res.1.streams = state.streams
+      ∧ res.1.activeRequestStreams = state.activeRequestStreams
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId := by
+  unfold processGoAway at h
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at h
+  split at h
+  next => cases h
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
+
+private theorem processPriority_ok {state : State} {frame : Frame} {res : State × Array Frame}
+    (h : processPriority state frame = .ok res) :
+    res.1.streams = state.streams
+      ∧ res.1.activeRequestStreams = state.activeRequestStreams
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId := by
+  unfold processPriority at h
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next => cases h; exact ⟨rfl, rfl, rfl⟩
+
+private theorem processRstStreamShared_ok {state : State} {frame : Frame}
+    {res : State × SharedFrameResult}
+    (h : processRstStreamShared state frame = .ok res) :
+    (∀ s ∈ res.1.streams, s ∈ state.streams)
+      ∧ (∀ a ∈ res.1.activeRequestStreams, a ∈ state.activeRequestStreams)
+      ∧ res.1.lastClientStreamId = state.lastClientStreamId
+      ∧ res.2.requestFeeds = #[] ∧ res.2.detached = none
+      ∧ res.2.requestStreaming = none := by
+  unfold processRstStreamShared at h
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst, pure,
+    Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next =>
+      cases h
+      refine ⟨?_, ?_, rfl, rfl, rfl, rfl⟩
+      · intro s hs
+        simp only [removeOutboundStreamState, removeInboundStreamState,
+          removeStream] at hs
+        exact (Array.mem_filter.mp hs).1
+      · intro a ha
+        simp only [removeOutboundStreamState, removeInboundStreamState,
+          removeActiveRequestStream] at ha
+        exact (Array.mem_filter.mp ha).1
+
+/-- Any successful shared-kernel step for a non-header frame preserves the
+inertness of a stream — provided any DATA frame targets that stream — and
+creates no dispatch work: no request feed, no detached dispatch, no
+request-streaming dispatch. -/
+private theorem processNonHeaderFrameShared_inert {registry : Registry} {state : State}
+    {frame : Frame} {res : State × SharedFrameResult} {streamId : Nat}
+    (hinert : state.StreamInert streamId)
+    (hdata : frame.header.frameType = FrameType.data → frame.header.streamId = streamId)
+    (h : processNonHeaderFrameShared registry state frame = .ok res) :
+    res.1.StreamInert streamId
+      ∧ res.2.requestFeeds = #[] ∧ res.2.detached = none
+      ∧ res.2.requestStreaming = none := by
+  unfold processNonHeaderFrameShared at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  -- SETTINGS
+  next =>
+    split at h
+    next => cases h
+    next pair hset =>
+      obtain ⟨s1, em⟩ := pair
+      cases h
+      obtain ⟨h1, h2, h3⟩ := processSettings_ok hset
+      exact ⟨hinert.of_fields (fun s hs => h1 ▸ hs) (fun a ha => h2 ▸ ha) h3, rfl, rfl, rfl⟩
+  -- DATA
+  next htype =>
+    have hsid : frame.header.streamId = streamId := hdata htype
+    cases hrej : state.rejectedAtHeaders frame.header.streamId with
+    | false =>
+        exact absurd h
+          (processDataShared_inert_error (state' := res.1) (result := res.2)
+            (hsid.symm ▸ hinert) hrej)
+    | true =>
+        obtain ⟨hfeeds, hdet, hstr, _hcancel, hs, hl, ha⟩ :=
+          processDataShared_rejected (state' := res.1) (result := res.2) hrej h
+        exact ⟨hinert.of_fields (fun s hmem => hs ▸ hmem) ha hl, hfeeds, hdet, hstr⟩
+  -- RST_STREAM
+  next =>
+    obtain ⟨h1, h2, h3, h4, h5, h6⟩ := processRstStreamShared_ok h
+    exact ⟨hinert.of_fields h1 h2 h3, h4, h5, h6⟩
+  -- WINDOW_UPDATE
+  next =>
+    split at h
+    next => cases h
+    next pair hupd =>
+      obtain ⟨s1, em⟩ := pair
+      cases h
+      obtain ⟨h1, h2, h3⟩ := processWindowUpdate_ok hupd
+      exact ⟨hinert.of_fields (fun s hs => h1 ▸ hs) (fun a ha => h2 ▸ ha) h3, rfl, rfl, rfl⟩
+  -- PING
+  next =>
+    split at h
+    next => cases h
+    next pair hping =>
+      obtain ⟨s1, em⟩ := pair
+      cases h
+      obtain ⟨h1, h2, h3⟩ := processPing_ok hping
+      exact ⟨hinert.of_fields (fun s hs => h1 ▸ hs) (fun a ha => h2 ▸ ha) h3, rfl, rfl, rfl⟩
+  -- PRIORITY
+  next =>
+    split at h
+    next => cases h
+    next pair hprio =>
+      obtain ⟨s1, em⟩ := pair
+      cases h
+      obtain ⟨h1, h2, h3⟩ := processPriority_ok hprio
+      exact ⟨hinert.of_fields (fun s hs => h1 ▸ hs) (fun a ha => h2 ▸ ha) h3, rfl, rfl, rfl⟩
+  -- GOAWAY
+  next =>
+    split at h
+    next => cases h
+    next pair hgo =>
+      obtain ⟨s1, em⟩ := pair
+      cases h
+      obtain ⟨h1, h2, h3⟩ := processGoAway_ok hgo
+      exact ⟨hinert.of_fields (fun s hs => h1 ▸ hs) (fun a ha => h2 ▸ ha) h3, rfl, rfl, rfl⟩
+  -- PUSH_PROMISE
+  next => cases h
+  -- unknown
+  next =>
+    cases h
+    exact ⟨hinert, rfl, rfl, rfl⟩
+  -- HEADERS/CONTINUATION (unreachable in this kernel; two matcher cases)
+  next => cases h
+  next => cases h
+
+/-- A pure trace of shared-kernel steps over non-header frames: each listed
+frame is processed by `processNonHeaderFrameShared` from the previous state
+and produces the recorded `SharedFrameResult`. -/
+private inductive FrameTrace (registry : Registry) :
+    State -> List (Frame × SharedFrameResult) -> State -> Prop
+  | nil (state : State) : FrameTrace registry state [] state
+  | step {state mid final : State} {frame : Frame} {result : SharedFrameResult}
+      {rest : List (Frame × SharedFrameResult)}
+      (h : processNonHeaderFrameShared registry state frame = .ok (mid, result))
+      (htail : FrameTrace registry mid rest final) :
+      FrameTrace registry state ((frame, result) :: rest) final
+
+/-- Trace-level generalization of `DataTrace.inert_no_dispatch` to every
+non-header frame type: over any successful sequence of SETTINGS, DATA,
+RST_STREAM, WINDOW_UPDATE, PING, PRIORITY, GOAWAY, and unknown steps in which
+DATA frames target the inert stream, the stream stays inert and no step
+produces dispatch work. -/
+private theorem FrameTrace.inert_no_dispatch {registry : Registry}
+    {state final : State} {steps : List (Frame × SharedFrameResult)}
+    (trace : FrameTrace registry state steps final) (streamId : Nat)
+    (hdata : ∀ step ∈ steps, (step.1 : Frame).header.frameType = FrameType.data →
+      (step.1).header.streamId = streamId)
+    (hinert : state.StreamInert streamId) :
+    final.StreamInert streamId
+      ∧ ∀ step ∈ steps,
+          (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
+            ∧ (step.2).requestStreaming = none := by
+  induction steps generalizing state with
+  | nil =>
+      cases trace
+      exact ⟨hinert, by simp⟩
+  | cons head rest ih =>
+      cases trace with
+      | step h htail =>
+        rename_i mid frame result
+        have hstep := processNonHeaderFrameShared_inert hinert
+          (hdata (frame, result) List.mem_cons_self) h
+        have ihres := ih htail
+          (fun step hmem => hdata step (List.mem_cons_of_mem _ hmem)) hstep.1
+        refine ⟨ihres.1, ?_⟩
+        intro step hmem
+        cases hmem with
+        | head => exact hstep.2
+        | tail _ hmem => exact ihres.2 step hmem
+
+/-- Generalized headline: when request-header authorization rejects a stream
+whose body is still open, any pure trace of non-header frames whose DATA
+frames target that stream drains without producing any dispatch work, and the
+stream ends (and stays) inert. -/
+private theorem rejectStreamAtHeaders_frameTrace_no_dispatch
+    {registry : Registry} {state final : State}
+    {steps : List (Frame × SharedFrameResult)}
+    (streamId : Nat) (inboundHpack outboundHpack : Hpack.State) (endStream : Bool)
+    (hclaimed : streamId ≤ state.lastClientStreamId)
+    (hactive : ∀ active ∈ state.activeRequestStreams, active.streamId ≠ streamId)
+    (trace : FrameTrace registry
+      (rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream)
+      steps final)
+    (hdata : ∀ step ∈ steps, (step.1 : Frame).header.frameType = FrameType.data →
+      (step.1).header.streamId = streamId) :
+    final.StreamInert streamId
+      ∧ ∀ step ∈ steps,
+          (step.2 : SharedFrameResult).requestFeeds = #[] ∧ (step.2).detached = none
+            ∧ (step.2).requestStreaming = none :=
+  trace.inert_no_dispatch streamId hdata
+    (rejectStreamAtHeaders_inert state streamId inboundHpack outboundHpack endStream
+      hclaimed hactive)
+
+/-!
+### HEADERS and CONTINUATION steps
+
+An inert stream id can never be reopened: the pure bookkeeping of a HEADERS
+step (`prepareHeadersShared`, factored out of the `IO` authorizer call in
+`processHeadersShared`) refuses the frame with a connection error because the
+id is at or below `lastClientStreamId`, and a CONTINUATION step refuses it
+because the stream has no buffered header block.  Either way the connection
+tears down before any authorizer or dispatch work happens.
+-/
+
+/-- A HEADERS frame naming an inert stream id is a connection error in the
+pure bookkeeping, before the authorizer runs. -/
+private theorem prepareHeadersShared_inert_error {state : State} {frame : Frame}
+    (hinert : state.StreamInert frame.header.streamId) {res : State × Option Frame} :
+    prepareHeadersShared state frame ≠ .ok res := by
+  intro h
+  unfold prepareHeadersShared at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next => cases h
+    next =>
+      have herr : ∀ r, requireNewClientStreamId state frame.header.streamId ≠ .ok r := by
+        intro r hok
+        unfold requireNewClientStreamId at hok
+        simp only [bind, Except.bind, pure, Except.pure] at hok
+        split at hok
+        next => cases hok
+        next =>
+          split at hok
+          next => cases hok
+          next hcond => exact hcond hinert.claimed
+      split at h
+      next => cases h
+      next _u hnew => exact herr _ hnew
+
+/-- `processHeadersShared` on a HEADERS frame naming an inert stream id fails
+with a connection error and performs no `IO`: the action is literally
+`pure (.error status)`. -/
+private theorem processHeadersShared_inert_error (registry : Registry) {state : State}
+    {frame : Frame} (hinert : state.StreamInert frame.header.streamId) :
+    ∃ status, processHeadersShared registry state frame = pure (.error status) := by
+  obtain ⟨status, herr⟩ : ∃ status, prepareHeadersShared state frame = .error status := by
+    cases hcase : prepareHeadersShared state frame with
+    | error status => exact ⟨status, rfl⟩
+    | ok res => exact absurd hcase (prepareHeadersShared_inert_error hinert)
+  refine ⟨status, ?_⟩
+  unfold processHeadersShared
+  rw [herr]
+
+private theorem appendContinuationFrame_inert_error {state : State} {frame : Frame}
+    (hinert : state.StreamInert frame.header.streamId) {streams' : Array StreamState} :
+    appendContinuationFrame state.streams frame ≠ .ok streams' := by
+  intro h
+  unfold appendContinuationFrame at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    have hnone : findStream? state.streams frame.header.streamId = none := by
+      unfold findStream?
+      rw [Array.find?_eq_none]
+      intro x hx
+      simp [hinert.notBuffered x hx]
+    split at h
+    next stream hfind =>
+      rw [hnone] at hfind
+      cases hfind
+    next => cases h
+
+/-- `processContinuationShared` on a CONTINUATION frame naming an inert stream
+id fails with a connection error and performs no `IO`. -/
+private theorem processContinuationShared_inert_error (registry : Registry) {state : State}
+    {frame : Frame} (hinert : state.StreamInert frame.header.streamId) :
+    ∃ status, processContinuationShared registry state frame = pure (.error status) := by
+  obtain ⟨status, herr⟩ :
+      ∃ status, appendContinuationFrame state.streams frame = .error status := by
+    cases hcase : appendContinuationFrame state.streams frame with
+    | error status => exact ⟨status, rfl⟩
+    | ok streams => exact absurd hcase (appendContinuationFrame_inert_error hinert)
+  refine ⟨status, ?_⟩
+  unfold processContinuationShared
+  rw [herr]
 
 end Connection
 end Http2
