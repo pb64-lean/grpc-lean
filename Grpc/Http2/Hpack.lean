@@ -210,10 +210,15 @@ values costs CPU for little relative gain, and header fields this large are
 dominated by frame overhead anyway. -/
 def huffmanMaxEncodeLength : Nat := 1024
 
+/-- The candidate Huffman coding `encodeString` compares against the raw
+bytes: the Huffman form for values worth compressing, the raw bytes
+otherwise (which then lose the size comparison and are emitted literally). -/
+def huffmanCandidate (bytes : ByteArray) : ByteArray :=
+  if bytes.size <= huffmanMaxEncodeLength then encodeHuffman bytes else bytes
+
 def encodeString (value : String) : Except Status ByteArray :=
   let bytes := value.toUTF8
-  let huffman :=
-    if bytes.size <= huffmanMaxEncodeLength then encodeHuffman bytes else bytes
+  let huffman := huffmanCandidate bytes
   if huffman.size < bytes.size then
     match encodeInteger 7 128 huffman.size with
     | .error status => .error status
@@ -519,6 +524,9 @@ def encodeHeaderBlock (state : State) (headers : Array Header) : Except Status (
   offset 0 recovers `value` and stops exactly at the encoded length, for any
   prefix mask that leaves the low `prefixBits` bits clear and fits with the
   filled prefix in one byte (every call site in this file satisfies both).
+* `decodeString_encodeString_raw` — literal string roundtrip with residual
+  bytes for the raw (non-Huffman) representation, i.e. whenever
+  `encodeString` finds the Huffman coding no shorter than the raw bytes.
 * `dynamicSize_resize_le` / `dynamicSize_insert_le` /
   `dynamicSize_resizeChecked_le` / `dynamicSize_setMaxAllowedSize_le` — the
   dynamic-table size invariant: after any resize, insert, or checked resize
@@ -725,6 +733,133 @@ theorem decodeInteger_encodeInteger {prefixBits prefixMask value : Nat}
         simp only [Nat.pow_zero, Nat.mul_one]
         omega
       rw [hval]
+
+/-!
+#### Literal string codec (raw representation)
+-/
+
+private theorem get!_append_left {bytes rest : ByteArray} {i : Nat} (hi : i < bytes.size) :
+    (bytes ++ rest)[i]! = bytes[i] := by
+  have h : i < (bytes ++ rest).size := by rw [ByteArray.size_append]; omega
+  rw [getElem!_pos (bytes ++ rest) i h, ByteArray.getElem_append_left hi]
+
+private theorem encodeInteger_ok_size {prefixBits prefixMask value : Nat} {encoded : ByteArray}
+    (henc : encodeInteger prefixBits prefixMask value = .ok encoded) : 0 < encoded.size := by
+  unfold encodeInteger at henc
+  split at henc
+  next => cases henc
+  next =>
+    split at henc
+    next =>
+      cases henc
+      show 0 < (ByteArray.empty.push _).size
+      rw [ByteArray.size_push]
+      omega
+    next =>
+      cases henc
+      have hlt := encodeIntegerRest_size_lt (value - prefixMax prefixBits)
+        (ByteArray.empty.push (UInt8.ofNat (prefixMask + prefixMax prefixBits)))
+      have hb : (ByteArray.empty.push
+          (UInt8.ofNat (prefixMask + prefixMax prefixBits))).size = 1 := by
+        rw [ByteArray.size_push]
+        rfl
+      omega
+
+/-- The leading byte of a `prefixMask = 0` HPACK integer has its high bit
+clear, so a literal string encoded with the raw representation is decoded as
+raw rather than Huffman. -/
+private theorem encodeInteger_raw_head {value : Nat} {encoded : ByteArray}
+    (henc : encodeInteger 7 0 value = .ok encoded) : encoded[0]!.toNat < 128 := by
+  unfold encodeInteger at henc
+  split at henc
+  next => cases henc
+  next =>
+    split at henc
+    next hsmall =>
+      cases henc
+      have hb : (ByteArray.empty.push (UInt8.ofNat (0 + value))).size = 1 := by
+        rw [ByteArray.size_push]
+        rfl
+      rw [getElem!_pos _ 0 (by omega)]
+      rw [show (ByteArray.empty.push (UInt8.ofNat (0 + value)))[0] = UInt8.ofNat (0 + value) from
+        getElem_push_eq ..]
+      have : prefixMax 7 = 127 := rfl
+      simp only [UInt8.toNat_ofNat', Nat.reducePow]
+      omega
+    next =>
+      cases henc
+      have hb : (ByteArray.empty.push (UInt8.ofNat (0 + prefixMax 7))).size = 1 := by
+        rw [ByteArray.size_push]
+        rfl
+      have hlt := encodeIntegerRest_size_lt (value - prefixMax 7)
+        (ByteArray.empty.push (UInt8.ofNat (0 + prefixMax 7)))
+      rw [getElem!_pos _ 0 (by omega)]
+      rw [encodeIntegerRest_getElem_prefix _ _ 0 (by omega)]
+      rw [show (ByteArray.empty.push (UInt8.ofNat (0 + prefixMax 7)))[0]
+          = UInt8.ofNat (0 + prefixMax 7) from getElem_push_eq ..]
+      have : prefixMax 7 = 127 := rfl
+      simp only [UInt8.toNat_ofNat', Nat.reducePow, this]
+      omega
+
+private theorem fromUTF8?_toUTF8 (s : String) : String.fromUTF8? s.toUTF8 = some s := by
+  rw [String.toUTF8_eq_toByteArray]
+  have hv : s.toByteArray.IsValidUTF8 := ⟨s.toList, String.utf8Encode_toList.symm⟩
+  unfold String.fromUTF8?
+  split
+  next => rfl
+  next h => exact absurd hv h
+
+private theorem encodeString_raw {value : String} {encoded : ByteArray}
+    (hraw : ¬ (huffmanCandidate value.toUTF8).size < value.toUTF8.size)
+    (henc : encodeString value = .ok encoded) :
+    ∃ prefixBytes, encodeInteger 7 0 value.toUTF8.size = .ok prefixBytes
+      ∧ encoded = prefixBytes ++ value.toUTF8 := by
+  unfold encodeString at henc
+  rw [if_neg hraw] at henc
+  split at henc
+  next => cases henc
+  next prefixBytes hint =>
+    cases henc
+    exact ⟨prefixBytes, hint, rfl⟩
+
+/-- Residual-byte inversion for the raw literal string representation:
+whenever `encodeString` decides the Huffman coding is not shorter, decoding
+its output recovers the string and stops exactly at the encoded length. -/
+theorem decodeString_encodeString_raw {value : String} {encoded : ByteArray}
+    (hraw : ¬ (huffmanCandidate value.toUTF8).size < value.toUTF8.size)
+    (henc : encodeString value = .ok encoded) (rest : ByteArray) :
+    decodeString (encoded ++ rest) 0 = .ok { value := value, next := encoded.size } := by
+  obtain ⟨prefixBytes, hint, rfl⟩ := encodeString_raw hraw henc
+  have hpre : 0 < prefixBytes.size := encodeInteger_ok_size hint
+  have hsz : (prefixBytes ++ value.toUTF8 ++ rest).size
+      = prefixBytes.size + value.toUTF8.size + rest.size := by
+    simp only [ByteArray.size_append]
+  have hassoc : prefixBytes ++ value.toUTF8 ++ rest = prefixBytes ++ (value.toUTF8 ++ rest) :=
+    ByteArray.append_assoc
+  have hdec : decodeInteger 7 (prefixBytes ++ value.toUTF8 ++ rest) 0
+      = .ok { value := value.toUTF8.size, next := prefixBytes.size } := by
+    rw [hassoc]
+    exact decodeInteger_encodeInteger (by rfl) (by omega) hint (value.toUTF8 ++ rest)
+  have hhead : (prefixBytes ++ value.toUTF8 ++ rest)[0]!.toNat < 128 := by
+    rw [hassoc, get!_append_left hpre]
+    have h := encodeInteger_raw_head hint
+    rwa [getElem!_pos prefixBytes 0 hpre] at h
+  have hextract : (prefixBytes ++ value.toUTF8 ++ rest).extract prefixBytes.size
+      (prefixBytes.size + value.toUTF8.size) = value.toUTF8 := by
+    rw [hassoc, ByteArray.extract_append, Nat.sub_self]
+    rw [show prefixBytes.extract prefixBytes.size (prefixBytes.size + value.toUTF8.size)
+        = ByteArray.empty from ByteArray.extract_eq_empty_iff.mpr (by omega)]
+    rw [ByteArray.empty_append]
+    exact ByteArray.extract_append_eq_left (by omega)
+  unfold decodeString
+  rw [if_neg (by omega)]
+  rw [hdec]
+  simp only
+  rw [if_neg (by omega)]
+  rw [if_neg (show ¬ ((prefixBytes ++ value.toUTF8 ++ rest)[0]!.toNat ≥ 128) from by omega)]
+  rw [hextract]
+  simp only [fromUTF8?_toUTF8]
+  rw [ByteArray.size_append]
 
 /-!
 #### Dynamic-table size invariant
