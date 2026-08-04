@@ -167,13 +167,19 @@ validation — test use only). `Grpc.Tls.Rest` additionally provides a minimal
 HTTP/1.1 JSON server over the same TLS stack (one request per connection; not
 a general HTTP server).
 
-Current limitations, inherited from `tls13-lean`'s single-suite scope:
+The server negotiates a single suite — TLS_CHACHA20_POLY1305_SHA256, X25519
+(P-256 only when configured), Ed25519 — but selects it from the client's
+offered overlap per RFC 8446, so mainstream clients interoperate:
+`//examples/lean_proto:note_grpcurl_tls_interop_test` completes real
+handshakes with **grpcurl** (Go `crypto/tls`) and **OpenSSL `s_client`**,
+negotiating ALPN `h2` and running gRPC over the result (see
+[Interoperability status](#interoperability-status)).
 
-- The server accepts a narrow ClientHello — TLS_CHACHA20_POLY1305_SHA256,
-  X25519 (P-256 only when configured), Ed25519 — and therefore does **not**
-  yet interoperate with mainstream TLS clients such as Go `crypto/tls`
-  (grpcurl) or OpenSSL `s_client`. gRPC-over-TLS is currently exercised by
-  the in-process Lean client.
+Current limitations:
+
+- One suite, one group, one signature algorithm: a client that offers none of
+  them (for example an FIPS-restricted or TLS 1.2-only client) gets a
+  handshake failure rather than a fallback.
 - The TLS accept path does not yet participate in graceful-shutdown
   bookkeeping (GOAWAY drain, keepalive); those apply to the plaintext managed
   path.
@@ -191,7 +197,16 @@ Honest summary: there is no official gRPC interop-suite or h2spec run yet.
   payload, and server-, client- and bidi-streaming calls. It is tagged
   `manual` and `requires-grpcurl`, so `bazel test //...` skips it — run it
   explicitly, with grpcurl on `PATH`, to reproduce those results.
-- TLS interop is Lean-client-only for now (see above).
+- `//examples/lean_proto:note_grpcurl_tls_interop_test` drives the same server
+  through `Grpc.Server.serveTls` — TLS 1.3 terminated by `../tls13-lean`,
+  ALPN `h2`, HTTP/2 and gRPC by this repo — with **grpcurl** and **OpenSSL
+  `s_client`**. It asserts `ALPN protocol: h2` and chain verification at the
+  TLS layer (so a gRPC failure could not be mistaken for a TLS one), that a
+  wrong `-servername` is rejected, then repeats the reflection-only
+  `list`/`describe`/invoke flow, error mapping, a 90 kB payload that spans
+  many 16 kB TLS records, and server-, client- and bidi-streaming over one
+  encrypted connection. Also `manual` and `requires-grpcurl`; run it with
+  grpcurl and openssl on `PATH`.
 - Wire behaviors (trailers-only responses, percent-encoded `grpc-message`,
   `-bin` metadata, status mapping) follow the gRPC over HTTP/2 spec and are
   covered by the in-repo test suite.

@@ -11,6 +11,10 @@ load("@rules_lean//lean:defs.bzl", "lean_library", "lean_test")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("//:defs.bzl", "lean_proto_library")
 
+# The self-signed TLS test identity, so example/interop targets in other
+# packages can depend on the same fixture the in-repo TLS tests use.
+exports_files(glob(["Test/Fixtures/Tls/*"]))
+
 proto_library(
     name = "recursive_struct_proto",
     srcs = ["Test/recursive_struct.proto"],

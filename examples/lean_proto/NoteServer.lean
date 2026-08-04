@@ -47,13 +47,32 @@ def portFromArgs (args : List String) : UInt16 :=
   | port :: _ => UInt16.ofNat (port.toNat?.getD 50051)
   | [] => 50051
 
+/-- Optional TLS identity taken from the command line: `<port> --tls <cert.der>
+<key.raw>`. The key is the raw 32-byte Ed25519 private scalar matching the leaf
+certificate; both are public test fixtures. -/
+def tlsPathsFromArgs (args : List String) : Option (String × String) :=
+  match args with
+  | _ :: "--tls" :: certPath :: keyPath :: _ => some (certPath, keyPath)
+  | _ => none
+
 end LeanProtoExampleServer
 
 def main (args : List String) : IO Unit := do
   let port := LeanProtoExampleServer.portFromArgs args
-  let server ← Grpc.Server.serve LeanProtoExampleServer.registry {
-    address := Grpc.Server.loopback port
-  }
-  IO.println s!"Lean gRPC h2c server listening on {server.localAddress}"
-  (← IO.getStdout).flush
-  Grpc.Server.wait server
+  match LeanProtoExampleServer.tlsPathsFromArgs args with
+  | none =>
+      let server ← Grpc.Server.serve LeanProtoExampleServer.registry {
+        address := Grpc.Server.loopback port
+      }
+      IO.println s!"Lean gRPC h2c server listening on {server.localAddress}"
+      (← IO.getStdout).flush
+      Grpc.Server.wait server
+  | some (certPath, keyPath) =>
+      let certDer ← IO.FS.readBinFile certPath
+      let signingKey ← IO.FS.readBinFile keyPath
+      let server ← Grpc.Server.serveTls LeanProtoExampleServer.registry
+        { certificateChain := #[certDer], signingKey := signingKey }
+        { address := Grpc.Server.loopback port }
+      IO.println s!"Lean gRPC TLS server listening on {server.localAddress}"
+      (← IO.getStdout).flush
+      Grpc.Server.wait server

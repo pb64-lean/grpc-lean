@@ -52,6 +52,31 @@ lean_binary(
 )
 
 sh_test(
+    name = "note_grpcurl_tls_interop_test",
+    srcs = ["note_grpcurl_tls_interop_test.sh"],
+    args = [
+        "$(location :note_server)",
+        "$(location note.proto)",
+        "$(location //:Test/Fixtures/Tls/server_cert.der)",
+        "$(location //:Test/Fixtures/Tls/server_key.raw)",
+        "$(location //:Test/Fixtures/Tls/server_cert.pem)",
+    ],
+    data = [
+        "common/note_common.proto",
+        "note.proto",
+        ":note_server",
+        "//:Test/Fixtures/Tls/server_cert.der",
+        "//:Test/Fixtures/Tls/server_cert.pem",
+        "//:Test/Fixtures/Tls/server_key.raw",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "requires-grpcurl",
+    ],
+)
+
+sh_test(
     name = "note_grpcurl_interop_test",
     srcs = ["note_grpcurl_interop_test.sh"],
     args = [
