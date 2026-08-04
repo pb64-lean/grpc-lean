@@ -192,18 +192,21 @@ private def encodeHuffmanFlush (acc bits : Nat) (out : ByteArray) : Nat × Nat �
   termination_by bits
   decreasing_by omega
 
+/-- One encoding step: append a symbol's code bits to the pending
+accumulator and flush whole bytes out of it. -/
+private def encodeHuffmanStep (state : Nat × Nat × ByteArray) (byte : UInt8) :
+    Nat × Nat × ByteArray :=
+  encodeHuffmanFlush
+    (state.1 * (2 ^ huffmanCodeLengths[byte.toNat]!) + huffmanCodes[byte.toNat]!)
+    (state.2.1 + huffmanCodeLengths[byte.toNat]!) state.2.2
+
 def encodeHuffman (bytes : ByteArray) : ByteArray :=
-  let (acc, bits, out) := bytes.foldl
-    (init := ((0 : Nat), (0 : Nat), ByteArray.empty))
-    fun (acc, bits, out) byte =>
-      let code := huffmanCodes[byte.toNat]!
-      let len := huffmanCodeLengths[byte.toNat]!
-      encodeHuffmanFlush (acc * (2 ^ len) + code) (bits + len) out
+  let (acc, bits, out) := bytes.data.foldl encodeHuffmanStep
+    ((0 : Nat), (0 : Nat), ByteArray.empty)
   if bits == 0 then
     out
   else
-    let pad := 8 - bits
-    out.push (UInt8.ofNat (acc * (2 ^ pad) + (prefixMax pad)))
+    out.push (UInt8.ofNat (acc * (2 ^ (8 - bits)) + (prefixMax (8 - bits))))
 
 /-- Values larger than this are emitted raw: Huffman coding of very large
 values costs CPU for little relative gain, and header fields this large are
@@ -535,10 +538,16 @@ def encodeHeaderBlock (state : State) (headers : Array Header) : Except Status (
 * `huffmanPrefixFree` — the fixed 257-entry Huffman table is prefix-free
   (`pairwiseNoBitPrefix` spells out the pairwise bit-prefix test), with
   `huffmanCode_not_bitPrefix` reading it off at a pair of table indices and
-  `findHuffmanSymbol?_proper_prefix_eq_none` turning it into the property
-  the bit-serial decoder needs: the table search returns `none` at every
-  position strictly inside a symbol's code, so decoding cannot stop early.
-  The full Huffman `decode ∘ encode` roundtrip is not proved yet.
+  `findHuffmanSymbol?_proper_prefix_eq_none` / `findHuffmanSymbol?_self`
+  turning it into what the bit-serial decoder needs: the table search
+  returns `none` at every position strictly inside a symbol's code and the
+  symbol's own index at its end.
+* `decodeHuffman_encodeHuffman` — the Huffman coder roundtrip. The decoder
+  is shown equivalent to a decoder over an explicit bit list, the encoder is
+  shown to emit exactly the concatenated code bits plus at most seven
+  padding ones, and prefix-freeness makes both the symbol boundaries and the
+  padding unambiguous (an all-ones run shorter than the EOS code is a proper
+  prefix of it).
 -/
 
 private theorem getElem_push_eq (a : ByteArray) (x : UInt8)
@@ -1396,6 +1405,265 @@ private theorem decodeBits_symbolBits_flatMap (pad : Nat) (hpad : pad ≤ 7) :
           rw [show b :: rest = [b] ++ rest from rfl, List.toByteArray_append]
           rfl,
         byteArray_push_eq_append out b, ByteArray.append_assoc]
+
+/-!
+#### Bit lists of byte arrays
+-/
+
+private theorem natBits_add (m : Nat) : ∀ n v,
+    natBits (m + n) v = natBits m (v / 2 ^ n) ++ natBits n v := by
+  induction m with
+  | zero => intro n v; rw [Nat.zero_add, natBits, List.nil_append]
+  | succ m ih =>
+      intro n v
+      rw [show m + 1 + n = m + n + 1 from by omega]
+      show (v / 2 ^ (m + n)) % 2 :: natBits (m + n) v
+        = ((v / 2 ^ n / 2 ^ m) % 2 :: natBits m (v / 2 ^ n)) ++ natBits n v
+      rw [ih n v, show v / 2 ^ n / 2 ^ m = v / 2 ^ (m + n) from by
+        rw [Nat.div_div_eq_div_mul, ← Nat.pow_add, Nat.add_comm]]
+      rfl
+
+private theorem natBits_congr (n : Nat) : ∀ v w, v % 2 ^ n = w % 2 ^ n ->
+    natBits n v = natBits n w := by
+  induction n with
+  | zero => intro v w _; rfl
+  | succ n ih =>
+      intro v w h
+      have hhead : ∀ x : Nat, x / 2 ^ n % 2 = x % 2 ^ (n + 1) / 2 ^ n := by
+        intro x
+        rw [Nat.pow_succ, Nat.mod_mul_right_div_self]
+      have hdvd : (2 : Nat) ^ n ∣ 2 ^ (n + 1) := ⟨2, Nat.pow_succ 2 n⟩
+      have htail : v % 2 ^ n = w % 2 ^ n := by
+        rw [← Nat.mod_mod_of_dvd v hdvd, h, Nat.mod_mod_of_dvd w hdvd]
+      show (v / 2 ^ n) % 2 :: natBits n v = (w / 2 ^ n) % 2 :: natBits n w
+      rw [hhead v, hhead w, h, ih v w htail]
+
+private theorem natBits_mod (n v : Nat) : natBits n (v % 2 ^ n) = natBits n v :=
+  natBits_congr n _ _ (Nat.mod_mod_of_dvd v (Nat.dvd_refl _))
+
+private theorem natBits_ones : ∀ n, natBits n (2 ^ n - 1) = List.replicate n 1 := by
+  intro n
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+      have hpos : 0 < 2 ^ n := Nat.two_pow_pos n
+      have hsplit : 2 ^ (n + 1) - 1 = (2 ^ n - 1) + 1 * 2 ^ n := by
+        rw [Nat.pow_succ]
+        omega
+      show ((2 ^ (n + 1) - 1) / 2 ^ n) % 2 :: natBits n (2 ^ (n + 1) - 1)
+        = List.replicate (n + 1) 1
+      rw [hsplit, Nat.add_mul_div_right _ _ hpos, Nat.div_eq_of_lt (by omega), Nat.zero_add,
+        natBits_congr n (2 ^ n - 1 + 1 * 2 ^ n) (2 ^ n - 1)
+          (by rw [Nat.add_mul_mod_self_right]),
+        ih, List.replicate_succ]
+
+/-- The bit stream a byte array carries, most significant bit first. -/
+private def bitsOf (bytes : ByteArray) : List Nat :=
+  bytes.data.toList.flatMap (fun byte => natBits 8 byte.toNat)
+
+private theorem bitsOf_push (out : ByteArray) (b : UInt8) :
+    bitsOf (out.push b) = bitsOf out ++ natBits 8 b.toNat := by
+  rw [bitsOf, bitsOf, ByteArray.data_push, Array.toList_push, List.flatMap_append]
+  rfl
+
+private theorem bitsFrom_byte (bytes : ByteArray) (offset : Nat) (h : offset < bytes.size) :
+    ∀ bit, bitsFrom bytes offset bit
+      = natBits (bit + 1) bytes[offset]!.toNat ++ bitsFrom bytes (offset + 1) 7 := by
+  intro bit
+  induction bit with
+  | zero =>
+      rw [bitsFrom, if_neg (by omega), if_pos rfl]
+      rfl
+  | succ bit ih =>
+      rw [bitsFrom, if_neg (by omega), if_neg (by omega)]
+      show bitAt bytes[offset]! (bit + 1) :: bitsFrom bytes offset (bit + 1 - 1) = _
+      rw [show bit + 1 - 1 = bit from by omega, ih]
+      rfl
+
+private theorem bitsFrom_eq_drop (bytes : ByteArray) : ∀ n offset, bytes.size - offset = n ->
+    bitsFrom bytes offset 7
+      = (bytes.data.toList.drop offset).flatMap (fun byte => natBits 8 byte.toNat) := by
+  intro n
+  induction n with
+  | zero =>
+      intro offset hn
+      have hsz : bytes.data.size = bytes.size := rfl
+      rw [bitsFrom, if_pos (by omega)]
+      rw [List.drop_eq_nil_of_le (by rw [Array.length_toList]; omega)]
+      rfl
+  | succ n ih =>
+      intro offset hn
+      have hlt : offset < bytes.size := by omega
+      have hlist : offset < bytes.data.toList.length := by
+        rw [Array.length_toList]
+        exact hlt
+      rw [bitsFrom_byte bytes offset hlt 7, ih (offset + 1) (by omega),
+        List.drop_eq_getElem_cons hlist, List.flatMap_cons]
+      rw [show bytes.data.toList[offset] = bytes[offset]! from by
+        rw [Array.getElem_toList, getElem!_pos bytes offset hlt]
+        rfl]
+
+private theorem bitsFrom_eq_bitsOf (bytes : ByteArray) : bitsFrom bytes 0 7 = bitsOf bytes := by
+  rw [bitsFrom_eq_drop bytes bytes.size 0 (by omega), bitsOf, List.drop_zero]
+
+/-!
+#### The encoder emits exactly the symbols' code bits
+-/
+
+private theorem encodeHuffmanFlush_spec (acc bits : Nat) (out : ByteArray) :
+    acc < 2 ^ bits ->
+    ∀ acc' bits' out', encodeHuffmanFlush acc bits out = (acc', bits', out') ->
+      bits' < 8 ∧ acc' < 2 ^ bits'
+        ∧ bitsOf out' ++ natBits bits' acc' = bitsOf out ++ natBits bits acc := by
+  fun_induction encodeHuffmanFlush acc bits out
+  next acc bits out hge ih =>
+    intro hacc acc' bits' out' heq
+    have hpos : 0 < 2 ^ (bits - 8) := Nat.two_pow_pos _
+    have hmod : acc % 2 ^ (bits - 8) < 2 ^ (bits - 8) := Nat.mod_lt _ hpos
+    obtain ⟨h1, h2, h3⟩ := ih hmod acc' bits' out' heq
+    refine ⟨h1, h2, ?_⟩
+    rw [h3, bitsOf_push]
+    rw [show (UInt8.ofNat (acc / 2 ^ (bits - 8))).toNat
+        = (acc / 2 ^ (bits - 8)) % 2 ^ 8 from by
+      simp only [UInt8.toNat_ofNat']]
+    rw [natBits_mod 8 (acc / 2 ^ (bits - 8)), natBits_mod (bits - 8) acc,
+      List.append_assoc, ← natBits_add 8 (bits - 8) acc,
+      show 8 + (bits - 8) = bits from by omega]
+  next acc bits out hlt =>
+    intro hacc acc' bits' out' heq
+    have heq' : (acc, bits, out) = (acc', bits', out') := heq
+    cases heq'
+    exact ⟨by omega, hacc, rfl⟩
+
+private theorem encodeHuffmanStep_spec (acc bits : Nat) (out : ByteArray) (byte : UInt8)
+    (hbits : bits < 8) (hacc : acc < 2 ^ bits) :
+    ∀ acc' bits' out', encodeHuffmanStep (acc, bits, out) byte = (acc', bits', out') ->
+      bits' < 8 ∧ acc' < 2 ^ bits'
+        ∧ bitsOf out' ++ natBits bits' acc'
+          = bitsOf out ++ natBits bits acc ++ symbolBits byte.toNat := by
+  intro acc' bits' out' heq
+  have hsym : byte.toNat < huffmanCodes.size := by
+    rw [huffmanCodes_size]
+    have := UInt8.toNat_lt byte
+    omega
+  obtain ⟨hcodelt, hlenpos, hlen30⟩ := huffmanCode_bounds hsym
+  have hlenpow : 0 < 2 ^ huffmanCodeLengths[byte.toNat]! := Nat.two_pow_pos _
+  have hbitspow : 0 < 2 ^ bits := Nat.two_pow_pos bits
+  have hmul : acc * 2 ^ huffmanCodeLengths[byte.toNat]!
+      ≤ 2 ^ bits * 2 ^ huffmanCodeLengths[byte.toNat]!
+        - 2 ^ huffmanCodeLengths[byte.toNat]! := by
+    have h := Nat.mul_le_mul_right (k := 2 ^ huffmanCodeLengths[byte.toNat]!)
+      (show acc ≤ 2 ^ bits - 1 from by omega)
+    rwa [Nat.sub_mul, Nat.one_mul] at h
+  have hle : 2 ^ huffmanCodeLengths[byte.toNat]!
+      ≤ 2 ^ bits * 2 ^ huffmanCodeLengths[byte.toNat]! :=
+    Nat.le_mul_of_pos_left _ hbitspow
+  have hsum : acc * 2 ^ huffmanCodeLengths[byte.toNat]! + huffmanCodes[byte.toNat]!
+      < 2 ^ (bits + huffmanCodeLengths[byte.toNat]!) := by
+    rw [Nat.pow_add]
+    omega
+  obtain ⟨h1, h2, h3⟩ := encodeHuffmanFlush_spec _ _ out hsum acc' bits' out' heq
+  refine ⟨h1, h2, ?_⟩
+  rw [h3, natBits_add bits huffmanCodeLengths[byte.toNat]!]
+  rw [show (acc * 2 ^ huffmanCodeLengths[byte.toNat]! + huffmanCodes[byte.toNat]!)
+      / 2 ^ huffmanCodeLengths[byte.toNat]! = acc from by
+    rw [Nat.add_comm, Nat.add_mul_div_right _ _ hlenpow,
+      Nat.div_eq_of_lt hcodelt, Nat.zero_add]]
+  rw [natBits_congr huffmanCodeLengths[byte.toNat]!
+      (acc * 2 ^ huffmanCodeLengths[byte.toNat]! + huffmanCodes[byte.toNat]!)
+      huffmanCodes[byte.toNat]! (by
+    rw [Nat.add_comm, Nat.add_mul_mod_self_right])]
+  rw [symbolBits, List.append_assoc]
+
+private theorem encodeHuffman_fold_spec : ∀ (l : List UInt8) (acc bits : Nat) (out : ByteArray),
+    bits < 8 -> acc < 2 ^ bits ->
+    ∀ acc' bits' out', l.foldl encodeHuffmanStep (acc, bits, out) = (acc', bits', out') ->
+      bits' < 8 ∧ acc' < 2 ^ bits'
+        ∧ bitsOf out' ++ natBits bits' acc'
+          = bitsOf out ++ natBits bits acc ++ l.flatMap (fun b => symbolBits b.toNat) := by
+  intro l
+  induction l with
+  | nil =>
+      intro acc bits out hbits hacc acc' bits' out' heq
+      have heq' : (acc, bits, out) = (acc', bits', out') := heq
+      cases heq'
+      exact ⟨hbits, hacc, by rw [List.flatMap_nil, List.append_nil]⟩
+  | cons b rest ih =>
+      intro acc bits out hbits hacc acc' bits' out' heq
+      rw [List.foldl_cons] at heq
+      cases hstep : encodeHuffmanStep (acc, bits, out) b with
+      | mk acc₁ rest₁ =>
+        cases rest₁ with
+        | mk bits₁ out₁ =>
+          obtain ⟨s1, s2, s3⟩ := encodeHuffmanStep_spec acc bits out b hbits hacc
+            acc₁ bits₁ out₁ hstep
+          rw [hstep] at heq
+          obtain ⟨t1, t2, t3⟩ := ih acc₁ bits₁ out₁ s1 s2 acc' bits' out' heq
+          refine ⟨t1, t2, ?_⟩
+          rw [t3, s3, List.flatMap_cons, List.append_assoc, List.append_assoc]
+
+/-- Huffman encoding emits exactly the concatenated code bits of the input
+bytes, followed by at most seven padding one bits. -/
+private theorem bitsOf_encodeHuffman (bytes : ByteArray) :
+    ∃ pad, pad ≤ 7 ∧ bitsOf (encodeHuffman bytes)
+      = bytes.data.toList.flatMap (fun b => symbolBits b.toNat) ++ List.replicate pad 1 := by
+  have hfold := encodeHuffman_fold_spec bytes.data.toList 0 0 ByteArray.empty (by omega)
+    (by omega)
+  cases hres : bytes.data.toList.foldl encodeHuffmanStep (0, 0, ByteArray.empty) with
+  | mk acc rest =>
+    cases rest with
+    | mk bits out =>
+      obtain ⟨h1, h2, h3⟩ := hfold acc bits out hres
+      rw [show bitsOf ByteArray.empty = [] from rfl, natBits, List.append_nil,
+        List.nil_append] at h3
+      have hunfold : encodeHuffman bytes
+          = if bits == 0 then out
+            else out.push (UInt8.ofNat (acc * (2 ^ (8 - bits)) + (prefixMax (8 - bits)))) := by
+        rw [encodeHuffman, ← Array.foldl_toList, hres]
+      by_cases hzero : bits = 0
+      · subst hzero
+        refine ⟨0, by omega, ?_⟩
+        rw [hunfold, show ((0 : Nat) == 0) = true from rfl, ite_bool_true]
+        rw [List.replicate_zero, List.append_nil]
+        rw [natBits, List.append_nil] at h3
+        exact h3
+      · have hpad : 0 < 8 - bits ∧ 8 - bits ≤ 7 := by omega
+        have hpow : 0 < 2 ^ (8 - bits) := Nat.two_pow_pos _
+        have hprefix : prefixMax (8 - bits) = 2 ^ (8 - bits) - 1 := rfl
+        have hlt : acc * 2 ^ (8 - bits) + (2 ^ (8 - bits) - 1) < 2 ^ 8 := by
+          have h := Nat.mul_le_mul_right (k := 2 ^ (8 - bits))
+            (show acc ≤ 2 ^ bits - 1 from by omega)
+          rw [Nat.sub_mul, Nat.one_mul] at h
+          have hsplit : 2 ^ bits * 2 ^ (8 - bits) = 2 ^ 8 := by
+            rw [← Nat.pow_add, show bits + (8 - bits) = 8 from by omega]
+          have hle : 2 ^ (8 - bits) ≤ 2 ^ bits * 2 ^ (8 - bits) :=
+            Nat.le_mul_of_pos_left _ (Nat.two_pow_pos bits)
+          omega
+        refine ⟨8 - bits, hpad.2, ?_⟩
+        rw [hunfold, if_neg (by simpa using hzero), bitsOf_push, hprefix]
+        rw [show (UInt8.ofNat (acc * 2 ^ (8 - bits) + (2 ^ (8 - bits) - 1))).toNat
+            = (acc * 2 ^ (8 - bits) + (2 ^ (8 - bits) - 1)) % 2 ^ 8 from by
+          simp only [UInt8.toNat_ofNat']]
+        have hadd : ∀ V, natBits 8 V
+            = natBits bits (V / 2 ^ (8 - bits)) ++ natBits (8 - bits) V := by
+          have h := natBits_add bits (8 - bits)
+          rwa [show bits + (8 - bits) = 8 from by omega] at h
+        rw [natBits_mod 8 _, hadd]
+        rw [show (acc * 2 ^ (8 - bits) + (2 ^ (8 - bits) - 1)) / 2 ^ (8 - bits) = acc from by
+          rw [Nat.add_comm, Nat.add_mul_div_right _ _ hpow,
+            Nat.div_eq_of_lt (by omega), Nat.zero_add]]
+        rw [natBits_congr (8 - bits) (acc * 2 ^ (8 - bits) + (2 ^ (8 - bits) - 1))
+            (2 ^ (8 - bits) - 1) (by rw [Nat.add_comm, Nat.add_mul_mod_self_right]),
+          natBits_ones (8 - bits)]
+        rw [← List.append_assoc, h3]
+
+/-- Huffman decoding inverts Huffman encoding. -/
+theorem decodeHuffman_encodeHuffman (bytes : ByteArray) :
+    decodeHuffman (encodeHuffman bytes) = .ok bytes := by
+  obtain ⟨pad, hpad, hbits⟩ := bitsOf_encodeHuffman bytes
+  rw [decodeHuffman_eq, bitsFrom_eq_bitsOf, hbits,
+    decodeBits_symbolBits_flatMap pad hpad bytes.data.toList ByteArray.empty,
+    ByteArray.empty_append, toByteArray_data_toList]
 
 end Hpack
 end Http2
