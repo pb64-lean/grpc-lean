@@ -486,9 +486,20 @@ private def cleanupOutboundIfEndStream (state : State) (frame : Frame) : State :
   else
     state
 
-private partial def flushOutbound (state : State) (emitted : Array Frame := #[]) :
+private theorem cleanupOutboundIfEndStream_pendingOutbound (state : State) (frame : Frame) :
+    (cleanupOutboundIfEndStream state frame).pendingOutbound = state.pendingOutbound := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+private theorem popFirstFrame_size_lt {frames : Array Frame} {frame : Frame}
+    (h : frames[0]? = some frame) : (popFirstFrame frames).size < frames.size := by
+  have hpos : 0 < frames.size := (Array.getElem?_eq_some_iff.mp h).1
+  simp only [popFirstFrame, Array.size_extract]
+  omega
+
+private def flushOutbound (state : State) (emitted : Array Frame := #[]) :
     State × Array Frame :=
-  match state.pendingOutbound[0]? with
+  match h : state.pendingOutbound[0]? with
   | none => (state, emitted)
   | some frame =>
       if frame.header.frameType != FrameType.data then
@@ -522,6 +533,11 @@ private partial def flushOutbound (state : State) (emitted : Array Frame := #[])
               state with pendingOutbound := replaceFirstFrame state.pendingOutbound remainingFrame
             }
             (state, emitted.push sentFrame)
+  termination_by state.pendingOutbound.size
+  decreasing_by
+    all_goals
+      simp only [cleanupOutboundIfEndStream_pendingOutbound, setOutboundStreamWindow]
+      exact popFirstFrame_size_lt h
 
 private def queueOutbound (state : State) (frames : Array Frame) : State × Array Frame :=
   flushOutbound { state with pendingOutbound := state.pendingOutbound.append frames }
