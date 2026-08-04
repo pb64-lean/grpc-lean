@@ -42,6 +42,7 @@ flowchart TB
 | Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout (plaintext managed path; see TLS limitations) |
+| Connection lifecycle | No managed connection dies silently: every teardown records a `CloseCause` (peer close, shutdown, keepalive timeout, connection error, connection-task failure), the peer gets a GOAWAY carrying that cause before the socket is retired, and the last 64 causes are readable from `Grpc.Server.closedConnections`. `acceptFailure?`/`checkAccepting` expose the accept loop while the server runs |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
 | Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Every connection-scoped framing check carries a comment naming the RFC rule it follows, including the two places where a rule that would permit a stream error is deliberately widened to a connection error and why |
 
@@ -78,11 +79,13 @@ than a bare disconnect. Locally the last 64 causes are readable from
 `checkAccepting` expose the accept loop while the server runs, so a dead accept
 loop is a reportable failure instead of clients hanging on connect.
 
-Teardown retires the socket in `Async`, racing the write-side shutdown against a
-short timer: a peer that has stopped reading cannot stall it, and no worker
-thread is parked. Lean 4.31's `Std.Async.TCP` exposes no socket `close`, so the
-file descriptor itself is still released by handle finalization; the shutdown is
-what makes the FIN prompt.
+For every cause the peer was told about, teardown then retires the socket in
+`Async`, racing the write-side shutdown against a short timer: a peer that has
+stopped reading cannot stall it, and no worker thread is parked. (A peer that
+closed first already sent its FIN, so that path skips the shutdown.) Lean
+4.31's `Std.Async.TCP` exposes no socket `close`, so the file descriptor itself
+is still released by handle finalization; the shutdown is what makes the FIN
+prompt.
 
 A complete server (all four RPC shapes plus reflection) is
 `examples/lean_proto/NoteServer.lean`:
