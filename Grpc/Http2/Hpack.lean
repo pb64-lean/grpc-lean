@@ -1053,6 +1053,43 @@ theorem findHuffmanSymbol?_proper_prefix_eq_none {i k : Nat} (hi : i < huffmanCo
       rw [huffmanCode_not_bitPrefix hj hi hne] at hpref
       exact absurd hpref (by simp)
 
+/-- The linear table search returns the first index at or after `i` whose
+`(code, length)` pair matches. -/
+private theorem findHuffmanSymbol?_of_hit (code bits : Nat) : ∀ i n : Nat, i ≤ n ->
+    n < huffmanCodes.size -> huffmanCodes[n]! = code -> huffmanCodeLengths[n]! = bits ->
+    (∀ m, i ≤ m -> m < n -> ¬(huffmanCodes[m]! = code ∧ huffmanCodeLengths[m]! = bits)) ->
+    findHuffmanSymbol? code bits i = some n := by
+  intro i
+  fun_induction findHuffmanSymbol? code bits i
+  next i hge => intro n hin hn _ _ _; omega
+  next i hge hmatch =>
+    intro n hin hn hcode hlen hnone
+    simp only [Bool.and_eq_true, beq_iff_eq] at hmatch
+    have : ¬ i < n := fun hlt => hnone i (Nat.le_refl i) hlt ⟨hmatch.1, hmatch.2⟩
+    have : i = n := by omega
+    rw [this]
+  next i hge hmatch ih =>
+    intro n hin hn hcode hlen hnone
+    have hne : i ≠ n := by
+      intro heq
+      rw [heq] at hmatch
+      rw [hcode, hlen] at hmatch
+      simp at hmatch
+    exact ih n (by omega) hn hcode hlen (fun m hm hmn => hnone m (by omega) hmn)
+
+/-- The table search is exact: given an assigned code and its length, it
+returns that symbol's own index. Together with
+`findHuffmanSymbol?_proper_prefix_eq_none` this pins down the bit-serial
+decoder's symbol boundaries. -/
+theorem findHuffmanSymbol?_self {i : Nat} (hi : i < huffmanCodes.size) :
+    findHuffmanSymbol? huffmanCodes[i]! huffmanCodeLengths[i]! 0 = some i := by
+  refine findHuffmanSymbol?_of_hit _ _ 0 i (Nat.zero_le i) hi rfl rfl ?_
+  intro m _ hmi hm
+  have hmsize : m < huffmanCodes.size := by omega
+  have hpf := huffmanCode_not_bitPrefix hmsize hi (by omega)
+  rw [isBitPrefix, hm.1, hm.2] at hpf
+  simp at hpf
+
 end Hpack
 end Http2
 end Grpc
