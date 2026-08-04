@@ -1090,6 +1090,313 @@ theorem findHuffmanSymbol?_self {i : Nat} (hi : i < huffmanCodes.size) :
   rw [isBitPrefix, hm.1, hm.2] at hpf
   simp at hpf
 
+/-!
+#### Bit-list model of the Huffman decoder
+
+`decodeHuffmanBits` walks a byte/bit cursor; every proof about it is easier
+against an explicit list of the bits still to be read. `decodeHuffmanBits_eq`
+shows the two agree.
+-/
+
+/-- The bits of `bytes` from `(offset, bit)` onwards, most significant
+first. -/
+private def bitsFrom (bytes : ByteArray) (offset bit : Nat) : List Nat :=
+  if offset >= bytes.size then
+    []
+  else
+    bitAt bytes[offset]! bit ::
+      (if bit = 0 then bitsFrom bytes (offset + 1) 7 else bitsFrom bytes offset (bit - 1))
+  termination_by (bytes.size - offset) * 8 + bit
+  decreasing_by
+    · omega
+    · omega
+
+/-- `decodeHuffmanBits` as a function of the remaining bits. -/
+private def decodeBits : List Nat -> Nat -> Nat -> ByteArray -> Except Status ByteArray
+  | [], code, bits, out =>
+      if validHuffmanPadding code bits then
+        .ok out
+      else
+        .error (Status.internal "invalid HPACK Huffman padding")
+  | b :: rest, code, bits, out =>
+      match findHuffmanSymbol? (code * 2 + b) (bits + 1) 0 with
+      | some symbol =>
+          if symbol == huffmanEOSSymbol then
+            .error (Status.internal "HPACK Huffman EOS appeared in data")
+          else
+            decodeBits rest 0 0 (out.push (UInt8.ofNat symbol))
+      | none =>
+          if bits + 1 > 30 then
+            .error (Status.internal "invalid HPACK Huffman code")
+          else
+            decodeBits rest (code * 2 + b) (bits + 1) out
+
+private theorem except_bind_ok {α β : Type} (a : α) (f : α -> Except Status β) :
+    (Except.ok a >>= f) = f a := rfl
+
+private theorem except_bind_error {α β : Type} (e : Status) (f : α -> Except Status β) :
+    ((Except.error e : Except Status α) >>= f) = .error e := rfl
+
+private theorem ite_bool_true {α : Type} (a b : α) :
+    (if (true : Bool) = true then a else b) = a := rfl
+
+private theorem ite_bool_false {α : Type} (a b : α) :
+    (if (false : Bool) = true then a else b) = b := rfl
+
+/-- The cursor-driven decoder and the bit-list decoder agree. -/
+private theorem decodeHuffmanBits_eq (bytes : ByteArray) (offset bit : Nat) :
+    ∀ code bits out, decodeHuffmanBits bytes offset bit code bits out
+      = decodeBits (bitsFrom bytes offset bit) code bits out := by
+  fun_induction bitsFrom bytes offset bit
+  next offset bit hge =>
+    intro code bits out
+    rw [decodeHuffmanBits, if_pos (by omega), decodeBits]
+    split <;> rfl
+  next offset bit hge hzero hsucc =>
+    intro code bits out
+    have hstep : ∀ c b o,
+        (if bit = 0 then decodeHuffmanBits bytes (offset + 1) 7 c b o
+          else decodeHuffmanBits bytes offset (bit - 1) c b o)
+        = decodeBits (if bit = 0 then bitsFrom bytes (offset + 1) 7
+            else bitsFrom bytes offset (bit - 1)) c b o := by
+      intro c b o
+      by_cases hb : bit = 0
+      · rw [if_pos hb, if_pos hb]
+        exact hzero hb c b o
+      · rw [if_neg hb, if_neg hb]
+        exact hsucc hb c b o
+    rw [decodeHuffmanBits, if_neg (by omega), decodeBits]
+    simp only [bind, Except.bind]
+    split
+    next symbol hfind =>
+      split
+      next => rfl
+      next => exact hstep 0 0 (out.push (UInt8.ofNat symbol))
+    next hfind =>
+      split
+      next => rfl
+      next => exact hstep (code * 2 + bitAt bytes[offset]! bit) (bits + 1) out
+
+/-- Huffman decoding, as a function of the input's bit list. -/
+private theorem decodeHuffman_eq (bytes : ByteArray) :
+    decodeHuffman bytes = decodeBits (bitsFrom bytes 0 7) 0 0 ByteArray.empty :=
+  decodeHuffmanBits_eq bytes 0 7 0 0 ByteArray.empty
+
+/-!
+#### The bit-list decoder recovers encoded symbols
+-/
+
+/-- The `len` least significant bits of `value`, most significant first. -/
+private def natBits (len value : Nat) : List Nat :=
+  match len with
+  | 0 => []
+  | len + 1 => (value / 2 ^ len) % 2 :: natBits len value
+
+/-- The Huffman code bits of one symbol. -/
+private def symbolBits (symbol : Nat) : List Nat :=
+  natBits huffmanCodeLengths[symbol]! huffmanCodes[symbol]!
+
+set_option maxRecDepth 8192 in
+private theorem huffmanCodes_size : huffmanCodes.size = 257 := by rfl
+
+set_option maxRecDepth 8192 in
+/-- Every table entry has a positive length of at most 30 bits and a code
+that fits in that many bits. -/
+theorem huffmanCodeTableBounded :
+    huffmanCodeTable.all (fun entry => entry.1 < 2 ^ entry.2 && 0 < entry.2 && entry.2 ≤ 30)
+      = true := by
+  decide
+
+private theorem huffmanCode_bounds {i : Nat} (hi : i < huffmanCodes.size) :
+    huffmanCodes[i]! < 2 ^ huffmanCodeLengths[i]! ∧ 0 < huffmanCodeLengths[i]!
+      ∧ huffmanCodeLengths[i]! ≤ 30 := by
+  have hi' : i < huffmanCodeTable.length := by rw [huffmanCodeTable_length]; exact hi
+  have h := List.all_eq_true.mp huffmanCodeTableBounded huffmanCodeTable[i]
+    (List.getElem_mem hi')
+  rw [huffmanCodeTable_getElem hi'] at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  exact ⟨h.1.1, h.1.2, h.2⟩
+
+/-- Decoding the tail of a symbol's code: with `j` of the code's bits still
+to read and the leading bits already accumulated, the decoder consumes
+exactly those `j` bits and emits the symbol. -/
+private theorem decodeBits_natBits (s : Nat) (hs : s < huffmanCodes.size)
+    (hne : s ≠ huffmanEOSSymbol) (rest : List Nat) (out : ByteArray) :
+    ∀ j, 1 ≤ j -> j ≤ huffmanCodeLengths[s]! ->
+      decodeBits (natBits j huffmanCodes[s]! ++ rest)
+          (huffmanCodes[s]! / 2 ^ j) (huffmanCodeLengths[s]! - j) out
+        = decodeBits rest 0 0 (out.push (UInt8.ofNat s)) := by
+  obtain ⟨hcodelt, hlenpos, hlen30⟩ := huffmanCode_bounds hs
+  intro j
+  induction j with
+  | zero => intro h; omega
+  | succ j ih =>
+      intro _ hle
+      have hdiv : huffmanCodes[s]! / 2 ^ (j + 1) = huffmanCodes[s]! / 2 ^ j / 2 := by
+        rw [Nat.pow_succ, Nat.div_div_eq_div_mul]
+      have hcode : huffmanCodes[s]! / 2 ^ (j + 1) * 2 + huffmanCodes[s]! / 2 ^ j % 2
+          = huffmanCodes[s]! / 2 ^ j := by
+        rw [hdiv]
+        omega
+      have hbits : huffmanCodeLengths[s]! - (j + 1) + 1 = huffmanCodeLengths[s]! - j := by
+        omega
+      rw [natBits, List.cons_append, decodeBits, hcode, hbits]
+      by_cases hj : j = 0
+      · subst hj
+        rw [show huffmanCodes[s]! / 2 ^ 0 = huffmanCodes[s]! from by
+          rw [Nat.pow_zero, Nat.div_one]]
+        rw [show huffmanCodeLengths[s]! - 0 = huffmanCodeLengths[s]! from by omega]
+        simp only [findHuffmanSymbol?_self hs]
+        rw [show (s == huffmanEOSSymbol) = false from by
+          simp only [beq_eq_false_iff_ne]
+          exact hne]
+        rw [ite_bool_false, natBits, List.nil_append]
+      · have hprefix : findHuffmanSymbol? (huffmanCodes[s]! / 2 ^ j)
+            (huffmanCodeLengths[s]! - j) 0 = none := by
+          have h := findHuffmanSymbol?_proper_prefix_eq_none hs
+            (k := huffmanCodeLengths[s]! - j) (by omega)
+          rwa [show huffmanCodeLengths[s]! - (huffmanCodeLengths[s]! - j) = j from by omega] at h
+        simp only [hprefix]
+        rw [if_neg (show ¬ (huffmanCodeLengths[s]! - j > 30) from by omega)]
+        exact ih (by omega) (by omega)
+
+/-- One symbol's Huffman code decodes to exactly that symbol, leaving the
+rest of the bit stream untouched. -/
+private theorem decodeBits_symbolBits {s : Nat} (hs : s < 256) (rest : List Nat)
+    (out : ByteArray) :
+    decodeBits (symbolBits s ++ rest) 0 0 out
+      = decodeBits rest 0 0 (out.push (UInt8.ofNat s)) := by
+  have hsize : s < huffmanCodes.size := by rw [huffmanCodes_size]; omega
+  have hne : s ≠ huffmanEOSSymbol := by
+    show s ≠ 256
+    omega
+  obtain ⟨hcodelt, hlenpos, hlen30⟩ := huffmanCode_bounds hsize
+  have h := decodeBits_natBits s hsize hne rest out huffmanCodeLengths[s]! hlenpos
+    (Nat.le_refl _)
+  rw [show huffmanCodes[s]! / 2 ^ huffmanCodeLengths[s]! = 0 from
+      Nat.div_eq_of_lt hcodelt,
+    Nat.sub_self] at h
+  exact h
+
+/-!
+#### Padding and whole-stream decoding
+-/
+
+private theorem pow_sub_one_div (j d : Nat) : (2 ^ (j + d) - 1) / 2 ^ d = 2 ^ j - 1 := by
+  have hd : 0 < 2 ^ d := Nat.two_pow_pos d
+  have hj : 0 < 2 ^ j := Nat.two_pow_pos j
+  have hle : 2 ^ d ≤ 2 ^ j * 2 ^ d := Nat.le_mul_of_pos_left _ hj
+  have hsplit : 2 ^ (j + d) - 1 = (2 ^ d - 1) + (2 ^ j - 1) * 2 ^ d := by
+    rw [Nat.pow_add, Nat.sub_mul, Nat.one_mul]
+    omega
+  rw [hsplit, Nat.add_mul_div_right _ _ hd, Nat.div_eq_of_lt (by omega), Nat.zero_add]
+
+set_option maxRecDepth 8192 in
+private theorem huffmanEOS_code : huffmanCodes[256]! = 2 ^ 30 - 1 := by
+  rfl
+
+set_option maxRecDepth 8192 in
+private theorem huffmanEOS_length : huffmanCodeLengths[256]! = 30 := by
+  rfl
+
+/-- An all-ones bit run shorter than the EOS code is never a complete code:
+it is a proper prefix of the (all-ones) EOS code, which prefix-freeness
+excludes. This is what makes trailing Huffman padding unambiguous. -/
+private theorem findHuffmanSymbol?_ones {k : Nat} (hk : k ≤ 7) :
+    findHuffmanSymbol? (2 ^ k - 1) k 0 = none := by
+  have hsize : 256 < huffmanCodes.size := by rw [huffmanCodes_size]; omega
+  have h := findHuffmanSymbol?_proper_prefix_eq_none hsize
+    (k := k) (by rw [huffmanEOS_length]; omega)
+  rw [huffmanEOS_code, huffmanEOS_length] at h
+  rwa [show (30 : Nat) - k = 30 - k from rfl,
+    show (2 : Nat) ^ 30 - 1 = 2 ^ (k + (30 - k)) - 1 from by
+      rw [show k + (30 - k) = 30 from by omega],
+    pow_sub_one_div] at h
+
+/-- Trailing padding of at most seven one bits decodes to nothing. -/
+private theorem decodeBits_ones (out : ByteArray) : ∀ n k, n + k ≤ 7 ->
+    decodeBits (List.replicate n 1) (2 ^ k - 1) k out = .ok out := by
+  intro n
+  induction n with
+  | zero =>
+      intro k hk
+      rw [List.replicate_zero, decodeBits, if_pos]
+      show validHuffmanPadding (2 ^ k - 1) k = true
+      rw [validHuffmanPadding]
+      simp only [prefixMax, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq]
+      exact Or.inr ⟨by omega, by first | rfl | trivial⟩
+  | succ n ih =>
+      intro k hk
+      rw [List.replicate_succ, decodeBits]
+      have hpow : 0 < 2 ^ k := Nat.two_pow_pos k
+      rw [show (2 ^ k - 1) * 2 + 1 = 2 ^ (k + 1) - 1 from by
+        rw [Nat.pow_succ]
+        omega]
+      rw [findHuffmanSymbol?_ones (by omega)]
+      rw [if_neg (show ¬ (k + 1 > 30) from by omega)]
+      exact ih (k + 1) (by omega)
+
+private theorem byteArray_push_eq_append (a : ByteArray) (x : UInt8) :
+    a.push x = a ++ ByteArray.empty.push x := by
+  have hdata : (a.push x).data = (a ++ ByteArray.empty.push x).data := by
+    rw [ByteArray.data_push, ByteArray.data_append]
+    exact Array.push_eq_append
+  cases ha : a.push x
+  cases hb : a ++ ByteArray.empty.push x
+  simp_all
+
+private theorem foldl_push_eq (l : List UInt8) : ∀ out : ByteArray,
+    l.foldl ByteArray.push out = out ++ l.toByteArray := by
+  induction l with
+  | nil =>
+      intro out
+      rw [List.foldl_nil, show ([] : List UInt8).toByteArray = ByteArray.empty from rfl,
+        ByteArray.append_empty]
+  | cons b rest ih =>
+      intro out
+      rw [List.foldl_cons, ih,
+        show (b :: rest).toByteArray = ByteArray.empty.push b ++ rest.toByteArray from by
+          rw [show b :: rest = [b] ++ rest from rfl, List.toByteArray_append]
+          rfl,
+        byteArray_push_eq_append out b, ByteArray.append_assoc]
+
+private theorem toByteArray_data_toList (bytes : ByteArray) :
+    bytes.data.toList.toByteArray = bytes := by
+  apply ByteArray.ext_getElem
+  · rw [List.size_toByteArray, Array.length_toList]
+    rfl
+  · intro i h1 h2
+    rw [List.getElem_toByteArray, Array.getElem_toList]
+    rfl
+
+/-- The bit-list decoder recovers exactly the byte sequence whose Huffman
+codes it is given, ignoring up to seven trailing padding ones. -/
+private theorem decodeBits_symbolBits_flatMap (pad : Nat) (hpad : pad ≤ 7) :
+    ∀ (symbols : List UInt8) (out : ByteArray),
+      decodeBits (symbols.flatMap (fun b => symbolBits b.toNat) ++ List.replicate pad 1)
+          0 0 out
+        = .ok (out ++ symbols.toByteArray) := by
+  intro symbols
+  induction symbols with
+  | nil =>
+      intro out
+      rw [List.flatMap_nil, List.nil_append,
+        show ([] : List UInt8).toByteArray = ByteArray.empty from rfl, ByteArray.append_empty]
+      have h := decodeBits_ones out pad 0 (by omega)
+      rw [show (2 : Nat) ^ 0 - 1 = 0 from rfl] at h
+      exact h
+  | cons b rest ih =>
+      intro out
+      rw [List.flatMap_cons, List.append_assoc]
+      rw [decodeBits_symbolBits (s := b.toNat) (by
+        have := UInt8.toNat_lt b
+        omega)]
+      rw [UInt8.ofNat_toNat, ih]
+      rw [show (b :: rest).toByteArray = ByteArray.empty.push b ++ rest.toByteArray from by
+          rw [show b :: rest = [b] ++ rest from rfl, List.toByteArray_append]
+          rfl,
+        byteArray_push_eq_append out b, ByteArray.append_assoc]
+
 end Hpack
 end Http2
 end Grpc
