@@ -1666,23 +1666,30 @@ def processFrameWith (registry : Registry) (state : State) (frame : Frame)
               | .pushPromise => pure (.error (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported"))
               | .unknown _ => pure (.ok state)
 
+/-- The pure bookkeeping `processHeadersShared` performs before the `IO`
+authorizer call: stream-id validation, buffering the header frame, and
+claiming the stream id.  Factored out so the authorization-before-body
+groundwork (end of file) can reason about HEADERS steps without touching
+`IO`. -/
+private def prepareHeadersShared (state : State) (frame : Frame) :
+    Except Status (State × Option Frame) := do
+  requireClientStreamId frame.header.streamId "HEADERS"
+  if (findStream? state.streams frame.header.streamId).isSome then
+    throw (Status.internal "HTTP/2 duplicate HEADERS for active unary stream")
+  requireNewClientStreamId state frame.header.streamId
+  match ← rejectNewStreamAfterOutboundGoAway? state frame.header.streamId with
+  | some rst => pure (state, some rst)
+  | none =>
+      requireInboundStreamCapacity state
+      pure ({
+        state with
+        lastClientStreamId := frame.header.streamId,
+        streams := appendStreamFrame state.streams frame
+      }, none)
+
 private def processHeadersShared (registry : Registry) (state : State) (frame : Frame) :
     IO (Except Status (State × SharedFrameResult)) := do
-  let prepared : Except Status (State × Option Frame) := do
-    requireClientStreamId frame.header.streamId "HEADERS"
-    if (findStream? state.streams frame.header.streamId).isSome then
-      throw (Status.internal "HTTP/2 duplicate HEADERS for active unary stream")
-    requireNewClientStreamId state frame.header.streamId
-    match ← rejectNewStreamAfterOutboundGoAway? state frame.header.streamId with
-    | some rst => pure (state, some rst)
-    | none =>
-        requireInboundStreamCapacity state
-        pure ({
-          state with
-          lastClientStreamId := frame.header.streamId,
-          streams := appendStreamFrame state.streams frame
-        }, none)
-  match prepared with
+  match prepareHeadersShared state frame with
   | .error status => pure (.error status)
   | .ok (state, some rst) => pure (.ok (state, { emitted := #[rst] }))
   | .ok (state, none) =>
@@ -1812,6 +1819,36 @@ private def processDataShared (registry : Registry) (state : State) (frame : Fra
       else
         pure (state, { emitted := updates })
 
+/-- The pure shared-kernel step for every frame type that does not require the
+`IO` authorizer (i.e. everything except HEADERS/CONTINUATION).  Factored out of
+`processFrameShared` so the authorization-before-body groundwork (end of file)
+can state trace theorems over arbitrary non-header frame steps. -/
+private def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) := do
+  match frame.header.frameType with
+  | .settings =>
+      let (state, emitted) ← processSettings state frame
+      pure (state, { emitted := emitted })
+  | .data => processDataShared registry state frame
+  | .rstStream => processRstStreamShared state frame
+  | .windowUpdate =>
+      let (state, emitted) ← processWindowUpdate state frame
+      pure (state, { emitted := emitted })
+  | .ping =>
+      let (state, emitted) ← processPing state frame
+      pure (state, { emitted := emitted })
+  | .priority =>
+      let (state, emitted) ← processPriority state frame
+      pure (state, { emitted := emitted })
+  | .goAway =>
+      let (state, emitted) ← processGoAway state frame
+      pure (state, { emitted := emitted })
+  | .pushPromise =>
+      throw (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported")
+  | .unknown _ => pure (state, {})
+  | .headers | .continuation =>
+      throw (Status.internal "unreachable HTTP/2 header dispatch")
+
 private def processFrameShared (registry : Registry) (state : State) (frame : Frame) :
     IO (Except Status (State × SharedFrameResult)) := do
   let validated : Except Status Unit := do
@@ -1827,32 +1864,7 @@ private def processFrameShared (registry : Registry) (state : State) (frame : Fr
         | .error status => pure (.error status)
         | .ok frame => processHeadersShared registry state frame
     | .continuation => processContinuationShared registry state frame
-    | frameType =>
-      let result : Except Status (State × SharedFrameResult) := do
-        match frameType with
-        | .settings =>
-            let (state, emitted) ← processSettings state frame
-            pure (state, { emitted := emitted })
-        | .data => processDataShared registry state frame
-        | .rstStream => processRstStreamShared state frame
-        | .windowUpdate =>
-            let (state, emitted) ← processWindowUpdate state frame
-            pure (state, { emitted := emitted })
-        | .ping =>
-            let (state, emitted) ← processPing state frame
-            pure (state, { emitted := emitted })
-        | .priority =>
-            let (state, emitted) ← processPriority state frame
-            pure (state, { emitted := emitted })
-        | .goAway =>
-            let (state, emitted) ← processGoAway state frame
-            pure (state, { emitted := emitted })
-        | .pushPromise =>
-            throw (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported")
-        | .unknown _ => pure (state, {})
-        | .headers | .continuation =>
-            throw (Status.internal "unreachable HTTP/2 header dispatch")
-      pure result
+    | _ => pure (processNonHeaderFrameShared registry state frame)
 
 def processFrameSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
     (emit : Array Frame -> IO Unit) : IO (Except Status Unit) := do
