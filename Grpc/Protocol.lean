@@ -126,6 +126,37 @@ followed by the unit character, e.g. `"250m"`). -/
 def render (timeout : Timeout) : String :=
   String.ofList (renderDigits timeout.value ++ [timeout.unit.toChar])
 
+/-- The largest value `grpc-timeout` can carry: the wire format allows at most
+eight decimal digits. -/
+def maxRenderedValue : Nat := 99999999
+
+/-- Units a duration may be rendered in, finest first. -/
+private def renderUnits : List TimeoutUnit :=
+  [.nanosecond, .microsecond, .millisecond, .second, .minute, .hour]
+
+private def ceilDiv (n divisor : Nat) : Nat := (n + divisor - 1) / divisor
+
+private def ofNanosecondsIn (nanoseconds : Nat) : List TimeoutUnit -> Timeout
+  | [] => { value := maxRenderedValue, unit := .hour }
+  | unit :: rest =>
+      if ceilDiv nanoseconds unit.nanoseconds ≤ maxRenderedValue then
+        { value := ceilDiv nanoseconds unit.nanoseconds, unit := unit }
+      else
+        ofNanosecondsIn nanoseconds rest
+
+/-- Express a duration in nanoseconds as a `grpc-timeout` value: the finest
+unit whose value still fits the eight-digit wire limit.
+
+Rounding is *up*, and a zero duration renders as the smallest representable
+one, because `grpc-timeout` has no encoding for zero — `parse?` rejects it, so
+a value rounded down to zero would be dropped and read by the peer as "no
+deadline at all", which is the opposite of what a propagated deadline means.
+Rounding up can overshoot by at most one unit, which cannot outlive the caller:
+the caller enforces its own deadline independently (`runWithDeadlineUntil`), so
+the downstream call is cut off at the caller's deadline regardless. -/
+def ofNanoseconds (nanoseconds : Nat) : Timeout :=
+  ofNanosecondsIn (Nat.max nanoseconds 1) renderUnits
+
 /-!
 ### Codec laws
 
@@ -217,6 +248,46 @@ theorem parse?_render (timeout : Timeout) (hpos : timeout.value ≠ 0)
   rw [TimeoutUnit.ofChar?_toChar]
   simp only [parseDigits_renderDigits, Nat.zero_mul, Nat.zero_add]
   rw [if_neg (by simpa using hpos)]
+
+private theorem nanoseconds_pos (unit : TimeoutUnit) : 0 < unit.nanoseconds := by
+  cases unit <;> decide
+
+private theorem ceilDiv_pos {n divisor : Nat} (hn : 1 ≤ n) (hd : 0 < divisor) :
+    1 ≤ ceilDiv n divisor := by
+  unfold ceilDiv
+  rw [Nat.le_div_iff_mul_le hd]
+  omega
+
+/-- Every duration renders to a value the wire format can carry: nonzero and
+at most eight digits.  This is what `parse?_render` needs, so `ofNanoseconds`
+always produces a header value that parses back. -/
+theorem ofNanoseconds_bounds (nanoseconds : Nat) :
+    (ofNanoseconds nanoseconds).value ≠ 0
+      ∧ (ofNanoseconds nanoseconds).value ≤ maxRenderedValue := by
+  unfold ofNanoseconds
+  have hn : 1 ≤ Nat.max nanoseconds 1 := Nat.le_max_right _ _
+  generalize Nat.max nanoseconds 1 = n at hn
+  induction renderUnits with
+  | nil =>
+      refine ⟨?_, Nat.le_refl _⟩
+      show maxRenderedValue ≠ 0
+      decide
+  | cons unit rest ih =>
+      rw [ofNanosecondsIn]
+      by_cases hle : ceilDiv n unit.nanoseconds ≤ maxRenderedValue
+      · rw [if_pos hle]
+        refine ⟨?_, hle⟩
+        have h1 := ceilDiv_pos hn (nanoseconds_pos unit)
+        show ceilDiv n unit.nanoseconds ≠ 0
+        omega
+      · rw [if_neg hle]
+        exact ih
+
+/-- A duration always renders to a `grpc-timeout` value that parses back to
+the same timeout. -/
+theorem parse?_render_ofNanoseconds (nanoseconds : Nat) :
+    parse? (ofNanoseconds nanoseconds).render = some (ofNanoseconds nanoseconds) :=
+  parse?_render _ (ofNanoseconds_bounds nanoseconds).1 (ofNanoseconds_bounds nanoseconds).2
 
 end Timeout
 
@@ -311,22 +382,87 @@ def pipe (capacity : Option Nat := some 16) : GrpcM (Producer α) := do
 
 end MessageStream
 
+/-! ### Deadlines
+
+A request's `grpc-timeout` is a *duration*, so on its own it cannot answer the
+question a handler making a downstream call has to answer: how much of it is
+left?  The server turns it into an absolute instant on `IO.monoNanosNow`'s
+monotonic clock as soon as the request headers are decoded, and hands that
+instant to the handler as `request.deadline`.  `Deadline.remaining?` turns the
+instant back into a duration at the moment of the downstream call. -/
+
+/-- What is left of a request's deadline. -/
+inductive Deadline.Remaining where
+  /-- The request carried no `grpc-timeout`: a downstream call inherits no
+  deadline. -/
+  | unbounded
+  /-- Time is left; this is what to send as the downstream `grpc-timeout`. -/
+  | remaining (timeout : Timeout)
+  /-- The deadline has already passed. -/
+  | exceeded
+  deriving Repr, DecidableEq, Inhabited
+
+namespace Deadline
+
+/-- Time left before `deadline?` (an absolute `IO.monoNanosNow` reading, as
+carried by `UnaryRequest.deadline` and friends), rendered as a `grpc-timeout`
+duration for a downstream call.
+
+`Timeout.ofNanoseconds` rounds up, so a strictly positive remainder never
+collapses to "no deadline"; a remainder of zero is reported as `.exceeded`
+rather than as a timeout, since the call cannot succeed. -/
+def remaining? (deadline? : Option Nat) : IO Remaining := do
+  match deadline? with
+  | none => pure .unbounded
+  | some deadline =>
+      let now ← IO.monoNanosNow
+      if deadline ≤ now then
+        pure .exceeded
+      else
+        pure (.remaining (Timeout.ofNanoseconds (deadline - now)))
+
+/-- The `Status` a handler should fail with when its deadline is already
+spent. -/
+def exceededStatus : Status :=
+  Status.deadlineExceeded "gRPC deadline exceeded"
+
+/-- The remaining deadline as a `grpc-timeout` header value: `none` when the
+request carried no deadline, an error when it has already expired. -/
+def remainingHeaderValue? (deadline? : Option Nat) : IO (Except Status (Option String)) := do
+  match ← remaining? deadline? with
+  | .unbounded => pure (.ok none)
+  | .remaining timeout => pure (.ok (some timeout.render))
+  | .exceeded => pure (.error exceededStatus)
+
+end Deadline
+
 structure UnaryRequest where
   method : MethodName
   metadata : Metadata
   timeout : Option Timeout := none
+  /-- Absolute deadline on `IO.monoNanosNow`'s clock, set when the request
+  carried a `grpc-timeout`.  Pass it to `Deadline.remaining?` (or
+  `Grpc.Client.CallOptions.propagating`) to give a downstream call the time
+  that is actually left. -/
+  deadline : Option Nat := none
   data : ByteArray
 
 structure ClientStreamingRequest where
   method : MethodName
   metadata : Metadata
   timeout : Option Timeout := none
+  /-- Absolute deadline on `IO.monoNanosNow`'s clock; see
+  `UnaryRequest.deadline`. -/
+  deadline : Option Nat := none
   messages : Array ByteArray := #[]
 
 structure ClientStreamingStreamRequest where
   method : MethodName
   metadata : Metadata
   timeout : Option Timeout := none
+  /-- Absolute deadline on `IO.monoNanosNow`'s clock; see
+  `UnaryRequest.deadline`. -/
+  deadline : Option Nat := none
   messages : MessageStream ByteArray
 
 structure UnaryResponse where

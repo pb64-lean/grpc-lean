@@ -24,6 +24,73 @@ abbrev TypedClientStreamingStreamHandler (α β : Type) := MessageStream α -> G
 abbrev TypedBidirectionalStreamingStreamHandler (α β : Type) :=
   MessageStream α -> GrpcM (MessageStream β)
 
+/-- What a typed handler knows about the call it is serving, beyond the decoded
+message: the method, the request metadata, and the deadline.
+
+A raw handler reads these off its `UnaryRequest`/`ClientStreamingRequest`; a
+typed handler is handed only the decoded message, so the `*WithContext`
+registration variants pass this record alongside it.  `deadline` is the same
+absolute instant the server enforces, so `context.remainingDeadline` is exactly
+the time a downstream call may still take. -/
+structure RequestContext where
+  method : MethodName
+  metadata : Metadata
+  timeout : Option Timeout := none
+  /-- Absolute deadline on `IO.monoNanosNow`'s clock, or `none` when the
+  request carried no `grpc-timeout`. -/
+  deadline : Option Nat := none
+
+namespace RequestContext
+
+def ofUnaryRequest (request : UnaryRequest) : RequestContext :=
+  {
+    method := request.method,
+    metadata := request.metadata,
+    timeout := request.timeout,
+    deadline := request.deadline
+  }
+
+def ofClientStreamingRequest (request : ClientStreamingRequest) : RequestContext :=
+  {
+    method := request.method,
+    metadata := request.metadata,
+    timeout := request.timeout,
+    deadline := request.deadline
+  }
+
+def ofClientStreamingStreamRequest (request : ClientStreamingStreamRequest) :
+    RequestContext :=
+  {
+    method := request.method,
+    metadata := request.metadata,
+    timeout := request.timeout,
+    deadline := request.deadline
+  }
+
+/-- What is left of this call's deadline, ready to be sent as a downstream
+`grpc-timeout` (see `Grpc.Deadline.Remaining`). -/
+def remainingDeadline (context : RequestContext) : IO Deadline.Remaining :=
+  Deadline.remaining? context.deadline
+
+end RequestContext
+
+/-- Typed handlers that also see the call's metadata and deadline.  These are
+additive: `TypedUnaryHandler` and friends keep their shapes, and generated
+service code is unaffected. -/
+abbrev TypedUnaryContextHandler (α β : Type) := RequestContext -> α -> GrpcM β
+abbrev TypedServerStreamingContextHandler (α β : Type) :=
+  RequestContext -> α -> GrpcM (Array β)
+abbrev TypedClientStreamingContextHandler (α β : Type) :=
+  RequestContext -> Array α -> GrpcM β
+abbrev TypedBidirectionalStreamingContextHandler (α β : Type) :=
+  RequestContext -> Array α -> GrpcM (Array β)
+abbrev TypedServerStreamingStreamContextHandler (α β : Type) :=
+  RequestContext -> α -> GrpcM (MessageStream β)
+abbrev TypedClientStreamingStreamContextHandler (α β : Type) :=
+  RequestContext -> MessageStream α -> GrpcM β
+abbrev TypedBidirectionalStreamingStreamContextHandler (α β : Type) :=
+  RequestContext -> MessageStream α -> GrpcM (MessageStream β)
+
 /--
 The seven RPC shapes a registered method handler may have.  The `*Stream`
 shapes consume or produce incremental `MessageStream`s; the others use
@@ -168,15 +235,15 @@ def registerBidirectionalStreamingStream (registry : Registry) (name : MethodNam
     (handler : BidirectionalStreamingStreamHandler) : Registry :=
   registry.register { name := name, shape := .bidirectionalStreamingStream, handler := handler }
 
-def registerUnaryCodec [ToString ε] (registry : Registry) (name : MethodName)
+def registerUnaryCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
-    (handler : TypedUnaryHandler α β) : Registry :=
+    (handler : TypedUnaryContextHandler α β) : Registry :=
   registry.registerUnary name fun request => do
     let input ← GrpcM.ofExcept <|
       match decode request.data with
       | .ok value => .ok value
       | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let output ← handler input
+    let output ← handler (RequestContext.ofUnaryRequest request) input
     let data ← GrpcM.ofExcept <|
       match encode output with
       | .ok value => .ok value
@@ -187,16 +254,46 @@ def registerUnaryCodec [ToString ε] (registry : Registry) (name : MethodName)
       status := Status.ok
     }
 
-def registerServerStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+def registerUnaryCodec [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
-    (handler : TypedServerStreamingHandler α β) : Registry :=
+    (handler : TypedUnaryHandler α β) : Registry :=
+  registry.registerUnaryCodecWithContext name decode encode (fun _ input => handler input)
+
+def registerServerStreamingCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedServerStreamingContextHandler α β) : Registry :=
   registry.registerServerStreaming name fun request => do
     let input ← GrpcM.ofExcept <|
       match decode request.data with
       | .ok value => .ok value
       | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let outputs ← handler input
+    let outputs ← handler (RequestContext.ofUnaryRequest request) input
     let messages ← outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure {
+      metadata := Metadata.empty,
+      messages := messages,
+      status := Status.ok
+    }
+
+def registerServerStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedServerStreamingHandler α β) : Registry :=
+  registry.registerServerStreamingCodecWithContext name decode encode (fun _ input => handler input)
+
+def registerServerStreamingStreamCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedServerStreamingStreamContextHandler α β) : Registry :=
+  registry.registerServerStreamingStream name fun request => do
+    let input ← GrpcM.ofExcept <|
+      match decode request.data with
+      | .ok value => .ok value
+      | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler (RequestContext.ofUnaryRequest request) input
+    let messages := outputs.mapM fun output =>
       GrpcM.ofExcept <|
         match encode output with
         | .ok value => .ok value
@@ -210,33 +307,43 @@ def registerServerStreamingCodec [ToString ε] (registry : Registry) (name : Met
 def registerServerStreamingStreamCodec [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
     (handler : TypedServerStreamingStreamHandler α β) : Registry :=
-  registry.registerServerStreamingStream name fun request => do
-    let input ← GrpcM.ofExcept <|
-      match decode request.data with
-      | .ok value => .ok value
-      | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let outputs ← handler input
-    let messages := outputs.mapM fun output =>
-      GrpcM.ofExcept <|
-        match encode output with
-        | .ok value => .ok value
-        | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure {
-      metadata := Metadata.empty,
-      messages := messages,
-      status := Status.ok
-    }
+  registry.registerServerStreamingStreamCodecWithContext name decode encode (fun _ input => handler input)
 
-def registerClientStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+def registerClientStreamingCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
-    (handler : TypedClientStreamingHandler α β) : Registry :=
+    (handler : TypedClientStreamingContextHandler α β) : Registry :=
   registry.registerClientStreaming name fun request => do
     let inputs ← request.messages.mapM fun message =>
       GrpcM.ofExcept <|
         match decode message with
         | .ok value => .ok value
         | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let output ← handler inputs
+    let output ← handler (RequestContext.ofClientStreamingRequest request) inputs
+    let data ← GrpcM.ofExcept <|
+      match encode output with
+      | .ok value => .ok value
+      | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure {
+      metadata := Metadata.empty,
+      data := data,
+      status := Status.ok
+    }
+
+def registerClientStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedClientStreamingHandler α β) : Registry :=
+  registry.registerClientStreamingCodecWithContext name decode encode (fun _ input => handler input)
+
+def registerClientStreamingStreamCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedClientStreamingStreamContextHandler α β) : Registry :=
+  registry.registerClientStreamingStream name fun request => do
+    let inputs := request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let output ← handler (RequestContext.ofClientStreamingStreamRequest request) inputs
     let data ← GrpcM.ofExcept <|
       match encode output with
       | .ok value => .ok value
@@ -250,34 +357,45 @@ def registerClientStreamingCodec [ToString ε] (registry : Registry) (name : Met
 def registerClientStreamingStreamCodec [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
     (handler : TypedClientStreamingStreamHandler α β) : Registry :=
-  registry.registerClientStreamingStream name fun request => do
-    let inputs := request.messages.mapM fun message =>
-      GrpcM.ofExcept <|
-        match decode message with
-        | .ok value => .ok value
-        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let output ← handler inputs
-    let data ← GrpcM.ofExcept <|
-      match encode output with
-      | .ok value => .ok value
-      | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure {
-      metadata := Metadata.empty,
-      data := data,
-      status := Status.ok
-    }
+  registry.registerClientStreamingStreamCodecWithContext name decode encode (fun _ input => handler input)
 
-def registerBidirectionalStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+def registerBidirectionalStreamingCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
-    (handler : TypedBidirectionalStreamingHandler α β) : Registry :=
+    (handler : TypedBidirectionalStreamingContextHandler α β) : Registry :=
   registry.registerBidirectionalStreaming name fun request => do
     let inputs ← request.messages.mapM fun message =>
       GrpcM.ofExcept <|
         match decode message with
         | .ok value => .ok value
         | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let outputs ← handler inputs
+    let outputs ← handler (RequestContext.ofClientStreamingRequest request) inputs
     let messages ← outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure {
+      metadata := Metadata.empty,
+      messages := messages,
+      status := Status.ok
+    }
+
+def registerBidirectionalStreamingCodec [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedBidirectionalStreamingHandler α β) : Registry :=
+  registry.registerBidirectionalStreamingCodecWithContext name decode encode (fun _ input => handler input)
+
+def registerBidirectionalStreamingStreamCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : TypedBidirectionalStreamingStreamContextHandler α β) : Registry :=
+  registry.registerBidirectionalStreamingStream name fun request => do
+    let inputs := request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler (RequestContext.ofClientStreamingStreamRequest request) inputs
+    let messages := outputs.mapM fun output =>
       GrpcM.ofExcept <|
         match encode output with
         | .ok value => .ok value
@@ -291,23 +409,7 @@ def registerBidirectionalStreamingCodec [ToString ε] (registry : Registry) (nam
 def registerBidirectionalStreamingStreamCodec [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
     (handler : TypedBidirectionalStreamingStreamHandler α β) : Registry :=
-  registry.registerBidirectionalStreamingStream name fun request => do
-    let inputs := request.messages.mapM fun message =>
-      GrpcM.ofExcept <|
-        match decode message with
-        | .ok value => .ok value
-        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
-    let outputs ← handler inputs
-    let messages := outputs.mapM fun output =>
-      GrpcM.ofExcept <|
-        match encode output with
-        | .ok value => .ok value
-        | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure {
-      metadata := Metadata.empty,
-      messages := messages,
-      status := Status.ok
-    }
+  registry.registerBidirectionalStreamingStreamCodecWithContext name decode encode (fun _ input => handler input)
 
 /-- The first registered entry with the given name, regardless of shape. -/
 def findEntry? (registry : Registry) (name : MethodName) : Option MethodEntry :=
@@ -412,11 +514,6 @@ private def runWithDeadlineUntil (deadline? : Option Nat) (action : GrpcM α) : 
             IO.cancel handlerTask
             pure (.error (Status.deadlineExceeded "gRPC deadline exceeded"))
 
-private def runWithDeadline (timeout? : Option Timeout) (action : GrpcM α) : GrpcM α :=
-  ExceptT.mk do
-    let deadline? ← deadlineFromNow? timeout?
-    (runWithDeadlineUntil deadline? action).run
-
 private def checkSendDataSize (registry : Registry) (data : ByteArray) : GrpcM Unit := do
   match registry.maxSendMessageSize with
   | none => pure ()
@@ -510,7 +607,14 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
   let message : Message := messages[0]!
   if message.compressed != CompressionFlag.identity then
     throw (Status.unimplemented "compressed requests are not supported")
-  pure { method := method, metadata := metadata, timeout := timeout, data := message.data }
+  let deadline? ← deadlineFromNow? timeout
+  pure {
+    method := method,
+    metadata := metadata,
+    timeout := timeout,
+    deadline := deadline?,
+    data := message.data
+  }
 
 private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata) (body : ByteArray) :
     GrpcM ClientStreamingRequest := do
@@ -521,10 +625,12 @@ private def decodeClientStreamingRequest (registry : Registry) (metadata : Metad
   for message in messages do
     if message.compressed != CompressionFlag.identity then
       throw (Status.unimplemented "compressed requests are not supported")
+  let deadline? ← deadlineFromNow? timeout
   pure {
     method := method,
     metadata := metadata,
     timeout := timeout,
+    deadline := deadline?,
     messages := messages.map (fun message => message.data)
   }
 
@@ -538,6 +644,7 @@ private def decodeClientStreamingStreamRequest (metadata : Metadata)
     method := method,
     metadata := metadata,
     timeout := timeout,
+    deadline := deadline?,
     messages := withDeadlineUntil deadline? messages
   }, deadline?)
 
@@ -548,6 +655,7 @@ private def clientStreamingRequestOfStream (request : ClientStreamingStreamReque
     method := request.method,
     metadata := request.metadata,
     timeout := request.timeout,
+    deadline := request.deadline,
     messages := messages
   }
 
@@ -578,14 +686,16 @@ def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
         match registry.findUnary? request.method with
         | some handler => pure handler
         | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-  let response ← runWithDeadline request.timeout (handler request)
+  -- Enforce the same instant the handler is told about, so
+  -- `request.deadline` is authoritative for propagation.
+  let response ← runWithDeadlineUntil request.deadline (handler request)
   validateUnaryResponse registry response
 
 def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none) :
     GrpcM ServerStreamingStreamResponse := do
   let request ← decodeUnaryRequest registry metadata body
-  let deadline? ← deadlineFromNow? request.timeout
+  let deadline? := request.deadline
   let response ← match handler? with
     | some handler => runWithDeadlineUntil deadline? (handler request)
     | none =>

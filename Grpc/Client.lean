@@ -74,6 +74,33 @@ structure CallOptions where
   /-- Raw grpc-timeout header value, e.g. "5S" or "250m". -/
   timeout : Option String := none
 
+namespace CallOptions
+
+/-- Set the call's deadline from a `Timeout`, rather than a raw header value. -/
+def withTimeout (options : CallOptions) (timeout : Timeout) : CallOptions :=
+  { options with timeout := some timeout.render }
+
+/-- Give this call the time still left on an inbound request's deadline.
+
+A handler serving a request with a `grpc-timeout` receives the request's
+absolute deadline as `request.deadline` (or `context.deadline` for a typed
+handler registered with `register*CodecWithContext`); passing it here sends the
+*remaining* time as the downstream `grpc-timeout`, so the downstream server
+cannot outlive the caller's own deadline.
+
+`.error DEADLINE_EXCEEDED` when nothing is left: issuing the call would only
+burn a connection on work whose result can no longer be used, and a handler
+should return that status instead.  A request with no deadline propagates none,
+leaving `options.timeout` untouched. -/
+def propagating (options : CallOptions) (deadline? : Option Nat) :
+    IO (Except Status CallOptions) := do
+  match ← Deadline.remaining? deadline? with
+  | .unbounded => pure (.ok options)
+  | .remaining timeout => pure (.ok (options.withTimeout timeout))
+  | .exceeded => pure (.error Deadline.exceededStatus)
+
+end CallOptions
+
 structure CallResult where
   headers : Metadata := Metadata.empty
   trailers : Metadata := Metadata.empty
