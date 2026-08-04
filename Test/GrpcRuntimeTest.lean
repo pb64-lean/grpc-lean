@@ -127,6 +127,45 @@ partial def waitUntil (message : String) (remainingMilliseconds : Nat) (check : 
     IO.sleep 1
     waitUntil message (remainingMilliseconds - 1) check
 
+/-- Deadline for observing an asynchronous transition. Every wait below polls
+for the observable condition and returns the moment it holds, so a generous
+budget costs nothing on an idle machine and only bounds how long a genuine
+failure takes to report. CI runners execute other repositories' suites
+concurrently, so short fixed windows are not safe here. -/
+def observeTimeoutMs : Nat := 5000
+
+/-- Wait for `task`, polling so that the deadline costs nothing when the task
+finishes early. Racing against a sleeping timeout task would instead keep a
+worker asleep for the whole budget after the race is already decided. -/
+partial def awaitTaskWithin (task : Task (Except IO.Error α)) (remainingMilliseconds : Nat) :
+    IO (Option α) := do
+  if ← IO.hasFinished task then
+    match task.get with
+    | .ok value => pure (some value)
+    | .error err => throw err
+  else if remainingMilliseconds == 0 then
+    pure none
+  else
+    IO.sleep 1
+    awaitTaskWithin task (remainingMilliseconds - 1)
+
+partial def drainToEof (client : Std.Async.TCP.Socket.Client) : IO Unit := do
+  match ← (client.recv? 8192).block with
+  | none => pure ()
+  | some _ => drainToEof client
+
+/-- Wait for the peer's write side to close. Frames already in flight (a final
+GOAWAY, a trailing RST_STREAM) are drained first: the observable guarantee is
+that the stream ends, not that no bytes follow the last assertion. -/
+def expectWriteSideClosed (client : Std.Async.TCP.Socket.Client) (message : String) :
+    IO Unit := do
+  let eofTask ← IO.asTask (drainToEof client)
+  match ← awaitTaskWithin eofTask observeTimeoutMs with
+  | some _ => pure ()
+  | none =>
+      IO.cancel eofTask
+      throw (IO.userError message)
+
 partial def readHttp2FramesFromSocket (client : Std.Async.TCP.Socket.Client)
     (decoder : Http2.Frame.DecodeState) (frames : Array Http2.Frame) (wanted : Nat) :
     IO (Array Http2.Frame) := do
@@ -161,17 +200,11 @@ partial def readHttp2FramesUntilFromSocket (client : Std.Async.TCP.Socket.Client
 
 def readHttp2FramesUntilWithTimeout (client : Std.Async.TCP.Socket.Client)
     (state : ReadHttp2FrameState) (done : Array Http2.Frame -> Bool)
-    (timeoutMs : UInt32) (message : String) : IO ReadHttp2FrameState := do
-  let readTask ← IO.asTask do
-    let state ← readHttp2FramesUntilFromSocket client state done
-    pure (some state)
-  let timeoutTask ← IO.asTask do
-    IO.sleep timeoutMs
-    pure (none : Option ReadHttp2FrameState)
-  match ← IO.waitAny [readTask, timeoutTask] with
-  | .error err => throw err
-  | .ok (some state) => pure state
-  | .ok none =>
+    (timeoutMs : Nat) (message : String) : IO ReadHttp2FrameState := do
+  let readTask ← IO.asTask (readHttp2FramesUntilFromSocket client state done)
+  match ← awaitTaskWithin readTask timeoutMs with
+  | some state => pure state
+  | none =>
       IO.cancel readTask
       throw (IO.userError message)
 
@@ -735,7 +768,7 @@ def testStreamNativeDispatch : IO Unit := do
     runGrpcM (incrementalRegistry.dispatchClientStreamingMessageStream
       incrementalHeaders incrementalProducer.stream)
   runGrpcM (incrementalProducer.send (bytes [6, 7]))
-  waitUntil "stream-native client-streaming handler did not observe first message before close" 100
+  waitUntil "stream-native client-streaming handler did not observe first message before close" observeTimeoutMs
     incrementalSeenFirst.get
   let incrementalResponse ← awaitIoTask incrementalTask
   expectEq incrementalResponse.data (bytes [6, 7])
@@ -1737,7 +1770,7 @@ def testStreamingEncoderEmitsBeforeStreamEnd : IO Unit := do
       emittedRef.modify fun emitted => emitted.append frames)
 
   runGrpcM (producer.send (bytes [1, 2, 3]))
-  waitUntil "streaming encoder did not emit DATA before the stream closed" 100
+  waitUntil "streaming encoder did not emit DATA before the stream closed" observeTimeoutMs
     dataBeforeCloseRef.get
   let emittedBeforeClose ← emittedRef.get
   expect (emittedBeforeClose.any fun frame => frame.header.frameType == Http2.FrameType.data)
@@ -1812,7 +1845,7 @@ def testStreamingDispatchEmitsBeforeStreamEnd : IO Unit := do
               dataBeforeCloseRef.set true
         emittedRef.modify fun emitted => emitted.append frames)
 
-  waitUntil "streaming dispatch did not start the stream handler" 100 do
+  waitUntil "streaming dispatch did not start the stream handler" observeTimeoutMs do
     match ← producerRef.get with
     | none => pure false
     | some _ => pure true
@@ -1820,7 +1853,7 @@ def testStreamingDispatchEmitsBeforeStreamEnd : IO Unit := do
     | some producer => pure producer
     | none => throw (IO.userError "expected dispatch stream producer")
   runGrpcM (producer.send (bytes [4, 4]))
-  waitUntil "streaming dispatch did not emit DATA before the stream closed" 100
+  waitUntil "streaming dispatch did not emit DATA before the stream closed" observeTimeoutMs
     dataBeforeCloseRef.get
   let emittedBeforeClose ← emittedRef.get
   expect (emittedBeforeClose.any fun frame => frame.header.frameType == Http2.FrameType.data)
@@ -1902,7 +1935,7 @@ def testStreamingConnectionEmitsBeforeStreamEnd : IO Unit := do
                 dataBeforeCloseRef.set true
       | .error _ => pure ()
 
-  waitUntil "streaming connection did not start the stream handler" 100 do
+  waitUntil "streaming connection did not start the stream handler" observeTimeoutMs do
     match ← producerRef.get with
     | none => pure false
     | some _ => pure true
@@ -1910,7 +1943,7 @@ def testStreamingConnectionEmitsBeforeStreamEnd : IO Unit := do
     | some producer => pure producer
     | none => throw (IO.userError "expected connection stream producer")
   runGrpcM (producer.send (bytes [7, 7]))
-  waitUntil "streaming connection did not emit DATA before the stream closed" 100
+  waitUntil "streaming connection did not emit DATA before the stream closed" observeTimeoutMs
     dataBeforeCloseRef.get
   let emittedBeforeCloseBytes ← emittedRef.get
   let emittedBeforeClose ← expectStatusOk (Http2.Frame.decodeAll emittedBeforeCloseBytes)
@@ -3083,7 +3116,7 @@ def testMaxConcurrentStreamsCountsDetachedStreamingDispatch : IO Unit := do
   let firstDataResult ← Http2.Connection.processFrameSharedWith
     registry stateMutex requestDataFrame emit
   expectStatusOk firstDataResult
-  waitUntil "detached stream handler did not start for max-concurrent test" 100 do
+  waitUntil "detached stream handler did not start for max-concurrent test" observeTimeoutMs do
     match ← producerRef.get with
     | some _ => pure true
     | none => pure false
@@ -3100,7 +3133,7 @@ def testMaxConcurrentStreamsCountsDetachedStreamingDispatch : IO Unit := do
     | some producer => pure producer
     | none => throw (IO.userError "expected max-concurrent producer")
   runGrpcM producer.close
-  waitUntil "detached stream did not finish for max-concurrent test" 100 do
+  waitUntil "detached stream did not finish for max-concurrent test" observeTimeoutMs do
     let state ← stateMutex.atomically get
     pure state.activeDispatches.isEmpty
 
@@ -3150,7 +3183,7 @@ def testStreamNativeContentLengthEnforced : IO Unit := do
     emittedRef.modify fun emitted => emitted.append frames
   expectStatusOk (← Http2.Connection.processFrameSharedWith registry stateMutex requestHeadersFrame emit)
   expectStatusOk (← Http2.Connection.processFrameSharedWith registry stateMutex requestDataFrame emit)
-  waitUntil "stream-native request DATA exceeding content-length did not emit trailers" 100 do
+  waitUntil "stream-native request DATA exceeding content-length did not emit trailers" observeTimeoutMs do
     let emitted ← emittedRef.get
     pure <| emitted.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
@@ -3186,7 +3219,7 @@ def testStreamNativeContentLengthEnforced : IO Unit := do
     registry shortStateMutex shortRequestHeadersFrame shortEmit)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry shortStateMutex requestDataFrame shortEmit)
-  waitUntil "stream-native request ending before content-length did not emit trailers" 100 do
+  waitUntil "stream-native request ending before content-length did not emit trailers" observeTimeoutMs do
     let emitted ← shortEmittedRef.get
     pure <| emitted.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
@@ -3234,7 +3267,7 @@ def testStreamNativeContentLengthEnforced : IO Unit := do
   let earlyStateMutex ← Std.Mutex.new (Http2.Connection.initialState)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     earlyRegistry earlyStateMutex earlyRequestHeadersFrame earlyEmit)
-  waitUntil "headers-only content-length mismatch did not emit gRPC trailers" 100 do
+  waitUntil "headers-only content-length mismatch did not emit gRPC trailers" observeTimeoutMs do
     pure (!(← earlyEmittedRef.get).isEmpty)
   expect (!(← earlyCalledRef.get))
     "headers-only content-length mismatch should reject before invoking the handler"
@@ -3296,7 +3329,7 @@ def testStreamNativePaddedDataUsesUnpaddedContentLength : IO Unit := do
   let emittedCount := (← emittedRef.get).size
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex requestDataFrame emit)
-  waitUntil "padded stream-native request did not emit response trailers" 100 do
+  waitUntil "padded stream-native request did not emit response trailers" observeTimeoutMs do
     let emitted ← emittedRef.get
     pure <| emitted.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
@@ -3429,7 +3462,7 @@ def testEarlyInvalidHeadersIgnoreRequestBody : IO Unit := do
   let stateMutex ← Std.Mutex.new (Http2.Connection.initialState)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex requestHeadersFrame emit)
-  waitUntil "invalid request headers did not emit early response" 100 do
+  waitUntil "invalid request headers did not emit early response" observeTimeoutMs do
     pure (!(← emittedRef.get).isEmpty)
   expect (!(← calledRef.get))
     "invalid request headers should reject before invoking unary handler"
@@ -3512,7 +3545,7 @@ def testEarlyHttpStatusOnlyRejectionIgnoreRequestBody : IO Unit := do
   let stateMutex ← Std.Mutex.new (Http2.Connection.initialState)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex requestHeadersFrame emit)
-  waitUntil "non-gRPC request headers did not emit early HTTP status response" 100 do
+  waitUntil "non-gRPC request headers did not emit early HTTP status response" observeTimeoutMs do
     pure (!(← emittedRef.get).isEmpty)
   expect (!(← calledRef.get))
     "non-gRPC request headers should reject before invoking unary handler"
@@ -3582,7 +3615,7 @@ def testEarlyUnknownMethodIgnoreRequestBody : IO Unit := do
   let stateMutex ← Std.Mutex.new (Http2.Connection.initialState)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex requestHeadersFrame emit)
-  waitUntil "unknown method headers did not emit early gRPC status" 100 do
+  waitUntil "unknown method headers did not emit early gRPC status" observeTimeoutMs do
     pure (!(← emittedRef.get).isEmpty)
   expect (!(← calledRef.get))
     "unknown method headers should reject before invoking any registered handler"
@@ -3658,7 +3691,7 @@ def testEarlyRejectedStreamResetClearsIgnoredBody : IO Unit := do
   let stateMutex ← Std.Mutex.new (Http2.Connection.initialState)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex requestHeadersFrame emit)
-  waitUntil "early rejected stream did not emit response before RST_STREAM" 100 do
+  waitUntil "early rejected stream did not emit response before RST_STREAM" observeTimeoutMs do
     pure (!(← emittedRef.get).isEmpty)
   expect (!(← calledRef.get))
     "early rejected stream should not invoke the unary handler before reset"
@@ -3728,7 +3761,7 @@ def testStreamNativeMalformedDataReturnsGrpcStatus : IO Unit := do
     registry stateMutex requestHeadersFrame emit)
   expectStatusOk (← Http2.Connection.processFrameSharedWith
     registry stateMutex compressedDataFrame emit)
-  waitUntil "malformed request DATA did not emit gRPC trailers" 100 do
+  waitUntil "malformed request DATA did not emit gRPC trailers" observeTimeoutMs do
     let emitted ← emittedRef.get
     pure <| emitted.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
@@ -3745,7 +3778,7 @@ def testStreamNativeMalformedDataReturnsGrpcStatus : IO Unit := do
     "expected malformed request gRPC trailer block"
   expectEq (Metadata.get? trailers.headers "grpc-status") (some "13")
     "compressed-flag stream-native request DATA without grpc-encoding should return INTERNAL"
-  waitUntil "malformed stream-native request DATA did not finish the active dispatch" 100 do
+  waitUntil "malformed stream-native request DATA did not finish the active dispatch" observeTimeoutMs do
     let state ← stateMutex.atomically get
     pure state.activeDispatches.isEmpty
   let state ← stateMutex.atomically get
@@ -4182,7 +4215,7 @@ def testHttp2ServeManagedLifecycle : IO Unit := do
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let stateAfterResponse ← readHttp2FramesUntilWithTimeout client {} hasResponseTrailers 500
+  let stateAfterResponse ← readHttp2FramesUntilWithTimeout client {} hasResponseTrailers observeTimeoutMs
     "managed h2c server did not complete unary response"
   expectEq stateAfterResponse.frames[0]!.header.frameType Http2.FrameType.settings
     "managed h2c server preface should be SETTINGS"
@@ -4199,7 +4232,7 @@ def testHttp2ServeManagedLifecycle : IO Unit := do
   expect (← Grpc.Server.isShutdown server) "managed h2c server should report shutdown"
   let hasGoAway (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway
-  let stateAfterGoAway ← readHttp2FramesUntilWithTimeout client stateAfterResponse hasGoAway 500
+  let stateAfterGoAway ← readHttp2FramesUntilWithTimeout client stateAfterResponse hasGoAway observeTimeoutMs
     "managed h2c server shutdown did not emit GOAWAY"
   let goAway ← match stateAfterGoAway.frames.find? (fun frame =>
       frame.header.frameType == Http2.FrameType.goAway) with
@@ -4227,7 +4260,7 @@ def testHttp2ServeManagedLifecycle : IO Unit := do
   let hasRefusedStream (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.rstStream && frame.header.streamId == 3
-  let stateAfterRefused ← readHttp2FramesUntilWithTimeout client stateAfterGoAway hasRefusedStream 500
+  let stateAfterRefused ← readHttp2FramesUntilWithTimeout client stateAfterGoAway hasRefusedStream observeTimeoutMs
     "managed h2c server did not refuse post-GOAWAY stream"
   let refused ← match stateAfterRefused.frames.find? (fun frame =>
       frame.header.frameType == Http2.FrameType.rstStream && frame.header.streamId == 3) with
@@ -4243,21 +4276,9 @@ def testHttp2ServeManagedLifecycle : IO Unit := do
   let waitTask ← IO.asTask do
     Grpc.Server.wait server
     stopped.set true
-  waitUntil "managed h2c server wait did not finish after active RPCs drained" 500 stopped.get
+  waitUntil "managed h2c server wait did not finish after active RPCs drained" observeTimeoutMs stopped.get
   awaitIoTask waitTask
-  let eofTask ← IO.asTask do
-    let chunk? ← (client.recv? 8192).block
-    pure (some chunk?)
-  let timeoutTask ← IO.asTask do
-    IO.sleep 500
-    pure (none : Option (Option ByteArray))
-  match ← IO.waitAny [eofTask, timeoutTask] with
-  | .error err => throw err
-  | .ok (some none) => pure ()
-  | .ok (some (some _)) =>
-      throw (IO.userError "managed h2c server should close its write side after wait")
-  | .ok none =>
-      throw (IO.userError "managed h2c server did not close its write side after wait")
+  expectWriteSideClosed client "managed h2c server did not close its write side after wait"
   (client.shutdown).block
 
 def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
@@ -4308,7 +4329,7 @@ def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
     |>.append requestHeadersWire
     |>.append requestDataWire)).block
 
-  waitUntil "h2c open-stream handler did not start" 100 do
+  waitUntil "h2c open-stream handler did not start" observeTimeoutMs do
     match ← producerRef.get with
     | none => pure false
     | some _ => pure true
@@ -4323,7 +4344,7 @@ def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
   let hasPingAck (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.ping && Http2.Ping.isAck frame
-  let stateAfterPing ← readHttp2FramesUntilWithTimeout client {} hasPingAck 200
+  let stateAfterPing ← readHttp2FramesUntilWithTimeout client {} hasPingAck observeTimeoutMs
     "h2c server did not ACK PING while response stream was open"
   let pingAck ← match stateAfterPing.frames.find? (fun frame =>
       frame.header.frameType == Http2.FrameType.ping && Http2.Ping.isAck frame) with
@@ -4342,7 +4363,7 @@ def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
         && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let finalState ← readHttp2FramesUntilWithTimeout client stateAfterPing done 200
+  let finalState ← readHttp2FramesUntilWithTimeout client stateAfterPing done observeTimeoutMs
     "h2c server did not finish response stream after producer close"
   let responseMessages ← expectStatusOk (Message.decodeAll (dataPayloads finalState.frames))
   expectEq responseMessages.size 1 "h2c open stream should emit one produced response message"
@@ -4402,7 +4423,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
     |>.append requestHeadersWire
     |>.append requestDataWire)).block
 
-  waitUntil "h2c flow-controlled stream handler did not start" 100 do
+  waitUntil "h2c flow-controlled stream handler did not start" observeTimeoutMs do
     match ← producerRef.get with
     | none => pure false
     | some _ => pure true
@@ -4415,7 +4436,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders 500
+  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders observeTimeoutMs
     "h2c flow-controlled stream did not emit initial response headers"
 
   let responseData := bytes [4, 4, 4]
@@ -4429,7 +4450,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
   let hasPingAck (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.ping && Http2.Ping.isAck frame
-  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck 500
+  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck observeTimeoutMs
     "h2c server did not ACK PING while active response DATA was flow-control blocked"
   expect (!stateAfterPing.frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.data && frame.header.streamId == 1)
@@ -4441,7 +4462,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
   let hasResponseData (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.data && frame.header.streamId == 1
-  let stateAfterWindow ← readHttp2FramesUntilWithTimeout client stateAfterPing hasResponseData 500
+  let stateAfterWindow ← readHttp2FramesUntilWithTimeout client stateAfterPing hasResponseData observeTimeoutMs
     "h2c WINDOW_UPDATE did not flush active response DATA"
   let responseMessages ← expectStatusOk (Message.decodeAll (dataPayloads stateAfterWindow.frames))
   expect (responseMessages.any fun message => message.data == responseData)
@@ -4453,7 +4474,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  discard <| readHttp2FramesUntilWithTimeout client stateAfterWindow hasTrailers 500
+  discard <| readHttp2FramesUntilWithTimeout client stateAfterWindow hasTrailers observeTimeoutMs
     "h2c flow-controlled stream did not emit trailers after producer close"
 
   (client.shutdown).block
@@ -4508,7 +4529,7 @@ def testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream : IO Unit := do
   let hasResponseData (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.data && frame.header.streamId == 1
-  let stateAfterFirstData ← readHttp2FramesUntilWithTimeout client {} hasResponseData 500
+  let stateAfterFirstData ← readHttp2FramesUntilWithTimeout client {} hasResponseData observeTimeoutMs
     "h2c bidi stream did not emit response DATA before client END_STREAM"
   let responseMessages ← expectStatusOk (Message.decodeAll (dataPayloads stateAfterFirstData.frames))
   expect (responseMessages.any fun message => message.data == bytes [1, 2, 7])
@@ -4536,7 +4557,7 @@ def testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream : IO Unit := do
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let finalState ← readHttp2FramesUntilWithTimeout client stateAfterFirstData hasTrailers 500
+  let finalState ← readHttp2FramesUntilWithTimeout client stateAfterFirstData hasTrailers observeTimeoutMs
     "h2c bidi stream did not emit trailers after client END_STREAM"
   let allMessages ← expectStatusOk (Message.decodeAll (dataPayloads finalState.frames))
   expect (allMessages.any fun message => message.data == bytes [3, 4, 7])
@@ -4596,19 +4617,19 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
     |>.append requestHeadersWire
     |>.append requestDataWire)).block
 
-  waitUntil "h2c cancel-stream handler did not start" 100 startedRef.get
+  waitUntil "h2c cancel-stream handler did not start" observeTimeoutMs startedRef.get
   let hasInitialResponseHeaders (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders 200
+  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders observeTimeoutMs
     "h2c cancel-stream response did not emit initial headers"
 
   let rst ← expectStatusOk (Http2.RstStream.frame 1 Http2.ErrorCode.cancel)
   let rstWire ← expectStatusOk (Http2.Frame.encode rst)
   (client.send rstWire).block
-  waitUntil "h2c RST_STREAM did not cancel the active response stream" 200 cancelledRef.get
+  waitUntil "h2c RST_STREAM did not cancel the active response stream" observeTimeoutMs cancelledRef.get
 
   let pingPayload := bytes [1, 2, 3, 4, 5, 6, 7, 8]
   let ping ← expectStatusOk (Http2.Ping.frame pingPayload)
@@ -4617,7 +4638,7 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
   let hasPingAck (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.ping && Http2.Ping.isAck frame
-  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck 200
+  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck observeTimeoutMs
     "h2c server did not continue processing after RST_STREAM cancellation"
   expect (!stateAfterPing.frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
@@ -4638,7 +4659,7 @@ def testHttp2H2CServerCancelsStreamOnDisconnect : IO Unit := do
     startedRef.set true
     let producer ← MessageStream.pipe (α := ByteArray) (capacity := some 1)
     let producerTask ← IO.asTask do
-      waitUntil "h2c disconnect test did not release producer send" 1000 attemptSendRef.get
+      waitUntil "h2c disconnect test did not release producer send" observeTimeoutMs attemptSendRef.get
       let result ← (producer.send (bytes [5, 5, 5])).run
       producerSendResultRef.set (some result)
     producerTaskRef.set (some producerTask)
@@ -4684,19 +4705,19 @@ def testHttp2H2CServerCancelsStreamOnDisconnect : IO Unit := do
     |>.append requestHeadersWire
     |>.append requestDataWire)).block
 
-  waitUntil "h2c disconnect handler did not start" 100 startedRef.get
+  waitUntil "h2c disconnect handler did not start" observeTimeoutMs startedRef.get
   let hasInitialResponseHeaders (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  discard <| readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders 200
+  discard <| readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders observeTimeoutMs
     "h2c disconnect response did not emit initial headers"
 
   (client.shutdown).block
   awaitIoTask serverTask
   attemptSendRef.set true
-  waitUntil "h2c disconnect did not close the producer-backed response stream" 500 do
+  waitUntil "h2c disconnect did not close the producer-backed response stream" observeTimeoutMs do
     match ← producerSendResultRef.get with
     | some _ => pure true
     | none => pure false
@@ -4722,7 +4743,7 @@ def testHttp2H2CServerCancelsPipeStreamOnRst : IO Unit := do
     startedRef.set true
     let producer ← MessageStream.pipe (α := ByteArray) (capacity := some 1)
     let producerTask ← IO.asTask do
-      waitUntil "h2c cancel-pipe test did not release producer send" 1000 attemptSendRef.get
+      waitUntil "h2c cancel-pipe test did not release producer send" observeTimeoutMs attemptSendRef.get
       let result ← (producer.send (bytes [9, 9, 9])).run
       producerSendResultRef.set (some result)
     producerTaskRef.set (some producerTask)
@@ -4768,13 +4789,13 @@ def testHttp2H2CServerCancelsPipeStreamOnRst : IO Unit := do
     |>.append requestHeadersWire
     |>.append requestDataWire)).block
 
-  waitUntil "h2c cancel-pipe handler did not start" 100 startedRef.get
+  waitUntil "h2c cancel-pipe handler did not start" observeTimeoutMs startedRef.get
   let hasInitialResponseHeaders (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.headers
         && frame.header.streamId == 1
         && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders 200
+  let stateAfterHeaders ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders observeTimeoutMs
     "h2c cancel-pipe response did not emit initial headers"
 
   let rst ← expectStatusOk (Http2.RstStream.frame 1 Http2.ErrorCode.cancel)
@@ -4787,10 +4808,10 @@ def testHttp2H2CServerCancelsPipeStreamOnRst : IO Unit := do
   let hasPingAck (frames : Array Http2.Frame) : Bool :=
     frames.any fun frame =>
       frame.header.frameType == Http2.FrameType.ping && Http2.Ping.isAck frame
-  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck 200
+  let stateAfterPing ← readHttp2FramesUntilWithTimeout client stateAfterHeaders hasPingAck observeTimeoutMs
     "h2c server did not continue processing after pipe-backed RST_STREAM cancellation"
   attemptSendRef.set true
-  waitUntil "h2c RST_STREAM did not close the producer-backed response stream" 500 do
+  waitUntil "h2c RST_STREAM did not close the producer-backed response stream" observeTimeoutMs do
     match ← producerSendResultRef.get with
     | some _ => pure true
     | none => pure false
