@@ -863,7 +863,7 @@ private def requestStreamingDispatchForStream? (state : State)
 headers: the buffered stream is dropped and the stream id is either forgotten
 entirely (the request already carried END_STREAM) or put in drain-only mode
 so later DATA is consumed without dispatch.  See the authorization-before-body
-groundwork section at the end of this file for the properties proved about
+properties section at the end of this file for the theorems about
 this transition. -/
 def rejectStreamAtHeaders (state : State) (streamId : Nat)
     (inboundHpack outboundHpack : Hpack.State) (endStream : Bool) : State :=
@@ -2175,7 +2175,7 @@ def processFrameWith (registry : Registry) (state : State) (frame : Frame)
 /-- The pure bookkeeping `processHeadersShared` performs before the `IO`
 authorizer call: stream-id validation, buffering the header frame, and
 claiming the stream id.  Factored out so the authorization-before-body
-groundwork (end of file) can reason about HEADERS steps without touching
+properties (end of file) can cover HEADERS steps without touching
 `IO`. -/
 def prepareHeadersShared (state : State) (frame : Frame) :
     Except Status (State × Option Frame) := do
@@ -2362,7 +2362,7 @@ RFC 9113 §6.1: "If a DATA frame is received whose stream is not in the 'open'
 or 'half-closed (local)' state, the recipient MUST respond with a stream error
 (Section 5.4.2) of type STREAM_CLOSED."  This is the common case in practice —
 a client that races an extra DATA frame against the END_STREAM it already sent,
-or against our RST_STREAM — and it used to kill the whole connection.
+or against our RST_STREAM. The error is scoped to that stream.
 
 The frame is drained through `processResetInboundData` *before* the RST_STREAM
 is emitted. Only the connection window is credited: the stream is already
@@ -2444,7 +2444,7 @@ def processDataShared (registry : Registry) (state : State) (frame : Frame) :
 
 /-- The pure shared-kernel step for every frame type that does not require the
 `IO` authorizer (i.e. everything except HEADERS/CONTINUATION).  Factored out of
-`processFrameShared` so the authorization-before-body groundwork (end of file)
+`processFrameShared` so the authorization-before-body properties (end of file)
 can state trace theorems over arbitrary non-header frame steps. -/
 def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) := do
@@ -2682,9 +2682,9 @@ def processBytesEncoded (registry : Registry) (state : State) (chunk : ByteArray
   | .error status => pure (.error status)
 
 /-!
-## Authorization-before-body groundwork
+## Authorization-before-body properties
 
-Target trace property: over any frame sequence processed by a connection, a
+Trace property: over any frame sequence processed by a connection, a
 stream whose request headers were rejected (authorization failure, invalid
 headers, or unknown method) never feeds body bytes to a handler and never
 dispatches one.
@@ -2709,9 +2709,8 @@ implementations:
   — the trace-level statement: over any pure DATA trace for a rejected
   stream, every step is dispatch-free and the stream ends inert.
 
-Beyond the DATA-only trace, the shared kernel's remaining frame paths are
-covered further below (`flushOutbound` is now total, so SETTINGS and
-WINDOW_UPDATE steps are provable):
+The shared kernel's other frame paths are covered by the following theorems
+(`flushOutbound` is total, including for SETTINGS and WINDOW_UPDATE steps):
 
 * `processNonHeaderFrameShared_inert` / `FrameTrace.inert_no_dispatch` /
   `rejectStreamAtHeaders_frameTrace_no_dispatch` — the generalized trace:
@@ -2729,16 +2728,15 @@ WINDOW_UPDATE steps are provable):
   `processContinuationShared_inert_error` — a CONTINUATION frame naming an
   inert stream id is likewise a connection error (no buffered header block).
 
-Remaining obligation for the full connection-level property (identified, not
-yet proved):
+Scope boundary for the full connection-level property:
 
 * The `IO` layer (`processFrameSharedWith`) only spawns dispatch tasks for
   the `detached`/`requestStreaming`/`requestFeeds` artifacts shown empty
-  above, so the pure results extend to the task layer by inspection; making
-  that formal needs an `IO`-free event-trace refactor of the spawn sites.
+  above. The formal trace covers the pure results, not the task layer, because
+  the spawn sites do not expose an `IO`-free event trace.
 * DATA frames for *other* (live) streams legitimately produce request feeds
-  for those streams; extending the trace conclusion to arbitrary interleaved
-  DATA needs stream identity attached to `RequestStreamFeed` artifacts.
+  for those streams. The trace conclusion excludes arbitrary interleaved DATA
+  because `RequestStreamFeed` artifacts do not carry stream identity.
 -/
 
 /-- `true` when the connection is draining a request body without dispatch,
@@ -3125,7 +3123,7 @@ private theorem DataTrace.inert_no_dispatch {registry : Registry}
                 simp
             | tail _ hstep => exact ihres.2 step hstep
 
-/-- Groundwork headline: when request-header authorization rejects a stream
+/-- When request-header authorization rejects a stream
 whose body is still open, any pure DATA trace for that stream drains without
 producing any dispatch work, and the stream ends (and stays) inert. -/
 private theorem rejectStreamAtHeaders_dataTrace_no_dispatch
@@ -4731,11 +4729,10 @@ theorem prepareHeadersShared_no_reopen {state : State} {frame : Frame}
   have := prepareHeadersShared_gt_lastClientStreamId heq
   omega
 
-/-- `SETTINGS_MAX_CONCURRENT_STREAMS` still bounds what can be served, even
-though exceeding it is now a stream error rather than a connection error: a
-HEADERS frame that opens a new stream either arrives with the number of active
-inbound streams strictly below the advertised limit, or the stream it opens is
-marked for RST_STREAM(REFUSED_STREAM).
+/-- `SETTINGS_MAX_CONCURRENT_STREAMS` bounds what can be served while treating
+an excess stream as a stream error: a HEADERS frame that opens a stream either
+arrives with the number of active inbound streams strictly below the advertised
+limit, or the stream it opens is marked for RST_STREAM(REFUSED_STREAM).
 
 RFC 9113 §5.1.2 prescribes the stream error; the stream is opened only so its
 field block reaches the HPACK decoder, which §4.3 requires of every field block

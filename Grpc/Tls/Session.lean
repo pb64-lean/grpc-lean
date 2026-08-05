@@ -284,10 +284,10 @@ def establishWithLeftover (socket : TCP.Socket.Client) (config : Client.Config)
     writer := writer
   }, leftover)
 
-/-- Compatibility entry point for callers written before handshake application
-plaintext was surfaced. New code should use `establishWithLeftover`; this wrapper
-cannot preserve 0.5-RTT bytes and is retained only to avoid an abrupt source
-break for consumers whose peer never sends application data with its Finished. -/
+/-- Deprecated session-only entry point. This wrapper discards application
+plaintext coalesced with the peer's Finished flight, so its contract is valid
+only when the peer cannot send such data. Callers that accept 0.5-RTT data must
+use `establishWithLeftover`. -/
 @[deprecated establishWithLeftover (since := "2026-08-05")]
 def establish (socket : TCP.Socket.Client) (config : Client.Config)
     (readSize : UInt64 := 16384) : Async ClientSession := do
@@ -375,9 +375,9 @@ def establishWithLeftover (socket : TCP.Socket.Client) (config : Server.Config)
   pure ({ socket := socket, state := stateMutex, outbound := outbound, writer := writer },
     leftover)
 
-/-- Compatibility entry point for pre-leftover callers. New servers must use
-`establishWithLeftover` when a client may coalesce its first application record
-with its TLS Finished flight. -/
+/-- Deprecated session-only entry point. This wrapper discards application
+plaintext coalesced with the client's Finished flight. Servers whose clients
+may coalesce an application record must use `establishWithLeftover`. -/
 @[deprecated establishWithLeftover (since := "2026-08-05")]
 def establish (socket : TCP.Socket.Client) (config : Server.Config)
     (readSize : UInt64 := 16384) (stopToken : Option Std.CancellationToken := none) :

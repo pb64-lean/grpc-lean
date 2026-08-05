@@ -174,52 +174,24 @@ private def ofStatusExcept (result : Except Status α) : IO α :=
 abandons the attempt and lets the handle go. -/
 private def closeFlushTimeoutMs : Nat := 200
 
-/-- Connection teardown: retire the socket at the end of a connection instead of
-leaving it to handle finalization.
+/-- Connection teardown uses bounded, asynchronous write-side shutdown.
 
-A real `close(2)` (`uv_close`) would be the right primitive — it is immediate, it
-discards whatever is still queued, and it is not a half-close, so a peer that
-stopped reading cannot stall it. `Std.Async.TCP` in Lean 4.31 exposes no such
-operation (`Std.Internal.UV.TCP.Socket` has `shutdown` but no `close`), and the
-handle layout needed to call `uv_close` through FFI is not part of the published
-runtime ABI, so the write-side shutdown is all that is reachable from Lean.
+`Std.Async.TCP` in Lean 4.31 exposes `shutdown` but no full `close` operation.
+The internal socket API likewise has no `uv_close` binding, and its handle
+layout is not part of the published runtime ABI. Write-side shutdown is
+therefore the strongest transport-retirement operation available here.
 
-The hazard the previous no-op was avoiding was never `uv_shutdown` itself, it was
-`.block`: parking a worker thread on a `uv_shutdown` that a non-reading peer can
-stall indefinitely leaks a worker per closed connection and hangs process exit.
-This version cannot do that. It stays in `Async`, where waiting suspends
-cooperatively and holds no worker, and it races the shutdown against a timer, so
-a stalled peer costs one abandoned promise and `closeFlushTimeoutMs`, never a
-thread and never an unbounded wait. In the ordinary case the peer gets a prompt,
-attributable FIN right behind the GOAWAY instead of an EOF at an arbitrary later
-finalization.
+The shutdown stays in `Async`, so waiting suspends cooperatively without
+occupying a worker. Racing it against `closeFlushTimeoutMs` prevents a peer
+that has stopped reading from causing an unbounded teardown wait. In the
+ordinary case, the peer receives an attributable FIN behind the GOAWAY.
 
-What the losing branch costs, precisely, and what a real `close` would fix.
-`Async.race` does not cancel the loser — it documents that the other task "will
-continue the execution until the end" — so when the timer wins, the
-`client.shutdown` task stays alive awaiting the promise `uv_shutdown` resolves.
-`uv_shutdown` completes only once the send queue drains, which a peer holding
-its receive window shut can defer for as long as the kernel keeps
-retransmitting. So this branch leaves exactly one suspended task per stalled
-peer: no worker, no timer, and bounded by one per closed connection — but that
-task holds a reference to the `Client`, so the descriptor is released by
-finalization once `uv_shutdown` eventually completes or fails, not at the
-teardown point. Prompt FIN is achieved; deterministic fd release is not.
-
-`Std.Internal.UV.TCP.Socket` in Lean 4.31 exposes `new`, `connect`, `send`,
-`recv?`, `waitReadable`, `cancelRecv`, `bind`, `listen`, `accept`, `tryAccept`,
-`cancelAccept`, `shutdown`, `getPeerName`, `getSockName`, `noDelay`,
-`keepAlive`. There is no `close`; `cancelRecv`/`cancelAccept` cancel a pending
-read or accept but do not retire the handle.
-
-The upstream ask is one operation — `Socket.close : Socket → IO Unit` over
-`uv_close` — which removes both residues at once. It is unconditional, so there
-is nothing to await and no task to abandon and no timer to race. It discards
-queued writes and cancels outstanding requests instead of draining them, so a
-peer that stopped reading cannot defer it. It is a full close rather than a
-half-close. And it releases the descriptor in the same loop iteration, making fd
-release deterministic at the teardown point. Given it, this whole function
-collapses to that single call. -/
+`Async.race` does not cancel its losing branch. If the timer wins, one
+`client.shutdown` task per stalled peer can remain suspended until
+`uv_shutdown` completes or fails. The task holds the `Client`, so descriptor
+release occurs through finalization rather than at the teardown point. The
+contract therefore provides bounded cooperative teardown and best-effort FIN,
+but not deterministic descriptor release. -/
 private def closeConnectionSocket (client : TCP.Socket.Client) : Std.Async.Async Unit := do
   try
     Std.Async.Async.race
@@ -462,8 +434,7 @@ private def connectionTaskSnapshot (server : Server) : IO (Array ConnectionTask)
   | some tasksMutex => tasksMutex.atomically get
 
 /-- Observe and remove completed owners without ever blocking while holding the
-registry mutex.  Connection-level transport failures remain connection-local,
-matching the historical detached-task behavior. -/
+registry mutex. Connection-level transport failures remain connection-local. -/
 private def pruneFinishedConnectionTasks (server : Server) : IO Unit := do
   let owners ← connectionTaskSnapshot server
   let mut finishedIds := #[]

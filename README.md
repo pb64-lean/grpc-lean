@@ -33,7 +33,7 @@ flowchart TB
 | Area | Status |
 | --- | --- |
 | RPC shapes | Unary, server-streaming, client-streaming, bidirectional — each in a batched (`Array`) and an incremental `MessageStream` variant, with raw-`ByteArray` and typed-codec registration (`registerUnary` … `registerBidirectionalStreamingStreamCodec`) |
-| Deadlines | Server-enforced from `grpc-timeout`: expiry cancels the handler task and returns `DEADLINE_EXCEEDED`. The absolute deadline reaches the handler as `request.deadline` (or `context.deadline`, via the additive `register*CodecWithContext` variants for typed handlers), and `CallOptions.propagating` turns what is left of it into a downstream call's `grpc-timeout` — or `DEADLINE_EXCEEDED` when nothing is left. No default deadline: a request without `grpc-timeout` still runs unbounded |
+| Deadlines | Server-enforced from `grpc-timeout`: expiry cancels the handler task and returns `DEADLINE_EXCEEDED`. The absolute deadline reaches the handler as `request.deadline` (or `context.deadline` via the `register*CodecWithContext` variants for typed handlers), and `CallOptions.propagating` turns what is left of it into a downstream call's `grpc-timeout` — or `DEADLINE_EXCEEDED` when nothing is left. No default deadline: a request without `grpc-timeout` runs unbounded |
 | Early authorization | `Registry.withRequestHeaderAuthorizer` runs after header validation and **before any request body is accepted**; rejected streams get a trailers-only status while the body is drained without dispatch |
 | Message limits | Per-registry and per-client send/receive caps (`RESOURCE_EXHAUSTED`); 4 MiB default |
 | Compression | gzip both directions (see below) |
@@ -41,7 +41,7 @@ flowchart TB
 | Health | `grpc.health.v1.Health` `Check` + `Watch`, per-service status, terminal shutdown |
 | Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
-| Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout — over both h2c and TLS |
+| Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses streams beyond the GOAWAY boundary with `REFUSED_STREAM`, and `wait` drains with a timeout — over both h2c and TLS |
 | Connection lifecycle | Every managed plaintext/TLS teardown records one `CloseCause`, with the last 64 readable from `Grpc.Server.closedConnections`. Once HTTP/2 is established and the peer is still readable, teardown makes a best-effort GOAWAY carrying that cause (sealed through TLS); a peer that already closed, or a connection still in TLS handshake, cannot receive one. After shutdown, exact connection owners are observed with a finite bound but never cancelled out from under nested work: timeout leaves the owner and connection registered and returns an ownership error. `acceptFailure?`/`checkAccepting` expose the accept loop while it runs |
 | Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and take request/response stream callbacks exactly once; each handler and arbitrary callback remains beneath the exact connection owner until it finishes. Handler exceptions become gRPC statuses |
 | Error scope | Framing failures are split per RFC 9113 §5.4. Newly invalid DATA on a previously closed stream, HEADERS over `MAX_CONCURRENT_STREAMS`, an open stream exceeding its own receive window, or a PRIORITY frame whose length is not 5 octets (§6.3, FRAME_SIZE_ERROR) answer RST_STREAM while the connection keeps serving. Once a stream has been locally reset, late in-flight DATA is absorbed with connection-only flow credit and no repeat reset, and late field blocks are HPACK-decoded before being discarded. Connection errors — preface violation, CONTINUATION sequencing, stream-id monotonicity, connection-window overflow, or an undecodable field block — still end the connection with GOAWAY. Well-formed deprecated PRIORITY dependency semantics are ignored, including on idle streams; PRIORITY on stream 0 stays connection-fatal. Every connection-scoped check names the RFC rule it follows, and a header refusal is deferred until HPACK has consumed the complete field block |
@@ -101,9 +101,9 @@ worker, and the file descriptor is released by finalization only when
 bounded ownership rule: its TLS continuation ends on shutdown, but the
 uncancellable native send promise can remain. Lean 4.31's
 `Std.Internal.UV.TCP.Socket` offers `shutdown` but no `close`, so prompt FIN is
-best-effort and deterministic fd release is not; a single `Socket.close` over
-`uv_close` would remove both residues, and the rationale in
-`Grpc/Http2/Server.lean` states that ask in full.
+best-effort. A timed-out `uv_shutdown` can retain descriptor ownership until it
+settles. Deterministic descriptor release at the teardown point is outside the
+available transport contract because it requires `uv_close`.
 
 A complete server (all four RPC shapes plus reflection) is
 `examples/lean_proto/NoteServer.lean`:
@@ -174,7 +174,7 @@ Implemented and tested:
   size-update handling, Huffman encoding and decoding;
   `authorization`/`proxy-authorization` are always emitted never-indexed.
 
-Deliberately out of scope or ignored (a candid list):
+Unsupported or intentionally ignored:
 
 - `PUSH_PROMISE` is rejected (`UNIMPLEMENTED`); the client fails the
   connection if a server pushes.
@@ -191,7 +191,7 @@ Deliberately out of scope or ignored (a candid list):
   the same connection cannot progress until it returns. This is deliberate
   exact ownership, not per-stream retirement concurrency.
 - No HTTP/1.1 → h2c upgrade; plaintext is prior-knowledge h2c only.
-- Outbound plaintext and TLS writer channels are currently unbounded; flow
+- Outbound plaintext and TLS writer channels are unbounded; flow
   control bounds DATA progress, but sustained encoded control/response
   production can still grow those queues.
 - Transport retirement cooperatively drains each connection's sole writer,
@@ -235,19 +235,20 @@ handshakes with **grpcurl** (Go `crypto/tls`) and **OpenSSL `s_client`**,
 negotiating ALPN `h2` and running gRPC over the result (see
 [Interoperability status](#interoperability-status)).
 
-Current limitations:
+TLS limitations:
 
 - One suite, one group, one signature algorithm: a client that offers none of
   them (for example an FIPS-restricted or TLS 1.2-only client) gets a
   handshake failure rather than a fallback.
-- Server-initiated keepalive PINGs are plaintext-only: `keepaliveIntervalMs`
-  is not yet armed on the TLS accept path (its PING would have to be sealed
-  through the session). Cause-carrying teardown, connection registration and
-  the graceful-shutdown drain do apply to TLS.
+- Server-initiated keepalive PINGs are plaintext-only. The TLS accept path does
+  not schedule `keepaliveIntervalMs`, because its PING would have to be sealed
+  through the session. Cause-carrying teardown, connection registration and
+  the graceful-shutdown drain apply to TLS.
 
 ## Interoperability status
 
-Honest summary: there is no official gRPC interop-suite or h2spec run yet.
+The validation contract does not include the official gRPC interop suite or an
+h2spec conformance run.
 
 - `//examples/lean_proto:note_grpcurl_interop_test` drives the Lean server
   with **grpcurl** (grpc-go) over plaintext h2c: reflection `list`, then
@@ -320,13 +321,13 @@ there is no generated LRAT-certificate axiom (`…._native.bv_decide.ax_1_5`) in
 the allowed set — a proof that introduced one would fail the audit.
 `//:grpc_tls_assurance` makes the same `@[extern]` statement about `Grpc.Tls.*`.
 
-What holds today:
+Verified scope:
 
 - **Lean protocol code** (HTTP/2, HPACK, gRPC framing, metadata, dispatch):
   implemented in Lean; the I/O paths, dispatch and concurrency are evidenced
   by the test suite described above.
 - **Kernel-checked laws over the pure codecs and registry** (no `sorry`,
-  no `native_decide`), a growing set rather than a complete one:
+  no `native_decide`), covering a defined but incomplete set of properties:
   - `Grpc.Framing` — message-frame encode/decode inversion with residual
     bytes (`decodeAll_encode_append`), and that a successful size-limited
     decode never yields an oversized message (`decodeAllWithLimit_size_le`);
@@ -378,7 +379,7 @@ What holds today:
     exactly what the outbound connection window is debited), and
     `defaultStreamWindow_admits_max_message` /
     `inboundWindow_pos_of_incomplete` — the deadlock-freedom argument for
-    credit-on-consume, previously only a code comment.
+    credit-on-consume.
 
   Not proved: the HPACK header-block loop, the `IO` halves of the
   HEADERS/CONTINUATION steps (header decoding, authorization, dispatch
