@@ -783,7 +783,7 @@ private def connectTlsOnSocket
     alpnProtocols := tlsConfig.alpnProtocols
   }
   let (session, handshakeLeftover) ← Async.block
-    (Tls.ClientSession.establish socket clientConfig config.readSize)
+    (Tls.ClientSession.establishWithLeftover socket clientConfig config.readSize)
   try
     verifyTlsPeer session trustStore? tlsConfig
     initializeConnection socket config prefaceWire (some session) handshakeLeftover

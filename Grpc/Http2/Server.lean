@@ -1044,7 +1044,8 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       if config.noDelay then
         client.noDelay
       let serverConfig ← freshTlsServerConfig tlsConfig
-      let (session, handshakeLeftover) ← Grpc.Tls.ServerSession.establish client serverConfig
+      let (session, handshakeLeftover) ←
+        Grpc.Tls.ServerSession.establishWithLeftover client serverConfig
         config.readSize (stopToken := some stopToken)
       -- Publish the session before any byte of HTTP/2: from here on every
       -- teardown byte must be sealed instead of written plaintext.

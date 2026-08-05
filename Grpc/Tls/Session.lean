@@ -271,7 +271,7 @@ Also returns any application plaintext the server coalesced behind its final
 handshake flight (TLS 1.3 lets a server seal application data right after its
 Finished).  The caller must feed those bytes to the session's consumer before
 its first read; discarding them loses the head of the application stream. -/
-def establish (socket : TCP.Socket.Client) (config : Client.Config)
+def establishWithLeftover (socket : TCP.Socket.Client) (config : Client.Config)
     (readSize : UInt64 := 16384) : Async (ClientSession × ByteArray) := do
   let (state, leftover) ← clientHandshake socket config readSize
   let outbound ← Std.CloseableChannel.new
@@ -283,6 +283,16 @@ def establish (socket : TCP.Socket.Client) (config : Client.Config)
     outbound := outbound
     writer := writer
   }, leftover)
+
+/-- Compatibility entry point for callers written before handshake application
+plaintext was surfaced. New code should use `establishWithLeftover`; this wrapper
+cannot preserve 0.5-RTT bytes and is retained only to avoid an abrupt source
+break for consumers whose peer never sends application data with its Finished. -/
+@[deprecated establishWithLeftover (since := "2026-08-05")]
+def establish (socket : TCP.Socket.Client) (config : Client.Config)
+    (readSize : UInt64 := 16384) : Async ClientSession := do
+  let (session, _) ← establishWithLeftover socket config readSize
+  pure session
 
 /-- The ALPN protocol the peer selected, if any. -/
 def alpnSelected (session : ClientSession) : IO (Option String) :=
@@ -355,7 +365,7 @@ flight (a fast client's first application bytes — e.g. the HTTP/2 preface —
 routinely arrive in the same transport chunk).  The caller must feed those bytes
 to the session's consumer before its first read; discarding them loses the head
 of the application stream. -/
-def establish (socket : TCP.Socket.Client) (config : Server.Config)
+def establishWithLeftover (socket : TCP.Socket.Client) (config : Server.Config)
     (readSize : UInt64 := 16384) (stopToken : Option Std.CancellationToken := none) :
     Async (ServerSession × ByteArray) := do
   let (state, leftover) ← serverHandshake socket config readSize stopToken
@@ -364,6 +374,16 @@ def establish (socket : TCP.Socket.Client) (config : Server.Config)
   let writer ← startWriter socket outbound
   pure ({ socket := socket, state := stateMutex, outbound := outbound, writer := writer },
     leftover)
+
+/-- Compatibility entry point for pre-leftover callers. New servers must use
+`establishWithLeftover` when a client may coalesce its first application record
+with its TLS Finished flight. -/
+@[deprecated establishWithLeftover (since := "2026-08-05")]
+def establish (socket : TCP.Socket.Client) (config : Server.Config)
+    (readSize : UInt64 := 16384) (stopToken : Option Std.CancellationToken := none) :
+    Async ServerSession := do
+  let (session, _) ← establishWithLeftover socket config readSize stopToken
+  pure session
 
 /-- The ALPN protocol negotiated with the client, if any (e.g. "h2"). -/
 def alpnSelected (session : ServerSession) : IO (Option String) :=

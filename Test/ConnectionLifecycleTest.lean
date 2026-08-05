@@ -452,7 +452,7 @@ def connectRawTls (server : Grpc.Server.Instance) : IO Grpc.Tls.ClientSession :=
     alpnProtocols := #["h2"]
   }
   let (session, handshakeLeftover) ←
-    Std.Async.Async.block (Grpc.Tls.ClientSession.establish socket config 16384)
+    Std.Async.Async.block (Grpc.Tls.ClientSession.establishWithLeftover socket config 16384)
   -- This server never sends 0.5-RTT application data, so callers may treat the
   -- socket as the sole frame source; fail loudly if that ever changes.
   unless handshakeLeftover.isEmpty do

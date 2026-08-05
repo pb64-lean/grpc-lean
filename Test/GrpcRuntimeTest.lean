@@ -4060,11 +4060,10 @@ def testPriorityFrameIgnored : IO Unit := do
   let (_state, emitted) ← expectStatusOk result
   expectEq emitted.size 0 "PRIORITY frame should be ignored without emitting frames"
 
-/-- RFC 9113 §6.3: "A PRIORITY frame with a length other than 5 octets MUST be
-treated as a stream error (Section 5.4.2) of type FRAME_SIZE_ERROR" — every
-transition API answers RST_STREAM on the offending stream instead of tearing
-the connection down, while PRIORITY on stream 0 stays a connection error of
-type PROTOCOL_ERROR. -/
+/-- RFC 9113 §§5.4, 6.3, and 6.4: malformed PRIORITY is FRAME_SIZE_ERROR on a
+stream that has been opened, but it cannot be answered with RST_STREAM while
+the named stream is idle.  Every transition API makes the same distinction;
+stream id 0 remains a connection-level PROTOCOL_ERROR. -/
 def testPriorityFrameSizeStreamError : IO Unit := do
   let malformedPriority : Http2.Frame := {
     header := {
@@ -4084,20 +4083,25 @@ def testPriorityFrameSizeStreamError : IO Unit := do
     expectEq (← expectStatusOk (Http2.RstStream.decode emitted[0]!)) Http2.ErrorCode.frameSizeError
       s!"{api}: RFC 9113 §6.3 prescribes FRAME_SIZE_ERROR for a malformed PRIORITY length"
 
+  let openedState : Http2.Connection.State := {
+    readyConnectionState with
+    lastClientStreamId := 1
+    streams := #[{ streamId := 1 }]
+  }
   let (pureState, pureEmitted) ← expectStatusOk
-    (← Http2.Connection.processFrame Registry.empty readyConnectionState malformedPriority)
+    (← Http2.Connection.processFrame Registry.empty openedState malformedPriority)
   expectFrameSizeReset pureEmitted "aggregate"
-  expectEq pureState.lastClientStreamId readyConnectionState.lastClientStreamId
-    "a malformed PRIORITY must not claim a stream id"
+  expectEq pureState.lastClientStreamId openedState.lastClientStreamId
+    "resetting malformed PRIORITY must not change the claimed-stream frontier"
 
   let withEmitted ← IO.mkRef (#[] : Array Http2.Frame)
   let emitWith (frames : Array Http2.Frame) : IO Unit :=
     withEmitted.modify (fun old => old.append frames)
   discard <| expectStatusOk (← Http2.Connection.processFrameWith
-    Registry.empty readyConnectionState malformedPriority emitWith)
+    Registry.empty openedState malformedPriority emitWith)
   expectFrameSizeReset (← withEmitted.get) "emitting"
 
-  let sharedState ← Std.Mutex.new readyConnectionState
+  let sharedState ← Std.Mutex.new openedState
   let sharedEmitted ← IO.mkRef (#[] : Array Http2.Frame)
   let emitShared (frames : Array Http2.Frame) : IO Unit :=
     sharedEmitted.modify (fun old => old.append frames)
@@ -4105,8 +4109,24 @@ def testPriorityFrameSizeStreamError : IO Unit := do
     Registry.empty sharedState malformedPriority emitShared)
   expectFrameSizeReset (← sharedEmitted.get) "shared"
   let sharedStateAfter ← sharedState.atomically get
-  expectEq sharedStateAfter.lastClientStreamId readyConnectionState.lastClientStreamId
-    "shared malformed PRIORITY must not claim a stream id"
+  expectEq sharedStateAfter.lastClientStreamId openedState.lastClientStreamId
+    "shared malformed PRIORITY must not change the claimed-stream frontier"
+
+  -- PRIORITY does not open stream 1, and §6.4 forbids RST_STREAM while it is
+  -- idle.  §5.4.1 permits escalating the §6.3 stream error to a connection
+  -- error, which is the only response that does not itself violate §6.4.
+  let idleStatus ← expectStatusError
+    (← Http2.Connection.processFrame Registry.empty readyConnectionState malformedPriority)
+  expectEq idleStatus.code Code.internal
+    "malformed PRIORITY on an idle stream must be connection-fatal"
+  let evenIdlePriority : Http2.Frame := {
+    malformedPriority with
+    header := { malformedPriority.header with streamId := 2 }
+  }
+  let evenIdleStatus ← expectStatusError
+    (← Http2.Connection.processFrame Registry.empty openedState evenIdlePriority)
+  expectEq evenIdleStatus.code Code.internal
+    "an uncreated server-initiated stream is idle even below the client frontier"
 
   -- Connection error.  RFC 9113 §6.3: PRIORITY on stream 0 is PROTOCOL_ERROR,
   -- whether or not its length is also malformed.
@@ -5275,9 +5295,10 @@ def testHttp2StreamErrorContainment : IO Unit := do
       IO.cancel waitTask
       throw (IO.userError "stream-error containment server did not drain")
 
-/-- RFC 9113 §6.3 over a live connection: a PRIORITY frame with a length other
-than 5 octets answers RST_STREAM(FRAME_SIZE_ERROR) on its stream — no GOAWAY —
-and the connection then serves a fresh request. -/
+/-- RFC 9113 §6.3 over a live connection: after HEADERS has opened stream 1, a
+PRIORITY frame with a length other than 5 octets answers
+RST_STREAM(FRAME_SIZE_ERROR) on that stream — no GOAWAY — and the connection
+then serves a fresh request. -/
 def testHttp2PriorityFrameSizeContainment : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
   let registry := Registry.empty.registerUnary method fun request => do
@@ -5329,6 +5350,7 @@ def testHttp2PriorityFrameSizeContainment : IO Unit := do
   }
   let firstWire := Http2.connectionPreface
     |>.append clientSettingsWire
+    |>.append (← expectStatusOk (Http2.Frame.encode (headersFrameFor 1 block3)))
     |>.append (← expectStatusOk (Http2.Frame.encode malformedPriority))
   (client.send firstWire).block
 

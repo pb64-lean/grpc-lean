@@ -255,7 +255,7 @@ private def serveRestConnection (connectionId : Nat) (handler : Handler) (config
         signingKey := config.signingKey
         alpnProtocols := ["http/1.1"]
       }
-      Except.ok <$> ServerSession.establish client serverConfig config.readSize
+      Except.ok <$> ServerSession.establishWithLeftover client serverConfig config.readSize
         (stopToken := some shutdownToken)
     catch err =>
       pure (Except.error err)

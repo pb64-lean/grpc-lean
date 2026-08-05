@@ -1712,13 +1712,11 @@ theorem resetStreamFlowControl_scoped {state state' : State} {frame : Frame}
         simpa using hstream
       · exact ⟨connectionUpdate, rst, hconnectionUpdate, hrst, rfl⟩
 
-/-- Stream error.  RFC 9113 §6.3: "A PRIORITY frame with a length other than
-5 octets MUST be treated as a stream error (Section 5.4.2) of type
-FRAME_SIZE_ERROR."  PRIORITY is not flow controlled, so unlike
-`resetStreamFlowControl` there is no connection credit to refund; the stream's
-local state — if the id was ever opened — is torn down exactly as for any
-other locally generated RST_STREAM, and work attributable to it is
-cancelled. -/
+/-- Stream error for a malformed PRIORITY on a stream that is no longer idle.
+RFC 9113 §6.3 prescribes FRAME_SIZE_ERROR.  PRIORITY is not flow controlled, so
+unlike `resetStreamFlowControl` there is no connection credit to refund; the
+stream's local state is torn down exactly as for any other locally generated
+RST_STREAM, and work attributable to it is cancelled. -/
 private def resetPriorityFrameSize (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) := do
   let rst ← RstStream.frame frame.header.streamId ErrorCode.frameSizeError
@@ -1758,6 +1756,16 @@ private def containStreamError? (state : State) (frame : Frame) :
       if frame.header.streamId == 0 then
         throw (Status.internal "HTTP/2 PRIORITY frame must use a stream id")
       if frame.payload.size != 5 then
+        -- PRIORITY itself never opens a stream (§6.3), while §6.4 forbids
+        -- sending RST_STREAM for an idle stream.  This server never creates
+        -- even-numbered pushed streams, and an odd client stream above the
+        -- monotonic frontier has never been opened.  Escalate those cases as
+        -- §5.4.1 permits; only an open/half-closed/closed stream can receive
+        -- the §6.3 stream error.
+        if frame.header.streamId % 2 == 0
+            || frame.header.streamId > state.lastClientStreamId then
+          throw (Status.internal
+            "HTTP/2 malformed PRIORITY identifies an idle stream")
         some <$> resetPriorityFrameSize state frame
       else
         pure none

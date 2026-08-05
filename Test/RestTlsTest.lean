@@ -78,7 +78,8 @@ def httpsRequest (port : UInt16) (requestLine : String) : IO String := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send requestLine.toUTF8
   -- Any 0.5-RTT bytes the server coalesced behind its Finished flight are the
   -- head of the response stream.
@@ -165,7 +166,8 @@ def testShutdownCancelsIncompleteRequest (config : Rest.Config) : IO Unit := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, _handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, _handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send
     "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc".toUTF8
   IO.sleep 20
@@ -193,7 +195,8 @@ def testRejectsTruncatedBodyAtPeerEof (config : Rest.Config) : IO Unit := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, _handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, _handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send
     "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc".toUTF8
   -- Send authenticated close_notify and half-close while the server is still
@@ -226,7 +229,8 @@ def testWaitJoinsRunningHandler (config : Rest.Config) : IO Unit := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, _handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, _handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send "GET /owned HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".toUTF8
   waitUntil "REST ownership test handler did not start" observeTimeoutMs started.get
 
@@ -279,7 +283,8 @@ def closeClientBeforeResponse (server : Rest.Server) (handlerStarted : IO.Ref Bo
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, _handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, _handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send "GET /late-write HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".toUTF8
   -- `close` drains records in FIFO order before its bounded write-side
   -- shutdown, so the complete request precedes close_notify on the wire.
@@ -329,7 +334,8 @@ def testForcedWaitClearsOwnership (config : Rest.Config) : IO Unit := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
   }
-  let (session, _handshakeLeftover) ← Async.block (ClientSession.establish socket clientConfig)
+  let (session, _handshakeLeftover) ←
+    Async.block (ClientSession.establishWithLeftover socket clientConfig)
   session.send "GET /forced HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".toUTF8
   waitUntil "REST forced-ownership test handler did not start" observeTimeoutMs started.get
   let waitTask ← IO.asTask (Rest.wait server (drainTimeoutMs := some 0))
