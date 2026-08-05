@@ -6,10 +6,10 @@ open Grpc
 
 /-! Connection lifecycle: a connection that dies must say why.
 
-Every teardown path records a `CloseCause`; the peer reads it as GOAWAY debug
-data before the socket is retired, and the server keeps it in
-`Grpc.Server.closedConnections`.  Before this existed a dying connection was
-silent: no GOAWAY, and an EOF whose timing was decided by handle finalization.
+Every teardown path records a `CloseCause`; once HTTP/2 is established and the
+peer remains readable, it can read that cause as GOAWAY debug data before the
+bounded retirement attempt. The server always keeps the local record in
+`Grpc.Server.closedConnections`, including peer EOF and pre-HTTP/2 TLS failure.
 -/
 
 def expect (condition : Bool) (message : String) : IO Unit := do
@@ -116,6 +116,16 @@ def connectRaw (server : Grpc.Server.Instance) : IO Std.Async.TCP.Socket.Client 
 def closeCauses (server : Grpc.Server.Instance) : IO (Array Http2.Server.CloseCause) := do
   pure ((← Grpc.Server.closedConnections server).map (·.cause))
 
+def activeConnectionCount (server : Grpc.Server.Instance) : IO Nat := do
+  match server.activeConnections with
+  | none => pure 0
+  | some connections => connections.atomically do pure (← get).size
+
+def ownedConnectionCount (server : Grpc.Server.Instance) : IO Nat := do
+  match server.connectionTasks with
+  | none => pure 0
+  | some owners => owners.atomically do pure (← get).size
+
 def isKeepaliveTimeout : Http2.Server.CloseCause → Bool
   | .keepaliveTimeout => true
   | _ => false
@@ -179,8 +189,8 @@ def testConnectionErrorIsAttributable : IO Unit := do
   Grpc.Server.shutdown server
   Grpc.Server.wait server
 
-/-- An ordinary peer close is attributed too, and is the one cause that does not
-provoke a GOAWAY: the peer that would read it is already gone. -/
+/-- An ordinary peer half-close is attributed too and does not provoke a GOAWAY,
+but the server must still finish its own write side so the peer observes EOF. -/
 def testPeerCloseIsAttributable : IO Unit := do
   let server ← Grpc.Server.serve Registry.empty { address := Grpc.Server.loopback 0 }
   let client ← connectRaw server
@@ -194,6 +204,7 @@ def testPeerCloseIsAttributable : IO Unit := do
   let causes ← closeCauses server
   expect (causes.any fun cause => match cause with | .peerClosed => true | _ => false)
     "a peer-initiated close must be recorded as such"
+  expectPeerClosed client "server did not answer peer half-close with a local FIN"
   Grpc.Server.shutdown server
   Grpc.Server.wait server
 
@@ -219,6 +230,185 @@ def testAcceptLoopIsObservable : IO Unit := do
   | none => pure ()
   | some err => throw (IO.userError s!"clean shutdown reported an accept failure: {err}")
 
+/-- A plaintext send can fail while the peer deliberately keeps its write side
+open, so socket receive alone cannot wake the client reader.  The writer's
+sticky failure selector must wake that exact reader, which owns state failure
+and bounded transport retirement; both background handles then terminate before
+an explicit `Client.close`. -/
+def testPlaintextClientWriterFailureWakesReader : IO Unit := do
+  let listener ← Std.Async.TCP.Socket.Server.mk
+  listener.bind (Grpc.Server.loopback 0)
+  listener.listen 8
+  let address ← listener.getSockName
+  let acceptTask ← Std.Async.Async.toIO listener.accept
+  let connection ← Client.connect { address := address }
+  let peer ← Std.Async.Async.block (Std.Async.Async.ofAsyncTask acceptTask)
+
+  -- Ensure the initial preface has left the sole writer before making future
+  -- sends fail. `shutdown` is local write-side only: `peer` remains open for
+  -- writing, so the client's reader cannot observe EOF and must use the token.
+  let some preface ← (peer.recv? 4096).block
+    | throw (IO.userError "raw peer closed before receiving the client preface")
+  expect (!preface.isEmpty) "client emitted an empty HTTP/2 preface"
+  (connection.socket.shutdown).block
+
+  match ← Std.Async.Async.block
+      (Client.start connection "/lean.example.proto.NoteService/Echo") with
+  | .error status =>
+      throw (IO.userError s!"call was rejected before exercising writer failure: {status.messageD}")
+  | .ok _ => pure ()
+
+  waitUntil "plaintext writer failure did not wake and retire the reader" observeTimeoutMs do
+    Client.backgroundTasksFinished connection
+  let dead ← connection.state.atomically do pure (← get).dead
+  match dead with
+  | none => throw (IO.userError "finished reader did not mark the failed writer connection dead")
+  | some _ => pure ()
+  match ← Std.Async.Async.block
+      (Client.start connection "/lean.example.proto.NoteService/Echo") with
+  | .ok _ => throw (IO.userError "writer-failed connection accepted a new call")
+  | .error _ => pure ()
+
+  Std.Async.Async.block (Client.close connection)
+  try (peer.shutdown).block catch _ => pure ()
+
+partial def cooperativeResponseWait (started : IO.Ref Bool) : GrpcM (Option ByteArray) := do
+  started.set true
+  if ← IO.checkCanceled then
+    throw (Status.cancelled "response handler cancelled")
+  IO.sleep 1
+  cooperativeResponseWait started
+
+partial def uncooperativeResponseWait (started release : IO.Ref Bool) :
+    GrpcM (Option ByteArray) := do
+  started.set true
+  if ← release.get then
+    throw (Status.cancelled "test released uncooperative response handler")
+  IO.sleep 10
+  uncooperativeResponseWait started release
+
+partial def neverReturningStreamCancel (release : IO.Ref Bool) : GrpcM Unit := do
+  if ← release.get then
+    pure ()
+  else
+    IO.sleep 10
+    neverReturningStreamCancel release
+
+def startStreamingRequest (server : Grpc.Server.Instance) (path : String) :
+    IO Client.Connection := do
+  let connection ← Client.connect { address := server.localAddress }
+  let call ← match ← Std.Async.Async.block (Client.start connection path) with
+    | .ok call => pure call
+    | .error status => throw (IO.userError status.messageD)
+  discard <| expectStatusOk (← Std.Async.Async.block (call.send ByteArray.empty))
+  discard <| expectStatusOk (← Std.Async.Async.block call.closeSend)
+  pure connection
+
+/-- The ordinary nested-cancellation path invokes a response-stream callback
+exactly once, joins its cooperative handler, and retires both public owner
+registries before a finite post-shutdown wait returns. -/
+def testShutdownOwnsCooperativeStreamCancellation : IO Unit := do
+  let method : MethodName := {
+    service := "lean.example.proto.LifecycleService",
+    method := "CooperativeStream"
+  }
+  let recvStarted ← IO.mkRef false
+  let cancelCount ← IO.mkRef 0
+  let registry := Registry.empty.registerServerStreamingStream method fun _ => do
+    pure {
+      messages := {
+        recv? := cooperativeResponseWait recvStarted,
+        cancel := cancelCount.modify fun count => count + 1
+      },
+      status := Status.ok
+    }
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let connection ← startStreamingRequest server method.path
+  waitUntil "cooperative response stream did not enter recv" observeTimeoutMs recvStarted.get
+
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask (Grpc.Server.wait server (drainTimeoutMs := some 0))
+  match ← awaitTaskWithin waitTask observeTimeoutMs with
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "finite shutdown did not join cooperative stream cancellation")
+  | some () => pure ()
+  expectEq (← cancelCount.get) 1
+    "cooperative response cancel callback must be taken exactly once"
+  expectEq (← activeConnectionCount server) 0
+    "cooperative stream shutdown left an active connection"
+  expectEq (← ownedConnectionCount server) 0
+    "cooperative stream shutdown left a retained connection owner"
+  Std.Async.Async.block (Client.close connection)
+
+/-- Arbitrary user cancellation must never execute inline in `Server.wait` or
+be orphaned. Both the never-returning response cancel and its uncooperative
+handler remain beneath the exact managed connection task; finite wait reports
+the ownership timeout and leaves that task and connection observable. -/
+def testFiniteWaitRetainsUncooperativeNestedCancellation : IO Unit := do
+  let method : MethodName := {
+    service := "lean.example.proto.LifecycleService",
+    method := "UncooperativeStream"
+  }
+  let recvStarted ← IO.mkRef false
+  let cancelStarted ← IO.mkRef false
+  let cancelCount ← IO.mkRef 0
+  let release ← IO.mkRef false
+  let registry := Registry.empty.registerServerStreamingStream method fun _ => do
+    pure {
+      messages := {
+        recv? := uncooperativeResponseWait recvStarted release,
+        cancel := do
+          cancelCount.modify fun count => count + 1
+          cancelStarted.set true
+          neverReturningStreamCancel release
+      },
+      status := Status.ok
+    }
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let connection ← startStreamingRequest server method.path
+  waitUntil "uncooperative response stream did not enter recv" observeTimeoutMs recvStarted.get
+
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask do
+    try
+      Grpc.Server.wait server (drainTimeoutMs := some 0)
+      pure (none : Option IO.Error)
+    catch err =>
+      pure (some err)
+  let waitError ← match ← awaitTaskWithin waitTask observeTimeoutMs with
+    | none =>
+        IO.cancel waitTask
+        throw (IO.userError "finite Server.wait synchronously hung in user stream cancellation")
+    | some none =>
+        throw (IO.userError "finite Server.wait silently retired uncooperative nested work")
+    | some (some err) => pure err
+  expect (((toString waitError).splitOn "connection owner did not retire").length > 1)
+    s!"finite wait reported the wrong ownership failure: {waitError}"
+  waitUntil "never-returning response cancel callback did not start" observeTimeoutMs
+    cancelStarted.get
+  expectEq (← cancelCount.get) 1
+    "shutdown races must take a never-returning response cancel callback once"
+  expectEq (← activeConnectionCount server) 1
+    "uncooperative nested work lost its observable active connection"
+  expectEq (← ownedConnectionCount server) 1
+    "uncooperative nested work lost its exact registered connection owner"
+  -- Release the simulated permanently-blocked user code. The same retained
+  -- owner must resume, perform its one cleanup path, and disappear; no detached
+  -- rescue task is allowed to do this for it.
+  release.set true
+  let cleanupTask ← IO.asTask (Grpc.Server.wait server (drainTimeoutMs := some 0))
+  match ← awaitTaskWithin cleanupTask observeTimeoutMs with
+  | none =>
+      IO.cancel cleanupTask
+      throw (IO.userError "retained connection owner did not resume after releasing user code")
+  | some () => pure ()
+  expectEq (← activeConnectionCount server) 0
+    "released nested work left an active connection"
+  expectEq (← ownedConnectionCount server) 0
+    "released nested work left a registered connection owner"
+  Std.Async.Async.block (Client.close connection)
+
 /-! ## The same guarantees over TLS
 
 A TLS connection used to die in silence: its error was swallowed, it registered
@@ -233,6 +423,19 @@ def tlsIdentity : IO Http2.Server.TlsConfig := do
   let certificateDer ← IO.FS.readBinFile "Test/Fixtures/Tls/server_cert.der"
   let signingKey ← IO.FS.readBinFile "Test/Fixtures/Tls/server_key.raw"
   pure { certificateChain := #[certificateDer], signingKey := signingKey }
+
+def rawTlsClientHello : IO ByteArray := do
+  let entropy ← IO.getRandomBytes 96
+  let config : _root_.Tls.Client.Config := {
+    clientRandom := entropy.extract 0 32,
+    x25519Private := entropy.extract 32 64,
+    legacySessionId := entropy.extract 64 96,
+    serverName := some "localhost",
+    alpnProtocols := #["h2"]
+  }
+  match _root_.Tls.Client.start config with
+  | .ok output => pure output.wireBytes
+  | .error err => throw (IO.userError s!"could not construct raw ClientHello: {repr err}")
 
 /-- A raw TLS peer: a real TLS 1.3 handshake with ALPN "h2", and nothing above it,
 so this test drives HTTP/2 by hand exactly as the plaintext tests do. -/
@@ -319,15 +522,86 @@ def testTlsPeerCloseIsAttributable : IO Unit := do
   session.send (Http2.connectionPreface.append (← clientSettingsWire false))
   let _ ← readTlsFramesUntil session {} (fun frames => frames.size > 0)
     "TLS server did not send its preface"
-  session.close
+  Std.Async.Async.block session.close
 
   waitUntil "TLS peer close was not recorded on the server" observeTimeoutMs do
     pure (!(← Grpc.Server.closedConnections server).isEmpty)
   let causes ← closeCauses server
   expect (causes.any fun cause => match cause with | .peerClosed => true | _ => false)
     "a peer-initiated TLS close must be recorded as such"
+  expectPeerClosed session.socket
+    "TLS server did not answer close_notify/peer half-close with a local FIN"
   Grpc.Server.shutdown server
   Grpc.Server.wait server
+
+/-- Shutdown must interrupt a peer that connected but never sent ClientHello;
+otherwise the retained handshake task makes `Server.wait` unbounded. -/
+def testTlsShutdownCancelsSilentHandshake : IO Unit := do
+  let server ← Grpc.Server.serveTls Registry.empty (← tlsIdentity)
+    { address := Grpc.Server.loopback 0 }
+  let client ← connectRaw server
+  -- Give the accept loop time to publish the pre-handshake connection.
+  IO.sleep 20
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask (Grpc.Server.wait server)
+  match ← awaitTaskWithin waitTask observeTimeoutMs with
+  | some () => pure ()
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "TLS shutdown did not cancel a silent ClientHello peer")
+  expectPeerClosed client "silent TLS handshake socket was not retired on shutdown"
+
+/-- A more adversarial handshake peer sends ClientHello but never reads.  A
+large (still uint24-valid) certificate flight fills the TCP send path.  The stop
+token must win against that exact handshake-send task so `Server.wait` reaches
+the one owner cleanup path rather than blocking forever or launching a detached
+second retirement. -/
+def testTlsShutdownCancelsStalledHandshakeSend : IO Unit := do
+  let identity ← tlsIdentity
+  let some leaf := identity.certificateChain[0]?
+    | throw (IO.userError "TLS fixture identity has no leaf certificate")
+  -- 16k * (349-byte cert + framing) is about 5.7 MiB: below TLS's uint24
+  -- Certificate limit, but beyond Linux's maximum autotuned send buffer.
+  let stalledIdentity := {
+    identity with certificateChain := Array.replicate 16000 leaf
+  }
+  let server ← Grpc.Server.serveTls Registry.empty stalledIdentity
+    { address := Grpc.Server.loopback 0 }
+  let client ← connectRaw server
+  (client.send (← rawTlsClientHello)).block
+  waitUntil "TLS handshake connection owner was not published" observeTimeoutMs do
+    pure ((← activeConnectionCount server) == 1 && (← ownedConnectionCount server) == 1)
+  let owner ← match server.connectionTasks with
+    | none => throw (IO.userError "TLS server did not expose its owner registry")
+    | some ownersMutex => do
+        let owners ← ownersMutex.atomically get
+        let some owner := owners[0]?
+          | throw (IO.userError "TLS handshake owner disappeared before shutdown")
+        pure owner
+  -- Let the owner construct and enter the oversized server-flight send.
+  IO.sleep 3000
+
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask (Grpc.Server.wait server (drainTimeoutMs := some 10))
+  match ← awaitTaskWithin waitTask 10000 with
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "Server.wait hung on an unread TLS handshake flight")
+  | some () => pure ()
+
+  expectEq (← activeConnectionCount server) 0
+    "bounded TLS shutdown returned with an active handshake connection"
+  expectEq (← ownedConnectionCount server) 0
+    "bounded TLS shutdown returned with a retained handshake owner"
+  let records ← Grpc.Server.closedConnections server
+  expectEq records.size 1
+    "the single handshake owner must produce exactly one close record"
+  match owner.task.get with
+  | .ok () => throw (IO.userError "stalled TLS handshake owner unexpectedly succeeded")
+  | .error err =>
+      expect (((toString err).splitOn "handshake send cancelled").length > 1)
+        s!"shutdown cancelled a later receive, not the stalled handshake send: {err}"
+  try (client.shutdown).block catch _ => pure ()
 
 /-- A live TLS connection takes part in graceful shutdown: it is registered, so
 `shutdown` reaches it with a GOAWAY(NO_ERROR), `wait` drains it rather than
@@ -356,11 +630,28 @@ def testTlsShutdownDrainsConnections : IO Unit := do
 
 def main : IO Unit := do
   IO.println "connection-lifecycle test: cause-carrying teardown"
+  IO.println "  keepalive timeout"
   testKeepaliveTimeoutIsAttributable
+  IO.println "  plaintext protocol error"
   testConnectionErrorIsAttributable
+  IO.println "  plaintext peer close"
   testPeerCloseIsAttributable
+  IO.println "  accept-loop observability"
   testAcceptLoopIsObservable
+  IO.println "  plaintext writer failure"
+  testPlaintextClientWriterFailureWakesReader
+  IO.println "  cooperative nested cancellation ownership"
+  testShutdownOwnsCooperativeStreamCancellation
+  IO.println "  TLS protocol error"
   testTlsConnectionErrorIsAttributable
+  IO.println "  TLS peer close"
   testTlsPeerCloseIsAttributable
+  IO.println "  TLS silent handshake shutdown"
+  testTlsShutdownCancelsSilentHandshake
+  IO.println "  TLS stalled-send handshake shutdown"
+  testTlsShutdownCancelsStalledHandshakeSend
+  IO.println "  TLS graceful drain"
   testTlsShutdownDrainsConnections
+  IO.println "  bounded wait retains uncooperative nested cancellation"
+  testFiniteWaitRetainsUncooperativeNestedCancellation
   IO.println "connection lifecycle ok"

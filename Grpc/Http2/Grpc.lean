@@ -51,12 +51,6 @@ private def stripPadding (frameName : String) (payload : ByteArray) (offset : Na
     throw (Status.internal s!"HTTP/2 {frameName} padding exceeds payload size")
   pure (payload.extract offset (payload.size - padLength))
 
-private def readUInt32BE (bytes : ByteArray) (offset : Nat) : Nat :=
-  bytes[offset]!.toNat * 16777216
-    + bytes[offset + 1]!.toNat * 65536
-    + bytes[offset + 2]!.toNat * 256
-    + bytes[offset + 3]!.toNat
-
 def normalizeDataFrame (frame : Frame) : Except Status Frame := do
   if !FrameFlag.has frame.header.flags FrameFlag.padded then
     pure frame
@@ -86,11 +80,9 @@ def normalizeHeadersFrame (frame : Frame) : Except Status Frame := do
     if hasPriority then
       if frame.payload.size < offset + 5 then
         throw (Status.internal "HTTP/2 HEADERS priority fields are truncated")
-      else do
-        let rawDependency := readUInt32BE frame.payload offset
-        let streamDependency := rawDependency % (maxStreamId + 1)
-        if streamDependency == frame.header.streamId then
-          throw (Status.internal "HTTP/2 HEADERS priority dependency cannot reference the same stream")
+      else
+        -- RFC 9113 removed the dependency tree. Preserve the legacy five-byte
+        -- wire shape for compatibility, but ignore its semantics.
         pure (offset + 5)
     else
       pure offset
@@ -127,14 +119,13 @@ structure RequestHeaderBlock where
   frame : Frame
   nextIndex : Nat
 
-private partial def collectContinuationFrames (frames : Array Frame) (i : Nat)
+private def collectContinuationFrames (frames : Array Frame) (i : Nat)
     (headersFrame : Frame) : Except Status RequestHeaderBlock := do
+  let mut headersFrame := headersFrame
   if FrameFlag.has headersFrame.header.flags FrameFlag.endHeaders then
-    pure { frame := headersFrame, nextIndex := i }
-  else
-    let frame ← match frames[i]? with
-      | some frame => pure frame
-      | none => throw (Status.internal "HTTP/2 request header block ended before END_HEADERS")
+    return { frame := headersFrame, nextIndex := i }
+  for j in [i:frames.size] do
+    let frame := frames[j]!
     if frame.header.frameType != FrameType.continuation then
       throw (Status.internal "HTTP/2 header block must be followed by CONTINUATION frames")
     if frame.header.streamId != headersFrame.header.streamId then
@@ -145,12 +136,14 @@ private partial def collectContinuationFrames (frames : Array Frame) (i : Nat)
         UInt8.ofNat (headersFrame.header.flags.toNat + FrameFlag.endHeaders.toNat)
       else
         headersFrame.header.flags
-    let headersFrame := {
+    headersFrame := {
       headersFrame with
       header := { headersFrame.header with length := payload.size, flags := flags },
       payload := payload
     }
-    collectContinuationFrames frames (i + 1) headersFrame
+    if FrameFlag.has headersFrame.header.flags FrameFlag.endHeaders then
+      return { frame := headersFrame, nextIndex := j + 1 }
+  throw (Status.internal "HTTP/2 request header block ended before END_HEADERS")
 
 private def collectHeaderBlockFrames (frames : Array Frame) : Except Status RequestHeaderBlock := do
   let headersFrame ← match frames[0]? with
@@ -161,21 +154,20 @@ private def collectHeaderBlockFrames (frames : Array Frame) : Except Status Requ
   let headersFrame ← normalizeHeadersFrame headersFrame
   collectContinuationFrames frames 1 headersFrame
 
-private partial def collectData (frames : Array Frame) (i streamId : Nat) (body : ByteArray) :
+private def collectData (frames : Array Frame) (i streamId : Nat) (body : ByteArray) :
     Except Status ByteArray := do
-  if i >= frames.size then
-    throw (Status.internal "HTTP/2 request ended before END_STREAM")
-  let frame := frames[i]!
-  if frame.header.streamId != streamId then
-    throw (Status.internal "HTTP/2 request frames changed stream id")
-  if frame.header.frameType != FrameType.data then
-    throw (Status.internal "expected HTTP/2 DATA frame")
-  let frame ← normalizeDataFrame frame
-  let body := body.append frame.payload
-  if FrameFlag.has frame.header.flags FrameFlag.endStream then
-    pure body
-  else
-    collectData frames (i + 1) streamId body
+  let mut body := body
+  for j in [i:frames.size] do
+    let frame := frames[j]!
+    if frame.header.streamId != streamId then
+      throw (Status.internal "HTTP/2 request frames changed stream id")
+    if frame.header.frameType != FrameType.data then
+      throw (Status.internal "expected HTTP/2 DATA frame")
+    let frame ← normalizeDataFrame frame
+    body := body.append frame.payload
+    if FrameFlag.has frame.header.flags FrameFlag.endStream then
+      return body
+  throw (Status.internal "HTTP/2 request ended before END_STREAM")
 
 def decodeUnaryRequestFrames (state : Hpack.State) (frames : Array Frame)
     (maxHeaderListSize : Option Nat := none) :
@@ -214,20 +206,24 @@ private def headerBlockFrame (streamId : Nat) (frameType : FrameType)
     payload := payload
   }
 
-private partial def headerBlockFramesLoop (streamId maxSize offset : Nat) (block : ByteArray)
+private def headerBlockFramesLoop (streamId maxSize offset : Nat) (block : ByteArray)
     (endStream : Bool) (frames : Array Frame) : Except Status (Array Frame) := do
-  if offset >= block.size then
-    pure frames
+  if maxSize == 0 then
+    throw (Status.internal "HTTP/2 header block frame max size must be positive")
   else
-    let next := offset + maxSize
-    let stop := if next < block.size then next else block.size
-    let payload := block.extract offset stop
-    let first := frames.isEmpty
-    let last := stop == block.size
-    let frameType := if first then FrameType.headers else FrameType.continuation
-    let flags := headerBlockFlags first last endStream
-    let frame := headerBlockFrame streamId frameType payload flags
-    headerBlockFramesLoop streamId maxSize stop block endStream (frames.push frame)
+    pure <| Id.run do
+      let mut frames := frames
+      let mut offset := offset
+      while offset < block.size do
+        let stop := Nat.min block.size (offset + maxSize)
+        let payload := block.extract offset stop
+        let first := frames.isEmpty
+        let last := stop == block.size
+        let frameType := if first then FrameType.headers else FrameType.continuation
+        let flags := headerBlockFlags first last endStream
+        frames := frames.push (headerBlockFrame streamId frameType payload flags)
+        offset := stop
+      return frames
 
 private def headerBlockFrames (streamId : Nat) (block : ByteArray) (endStream : Bool)
     (maxSize : Nat := defaultMaxFramePayloadLength) : Except Status (Array Frame) := do
@@ -250,17 +246,20 @@ private def dataFrame (streamId : Nat) (payload : ByteArray) : Frame :=
     payload := payload
   }
 
-private partial def dataFramesLoop (streamId offset maxSize : Nat) (payload : ByteArray)
+private def dataFramesLoop (streamId offset maxSize : Nat) (payload : ByteArray)
     (frames : Array Frame) : Except Status (Array Frame) := do
   if maxSize == 0 then
     throw (Status.internal "HTTP/2 DATA frame max size must be positive")
-  else if offset >= payload.size then
-    pure frames
   else
-    let next := offset + maxSize
-    let stop := if next < payload.size then next else payload.size
-    let chunk := payload.extract offset stop
-    dataFramesLoop streamId stop maxSize payload (frames.push (dataFrame streamId chunk))
+    pure <| Id.run do
+      let mut frames := frames
+      let mut offset := offset
+      while offset < payload.size do
+        let stop := Nat.min payload.size (offset + maxSize)
+        let chunk := payload.extract offset stop
+        frames := frames.push (dataFrame streamId chunk)
+        offset := stop
+      return frames
 
 def dataFrames (streamId : Nat) (payload : ByteArray)
     (maxSize : Nat := defaultMaxFramePayloadLength) : Except Status (Array Frame) :=

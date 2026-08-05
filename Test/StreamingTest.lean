@@ -298,7 +298,7 @@ def testManyConnections (server : Grpc.Server.Instance) (port : UInt16) : IO Uni
   runRound "round-one"
   runRound "round-two"
   for client in clients do
-    Client.close client
+    Async.block (Client.close client)
   IO.println s!"many connections ({n} open, two concurrent rounds) ok"
 
 def main : IO Unit := do
@@ -324,6 +324,6 @@ def main : IO Unit := do
   Async.block (testTrailersOnlyViaHandle client)
   testManyConnections server port
 
-  Client.close client
+  Async.block (Client.close client)
   Grpc.Server.shutdown server
   IO.println "all streaming assertions passed"

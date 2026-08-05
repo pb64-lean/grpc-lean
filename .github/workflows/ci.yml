@@ -1,6 +1,8 @@
 name: ci
 
-# Hermetic Bazel tests + grpcurl interop on the self-hosted NixOS runners.
+# Hermetic Bazel tests + plaintext and TLS grpcurl interop on the self-hosted
+# NixOS runners. The weekly schedule exercises independent Go/OpenSSL clients
+# even when main is otherwise quiet.
 # NEVER add pull_request here: these jobs run on self-hosted runners.
 # examples/grpc_service is deliberately out of CI scope (no test targets).
 
@@ -29,6 +31,6 @@ jobs:
     uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
     with:
       siblings: rules_lean tls13-lean
-      targets: "//examples/lean_proto:note_grpcurl_interop_test"
-      extra_args: "--test_env=TEST_GRPC_PORT=50153 --flaky_test_attempts=3"
+      targets: "//examples/lean_proto:note_grpcurl_interop_test //examples/lean_proto:note_grpcurl_tls_interop_test"
+      extra_args: "--test_env=TEST_GRPC_PORT=50153 --test_env=TEST_GRPC_TLS_PORT=50154 --flaky_test_attempts=3"
       timeout_minutes: 30

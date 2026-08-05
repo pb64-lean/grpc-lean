@@ -86,7 +86,17 @@ structure State where
   outboundStreamWindows : Array OutboundStreamWindow := #[]
   pendingOutbound : Array Frame := #[]
   streams : Array StreamState := #[]
+  /-- Request bodies rejected without resetting the HTTP/2 stream. These remain
+  active for concurrency and graceful-drain accounting until peer END_STREAM. -/
   ignoredInboundStreams : Array Nat := #[]
+  /-- Locally reset streams whose late, in-flight DATA still needs connection
+  flow-control accounting. Unlike `ignoredInboundStreams`, these streams are
+  already closed and therefore consume neither concurrency slots nor drain time. -/
+  resetInboundStreams : Array Nat := #[]
+  /-- One incomplete field block received after a local reset. It is kept out
+  of `streams` because the reset stream is closed, but must reach HPACK before
+  any later frame can be processed. -/
+  resetHeaderBlock : Option Frame := none
   /-- Streams accepted only so their field block is decoded, to be reset with
   RST_STREAM the moment the block has been read.  See
   `inboundStreamCapacityRefusal?`. -/
@@ -129,6 +139,7 @@ def isDrainedAfterOutboundGoAway (state : State) : Bool :=
   | some _ =>
       state.streams.isEmpty
         && state.ignoredInboundStreams.isEmpty
+        && state.resetHeaderBlock.isNone
         && state.activeRequestStreams.isEmpty
         && state.activeDispatches.isEmpty
         && state.pendingOutbound.isEmpty
@@ -268,6 +279,10 @@ private def removeInboundStreamState (state : State) (streamId : Nat) : State :=
     state with
     inboundStreamWindows := removeInboundStreamWindow state.inboundStreamWindows streamId,
     ignoredInboundStreams := removeStreamId state.ignoredInboundStreams streamId,
+    resetInboundStreams := removeStreamId state.resetInboundStreams streamId,
+    resetHeaderBlock := state.resetHeaderBlock.bind fun frame =>
+      if frame.header.streamId == streamId then none else some frame,
+    refusedInboundStreams := removeStreamId state.refusedInboundStreams streamId,
     activeRequestStreams := removeActiveRequestStream state.activeRequestStreams streamId
   }
 
@@ -277,6 +292,18 @@ private def ignoreInboundStreamBody (state : State) (streamId : Nat) : State :=
     streams := removeStream state.streams streamId,
     ignoredInboundStreams := pushUniqueStreamId state.ignoredInboundStreams streamId
   }
+
+private def drainResetInboundStreamBody (state : State) (streamId : Nat) : State :=
+  {
+    state with
+    streams := removeStream state.streams streamId,
+    ignoredInboundStreams := removeStreamId state.ignoredInboundStreams streamId,
+    resetInboundStreams := pushUniqueStreamId state.resetInboundStreams streamId
+  }
+
+private def drainsInboundStreamBody (state : State) (streamId : Nat) : Bool :=
+  containsStreamId state.ignoredInboundStreams streamId
+    || containsStreamId state.resetInboundStreams streamId
 
 /-- Client-initiated stream ids are the odd ones (RFC 9113 §5.1.1). -/
 def isClientStreamId (streamId : Nat) : Bool :=
@@ -430,29 +457,15 @@ private def stripPadding (frame : Frame) (frameName : String) : Except Status Fr
         payload := payload
       }
 
-/-- Connection errors.  A truncated priority section is a frame size error in a
-frame carrying a field block, and RFC 9113 §4.2 says "A frame size error in a
-frame that could alter the state of the entire connection MUST be treated as a
-connection error (Section 5.4.1); this includes any frame carrying a field
-block".  The self-dependency check is the one place an RFC stream error
-(§5.3.1: "A stream cannot depend on itself.  An endpoint MUST treat this as a
-stream error (Section 5.4.2) of type PROTOCOL_ERROR") is deliberately widened
-to a connection error: the check runs before the field block reaches the HPACK
-decoder, and §4.3 requires every field block to be decompressed, so refusing
-the stream alone would leave the decoder out of step for every later stream. -/
+/-- A truncated priority section is connection-fatal because it makes the
+field-block boundary unknowable. Well-formed dependency fields are stripped and
+otherwise ignored: RFC 9113 removed the RFC 7540 priority tree. -/
 private def stripHeadersPriority (frame : Frame) : Except Status Frame := do
   if !FrameFlag.has frame.header.flags FrameFlag.priority then
     pure frame
   else if frame.payload.size < 5 then
     throw (Status.internal "HTTP/2 HEADERS frame priority section is truncated")
   else
-    let rawDependency :=
-      frame.payload[0]!.toNat * 16777216
-        + frame.payload[1]!.toNat * 65536
-        + frame.payload[2]!.toNat * 256
-        + frame.payload[3]!.toNat
-    if rawDependency % (maxStreamId + 1) == frame.header.streamId then
-      throw (Status.internal "HTTP/2 PRIORITY dependency cannot reference the same stream")
     let payload := frame.payload.extract 5 frame.payload.size
     pure {
       frame with
@@ -481,13 +494,12 @@ private def dataWindowUpdates (frame : Frame) : Except Status (Array Frame) := d
 private def dataFrameWithPayload (frame : Frame) (payload : ByteArray) : Frame :=
   { frame with header := { frame.header with length := payload.size }, payload := payload }
 
-/-- Connection error.  RFC 9113 §6.9 allows either scope here ("A receiver MAY
-respond with a stream error (Section 5.4.2) or connection error
-(Section 5.4.1) of type FLOW_CONTROL_ERROR"), and this connection takes the
-connection scope for both windows: the connection window is shared, so a peer
-that has overrun it has lost track of the shared credit, and a receiver that
-kept serving would have to guess how much of the overrun belonged to which
-stream. -/
+/-- Low-level receive-window debit. A connection-window overrun is necessarily
+connection-fatal because the peer has lost track of shared credit. The public
+frame transitions intercept an otherwise valid open stream's *stream-only*
+overrun before calling this helper and emit RST_STREAM(FLOW_CONTROL_ERROR),
+while direct/internal callers still receive an error for either insufficient
+window. -/
 def consumeInboundDataWindow (state : State) (frame : Frame) : Except Status State := do
   let size := frame.payload.size
   if size == 0 then
@@ -866,6 +878,17 @@ def rejectStreamAtHeaders (state : State) (streamId : Nat)
   else
     ignoreInboundStreamBody state streamId
 
+/-- Rejecting one stream commits the already-decoded connection-wide HPACK
+state (and the encoder state used for its rejection response) regardless of
+whether the peer ended the request at HEADERS.  This is the key reason a
+stream-scoped header error cannot desynchronise later streams. -/
+theorem rejectStreamAtHeaders_tables (state : State) (streamId : Nat)
+    (inboundHpack outboundHpack : Hpack.State) (endStream : Bool) :
+    let rejected := rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream
+    rejected.hpack = inboundHpack ∧ rejected.outboundHpack = outboundHpack := by
+  unfold rejectStreamAtHeaders
+  split <;> exact ⟨rfl, rfl⟩
+
 private def authorizeRequestHeadersForStream (registry : Registry) (state : State)
     (streamId : Nat) : IO (Except Status (State × Option (Array Frame))) := do
   let decoded : Except Status (StreamState × Frame × Transport.RequestHeadersFrames) := do
@@ -894,8 +917,11 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
             state with
             refusedInboundStreams := removeStreamId state.refusedInboundStreams streamId
           }
-          pure (.ok (rejectStreamAtHeaders state streamId headers.hpack
-            state.outboundHpack headers.endStream, some #[rst]))
+          let state := rejectStreamAtHeaders state streamId headers.hpack
+            state.outboundHpack headers.endStream
+          let state :=
+            if headers.endStream then state else drainResetInboundStreamBody state streamId
+          pure (.ok (state, some #[rst]))
     else
     match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
         headers.metadata state.outboundMaxFramePayloadLength with
@@ -935,6 +961,35 @@ private def processIgnoredInboundData (state : State) (frame : Frame) :
     else
       state
   pure (state, updates)
+
+/-- DATA received after a local RST_STREAM is still charged to connection flow
+control, but the closed stream no longer has a receive window to replenish. -/
+private def processResetInboundData (state : State) (frame : Frame) :
+    Except Status (State × Array Frame) := do
+  let size := frame.payload.size
+  if size > state.inboundConnectionWindow then
+    throw (Status.internal "HTTP/2 DATA frame exceeds connection flow-control window")
+  let updates ←
+    if size == 0 then
+      pure #[]
+    else
+      let update ← WindowUpdate.frame 0 size
+      pure #[update]
+  let frame ← stripPadding frame "DATA"
+  discard <| Transport.normalizeDataFrame frame
+  let state :=
+    if FrameFlag.has frame.header.flags FrameFlag.endStream then
+      removeInboundStreamState state frame.header.streamId
+    else
+      state
+  pure (state, updates)
+
+private def processDrainingInboundData (state : State) (frame : Frame) :
+    Except Status (State × Array Frame) :=
+  if containsStreamId state.resetInboundStreams frame.header.streamId then
+    processResetInboundData state frame
+  else
+    processIgnoredInboundData state frame
 
 /-- Content-length policing for a streaming request body.  `exact` is set at
 END_STREAM, where the received size must match rather than merely not exceed
@@ -1059,8 +1114,11 @@ private def queueOutboundShared (stateMutex : Std.Mutex State) (emit : Array Fra
   | .error status => pure (.error status)
   | .ok emitted => emitFrameBatch emit emitted
 
-private def cancelResponseStreamRef (responseStreamCancel : IO.Ref (Option (IO Unit))) : IO Unit := do
-  match ← responseStreamCancel.get with
+private def cancelStreamRef (streamCancel : IO.Ref (Option (IO Unit))) : IO Unit := do
+  -- Taking the callback before invoking arbitrary user IO gives cancellation
+  -- exactly-once semantics even when a late response-stream registration races
+  -- connection or RST_STREAM teardown.
+  match ← streamCancel.modifyGet fun cancel? => (cancel?, none) with
   | none => pure ()
   | some cancel =>
       try
@@ -1068,20 +1126,43 @@ private def cancelResponseStreamRef (responseStreamCancel : IO.Ref (Option (IO U
       catch _ =>
         pure ()
 
+private def cancelResponseStreamRef (responseStreamCancel : IO.Ref (Option (IO Unit))) : IO Unit :=
+  cancelStreamRef responseStreamCancel
+
 private def cancelRequestStreamRef (requestStreamCancel : IO.Ref (Option (IO Unit))) : IO Unit := do
-  match ← requestStreamCancel.get with
-  | none => pure ()
-  | some cancel =>
-      try
-        cancel
-      catch _ =>
-        pure ()
+  cancelStreamRef requestStreamCancel
 
 private def cancelResponseStream (dispatch : ActiveDispatch) : IO Unit :=
   cancelResponseStreamRef dispatch.responseStreamCancel
 
 private def cancelRequestStream (dispatch : ActiveDispatch) : IO Unit :=
   cancelRequestStreamRef dispatch.requestStreamCancel
+
+private def signalDispatches (dispatches : Array ActiveDispatch) : IO Unit := do
+  for dispatch in dispatches do
+    IO.cancel dispatch.task
+
+/-- Finish cancellation of an already-signalled detached set while retaining
+exact ownership in the calling connection task. An uncooperative handler or
+callback parks its registered connection owner instead of becoming detached
+work. -/
+private def finishDispatchCancellationOwned (dispatches : Array ActiveDispatch) :
+    Std.Async.Async Unit := do
+  for dispatch in dispatches do
+    cancelRequestStream dispatch
+    cancelResponseStream dispatch
+  for dispatch in dispatches do
+    try
+      Std.Async.Async.ofAsyncTask dispatch.task
+    catch _ =>
+      pure ()
+
+/-- Signal every handler before entering the first arbitrary callback, then
+join every exact handler handle. -/
+private def cancelDispatchesOwned (dispatches : Array ActiveDispatch) :
+    Std.Async.Async Unit := do
+  signalDispatches dispatches
+  finishDispatchCancellationOwned dispatches
 
 /-- Unbounded so that feeding inbound messages from the connection loop never
 blocks on a slow handler (one stalled stream must not stall the connection).
@@ -1107,8 +1188,10 @@ private def feedRequestStream (feed : RequestStreamFeed) : IO (Except Status Uni
 /-- Wait for the dispatch to be registered in connection state before running the
 handler. Resolved immediately after the spawn site's registration, so the wait is
 momentary; a promise (instead of a poll loop) avoids adding latency to every RPC. -/
-private def waitUntilDispatchRegistered (registered : IO.Promise Unit) : IO Unit := do
-  discard <| IO.wait registered.result?
+private def waitUntilDispatchRegistered (registered : IO.Promise Unit) : Std.Async.Async Unit := do
+  match ← Std.Async.Async.ofTask registered.result? with
+  | some () => pure ()
+  | none => throw (IO.userError "dispatch registration gate was dropped")
 
 /-- Drop all connection-level state for a stream and send RST_STREAM so the peer learns
 the stream is dead instead of waiting on a response that will never arrive. -/
@@ -1116,9 +1199,11 @@ private def abortStreamShared (stateMutex : Std.Mutex State) (emit : Array Frame
     (streamId : Nat) (code : ErrorCode) : IO Unit := do
   stateMutex.atomically do
     let state ← get
+    let peerEnded := (findActiveRequestStream? state.activeRequestStreams streamId).isNone
     let state := { state with streams := removeStream state.streams streamId }
     let state := removeInboundStreamState state streamId
-    set (removeOutboundStreamState state streamId)
+    let state := removeOutboundStreamState state streamId
+    set (if peerEnded then state else drainResetInboundStreamBody state streamId)
   match RstStream.frame streamId code with
   | .error _ => pure ()
   | .ok rst =>
@@ -1126,6 +1211,15 @@ private def abortStreamShared (stateMutex : Std.Mutex State) (emit : Array Frame
         emit #[rst]
       catch _ =>
         pure ()
+
+/-- A deliberate connection/stream teardown has already selected the wire-level
+error (or received one from the peer). In that case task cancellation performs
+bookkeeping only; an unrelated INTERNAL_ERROR reset would contradict it. -/
+private def abortStreamSharedUnlessCancelled (cancelled : IO.Ref Bool)
+    (stateMutex : Std.Mutex State) (emit : Array Frame -> IO Unit)
+    (streamId : Nat) (code : ErrorCode) : IO Unit := do
+  unless ← cancelled.get do
+    abortStreamShared stateMutex emit streamId code
 
 private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex State)
     (emit : Array Frame -> IO Unit) (detached : DetachedDispatch) : IO Unit := do
@@ -1138,7 +1232,7 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
       discard <| stream.cancel.run
     responseStreamCancel.set (some cancel)
     if ← cancelled.get then
-      cancel
+      cancelResponseStreamRef responseStreamCancel
   let emitOutbound (frames : Array Frame) : IO Unit := do
     if ← IO.checkCanceled then
       throw (IO.userError Status.dispatchCancelledMessage)
@@ -1148,7 +1242,7 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
       match ← queueOutboundShared stateMutex emit frames with
       | .ok () => pure ()
       | .error status => throw (IO.userError status.messageD)
-  let task ← IO.asTask do
+  let task ← Std.Async.Async.toIO do
     waitUntilDispatchRegistered registered
     try
       match ← Transport.dispatchDecodedUnaryFramesWith
@@ -1173,7 +1267,8 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
               activeDispatches := removeActiveDispatchesForStream
                 state.activeDispatches detached.request.streamId
             }
-          abortStreamShared stateMutex emit detached.request.streamId ErrorCode.internalError
+          abortStreamSharedUnlessCancelled cancelled stateMutex emit
+            detached.request.streamId ErrorCode.internalError
     catch _ =>
       cancelResponseStreamRef responseStreamCancel
       stateMutex.atomically do
@@ -1183,7 +1278,8 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
           activeDispatches := removeActiveDispatchesForStream
             state.activeDispatches detached.request.streamId
         }
-      abortStreamShared stateMutex emit detached.request.streamId ErrorCode.internalError
+      abortStreamSharedUnlessCancelled cancelled stateMutex emit
+        detached.request.streamId ErrorCode.internalError
   stateMutex.atomically do
     let state ← get
     set {
@@ -1274,7 +1370,7 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       discard <| stream.cancel.run
     responseStreamCancel.set (some cancel)
     if ← cancelled.get then
-      cancel
+      cancelResponseStreamRef responseStreamCancel
   let emitOutbound (frames : Array Frame) : IO Unit := do
     if ← IO.checkCanceled then
       throw (IO.userError Status.dispatchCancelledMessage)
@@ -1320,7 +1416,7 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
     messages := { recv? := pure none },
     status := status
   }
-  let task ← IO.asTask do
+  let task ← Std.Async.Async.toIO do
     waitUntilDispatchRegistered registered
     try
       match dispatch.requestError with
@@ -1335,7 +1431,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
           | .error _status =>
               cancelResponseStreamRef responseStreamCancel
               finish none
-              abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
+              abortStreamSharedUnlessCancelled cancelled stateMutex emit
+                dispatch.streamId ErrorCode.internalError
       | none =>
           match dispatch.kind with
           | .clientStreaming handler =>
@@ -1349,7 +1446,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
               | .error _status =>
                   cancelResponseStreamRef responseStreamCancel
                   finish none
-                  abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
+                  abortStreamSharedUnlessCancelled cancelled stateMutex emit
+                    dispatch.streamId ErrorCode.internalError
           | .bidirectionalStreaming handler =>
               let result ← (registry.dispatchBidirectionalStreamingMessageStream
                 dispatch.metadata requestStream (some handler)).run
@@ -1361,11 +1459,13 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
               | .error _status =>
                   cancelResponseStreamRef responseStreamCancel
                   finish none
-                  abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
+                  abortStreamSharedUnlessCancelled cancelled stateMutex emit
+                    dispatch.streamId ErrorCode.internalError
     catch _ =>
       cancelResponseStreamRef responseStreamCancel
       finish none
-      abortStreamShared stateMutex emit dispatch.streamId ErrorCode.internalError
+      abortStreamSharedUnlessCancelled cancelled stateMutex emit
+        dispatch.streamId ErrorCode.internalError
   stateMutex.atomically do
     let state ← get
     let activeDispatch : ActiveDispatch := {
@@ -1408,15 +1508,29 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       }
   pure (.ok ())
 
-def cancelActiveShared (stateMutex : Std.Mutex State) : IO State := do
+def signalCancelActiveShared (stateMutex : Std.Mutex State) : IO Unit := do
+  let dispatches ← stateMutex.atomically do
+    let state ← get
+    for dispatch in state.activeDispatches do
+      dispatch.cancelled.set true
+    pure state.activeDispatches
+  -- This entry point is safe for shutdown/error callbacks: it never enters
+  -- arbitrary MessageStream.cancel IO and never waits for a handler.
+  signalDispatches dispatches
+
+def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async State := do
   let (state, dispatches, requestStreams) ← stateMutex.atomically do
     let state ← get
     let dispatches := state.activeDispatches
     let requestStreams := state.activeRequestStreams
+    for dispatch in dispatches do
+      dispatch.cancelled.set true
     let state := {
       state with
       streams := #[],
       ignoredInboundStreams := #[],
+      resetInboundStreams := #[],
+      resetHeaderBlock := none,
       activeRequestStreams := #[],
       activeDispatches := #[],
       pendingOutbound := #[],
@@ -1425,14 +1539,19 @@ def cancelActiveShared (stateMutex : Std.Mutex State) : IO State := do
     }
     set state
     pure (state, dispatches, requestStreams)
-  for dispatch in dispatches do
-    dispatch.cancelled.set true
-    cancelRequestStream dispatch
-    cancelResponseStream dispatch
-    IO.cancel dispatch.task
+  cancelDispatchesOwned dispatches
+  -- Streaming dispatches own their producer cancellation through
+  -- requestStreamCancel. Retain ownership for any defensive orphan as well.
   for requestStream in requestStreams do
-    discard <| requestStream.producer.cancel.run
+    unless dispatches.any (fun dispatch => dispatch.streamId == requestStream.streamId) do
+      discard <| requestStream.producer.cancel.run
   pure state
+
+/-- Synchronous compatibility wrapper. Managed servers use
+`cancelActiveSharedOwned`, so arbitrary nested cancellation cannot park the
+thread executing `Server.wait`. -/
+def cancelActiveShared (stateMutex : Std.Mutex State) : IO State :=
+  Std.Async.Async.block (cancelActiveSharedOwned stateMutex)
 
 private def finalizeStreamWith (registry : Registry) (state : State) (streamId : Nat)
     (emit : Array Frame -> IO Unit) : IO (Except Status State) := do
@@ -1504,10 +1623,110 @@ private def processGoAway (state : State) (frame : Frame) : Except Status (State
   discard <| GoAway.decode frame
   pure (state, #[])
 
+private def hasOpenInboundStream (state : State) (streamId : Nat) : Bool :=
+  (findStream? state.streams streamId).isSome
+    || (findActiveRequestStream? state.activeRequestStreams streamId).isSome
+    || !(activeDispatchesForStream state.activeDispatches streamId).isEmpty
+
+/-- Drop only `streamId`'s state after a locally generated RST_STREAM.  When
+the peer may still have DATA in flight, retain the id in drain-only mode so
+those connection-flow-controlled bytes cannot affect dispatch. -/
+private def resetLocalStream (state : State) (streamId : Nat) (peerEnded : Bool := false) : State :=
+  let wasOpen := hasOpenInboundStream state streamId
+  let state := { state with streams := removeStream state.streams streamId }
+  let state := removeInboundStreamState (removeOutboundStreamState state streamId) streamId
+  if wasOpen && !peerEnded then drainResetInboundStreamBody state streamId else state
+
 private def processPriority (state : State) (frame : Frame) : Except Status (State × Array Frame) := do
   discard <| Priority.decode frame
-  requireClientStreamId frame.header.streamId "PRIORITY"
+  -- RFC 9113 §6.3 permits deprecated PRIORITY frames in any stream state and
+  -- says they do not create or alter a stream. Structural decoding above is
+  -- therefore the entire transition.
   pure (state, #[])
+
+private def streamWindowOverrun (state : State) (frame : Frame) : Bool :=
+  frame.payload.size <= state.inboundConnectionWindow
+    && frame.payload.size > inboundStreamWindow state frame.header.streamId
+
+/-- Contain an otherwise well-framed DATA overrun to its stream.  The bytes
+still consume connection credit, immediately returned by the connection-level
+WINDOW_UPDATE; no stream credit is returned after the FLOW_CONTROL_ERROR. -/
+def resetStreamFlowControl (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) := do
+  let connectionUpdate ← WindowUpdate.frame 0 frame.payload.size
+  let rst ← RstStream.frame frame.header.streamId ErrorCode.flowControlError
+  let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
+  let state := resetLocalStream state frame.header.streamId
+    (peerEnded := FrameFlag.has frame.header.flags FrameFlag.endStream)
+  pure (state, { emitted := #[connectionUpdate, rst], cancelDispatches := cancelDispatches })
+
+/-- A stream receive-window violation consumes no lasting connection credit,
+produces no dispatch work, cancels only work attributable to the offending
+stream, and emits exactly a connection-credit refund followed by that stream's
+FLOW_CONTROL_ERROR reset.  In particular, connection identity and HPACK state
+are untouched. -/
+theorem resetStreamFlowControl_scoped {state state' : State} {frame : Frame}
+    {result : SharedFrameResult}
+    (h : resetStreamFlowControl state frame = .ok (state', result)) :
+    result.requestFeeds = #[] ∧ result.detached = none ∧ result.requestStreaming = none
+      ∧ state'.inboundConnectionWindow = state.inboundConnectionWindow
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ state'.hpack = state.hpack
+      ∧ state'.outboundHpack = state.outboundHpack
+      ∧ (∀ dispatch ∈ result.cancelDispatches,
+          dispatch.streamId = frame.header.streamId)
+      ∧ (∃ connectionUpdate rst,
+          WindowUpdate.frame 0 frame.payload.size = .ok connectionUpdate
+            ∧ RstStream.frame frame.header.streamId ErrorCode.flowControlError = .ok rst
+            ∧ result.emitted = #[connectionUpdate, rst]) := by
+  unfold resetStreamFlowControl at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  next => cases h
+  next connectionUpdate hconnectionUpdate =>
+    split at h
+    next => cases h
+    next rst hrst =>
+      cases h
+      refine ⟨rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      · simp only [resetLocalStream, removeInboundStreamState, removeOutboundStreamState,
+          drainResetInboundStreamBody]
+        split <;> rfl
+      · simp only [resetLocalStream, removeInboundStreamState, removeOutboundStreamState,
+          drainResetInboundStreamBody]
+        split <;> rfl
+      · simp only [resetLocalStream, removeInboundStreamState, removeOutboundStreamState,
+          drainResetInboundStreamBody]
+        split <;> rfl
+      · simp only [resetLocalStream, removeInboundStreamState, removeOutboundStreamState,
+          drainResetInboundStreamBody]
+        split <;> rfl
+      · intro dispatch hd
+        have hstream := (Array.mem_filter.mp hd).2
+        simpa using hstream
+      · exact ⟨connectionUpdate, rst, hconnectionUpdate, hrst, rfl⟩
+
+/-- Classify frame-local failures after the caller has completed all
+connection-scoped validation.  Every transition API consults this same helper,
+so choosing the aggregate, emitting, or shared runtime API cannot change an
+RFC 9113 stream error into a connection error. -/
+private def containStreamError? (state : State) (frame : Frame) :
+    Except Status (Option (State × SharedFrameResult)) := do
+  match frame.header.frameType with
+  | .data =>
+      requireClientStreamId frame.header.streamId "DATA"
+      -- Invalid padding is a connection error (§6.1) and therefore takes
+      -- precedence over the stream-window classification below. Keep using
+      -- the raw payload size for flow control: padding bytes consume credit.
+      discard <| stripPadding frame "DATA"
+      let validOpenStream :=
+        (findActiveRequestStream? state.activeRequestStreams frame.header.streamId).isSome
+          || ((findStream? state.streams frame.header.streamId).map streamHeaderComplete).getD false
+      if validOpenStream && streamWindowOverrun state frame then
+        some <$> resetStreamFlowControl state frame
+      else
+        pure none
+  | _ => pure none
 
 private def processRstStream (state : State) (frame : Frame) : Except Status (State × Array Frame) := do
   discard <| RstStream.decode frame
@@ -1524,6 +1743,67 @@ private def processRstStreamShared (state : State) (frame : Frame) :
   let state := { state with streams := removeStream state.streams frame.header.streamId }
   let state := removeInboundStreamState state frame.header.streamId
   pure (removeOutboundStreamState state frame.header.streamId, { cancelDispatches := cancelDispatches })
+
+/-- HPACK is connection-wide, so even a field block that crossed a local reset
+must be decompressed before it is discarded. Request semantics are intentionally
+not revalidated: this closed stream can no longer reach a handler. -/
+private def discardResetHeaderBlock (state : State) (headersFrame : Frame) : Except Status State := do
+  if !headerComplete headersFrame then
+    throw (Status.internal "reset HTTP/2 header block ended before END_HEADERS")
+  let decoded ← Hpack.decodeHeaderBlock state.hpack headersFrame.payload
+  Metadata.validateHeaderListSize state.inboundMaxHeaderListSize decoded.headers
+  let state := {
+    state with
+    hpack := decoded.state,
+    resetHeaderBlock := none
+  }
+  pure <| if FrameFlag.has headersFrame.header.flags FrameFlag.endStream then
+    removeInboundStreamState state headersFrame.header.streamId
+  else
+    state
+
+private def appendResetContinuationFrame (headersFrame frame : Frame) : Except Status Frame := do
+  requireClientStreamId frame.header.streamId "CONTINUATION"
+  if frame.header.streamId != headersFrame.header.streamId then
+    throw (Status.internal "HTTP/2 CONTINUATION frame changed reset stream id")
+  if headerComplete headersFrame then
+    throw (Status.internal "unexpected HTTP/2 CONTINUATION after reset END_HEADERS")
+  let payload := headersFrame.payload.append frame.payload
+  if payload.size > maxHeaderBlockSize then
+    throw (Status.internal "HTTP/2 reset header block exceeds the maximum supported size")
+  let flags :=
+    if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
+      UInt8.ofNat (headersFrame.header.flags.toNat + FrameFlag.endHeaders.toNat)
+    else
+      headersFrame.header.flags
+  pure {
+    headersFrame with
+    header := { headersFrame.header with length := payload.size, flags := flags },
+    payload := payload
+  }
+
+private def processResetHeaders (state : State) (frame : Frame) :
+    Except Status (State × Array Frame) := do
+  requireClientStreamId frame.header.streamId "HEADERS"
+  let state ←
+    if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
+      discardResetHeaderBlock state frame
+    else
+      pure { state with resetHeaderBlock := some frame }
+  pure (state, #[])
+
+private def processResetContinuation (state : State) (frame : Frame) :
+    Except Status (State × Array Frame) := do
+  let headersFrame ← match state.resetHeaderBlock with
+    | some headersFrame => pure headersFrame
+    | none => throw (Status.internal "HTTP/2 CONTINUATION frame arrived before reset HEADERS")
+  let headersFrame ← appendResetContinuationFrame headersFrame frame
+  let state ←
+    if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
+      discardResetHeaderBlock state headersFrame
+    else
+      pure { state with resetHeaderBlock := some headersFrame }
+  pure (state, #[])
 
 private def processHeaders (registry : Registry) (state : State) (frame : Frame) :
     IO (Except Status (State × Array Frame)) := do
@@ -1661,8 +1941,8 @@ private def processData (registry : Registry) (state : State) (frame : Frame) :
   match requireClientStreamId frame.header.streamId "DATA" with
   | .error status => pure (.error status)
   | .ok () =>
-    if containsStreamId state.ignoredInboundStreams frame.header.streamId then
-      match processIgnoredInboundData state frame with
+    if drainsInboundStreamBody state frame.header.streamId then
+      match processDrainingInboundData state frame with
       | .error status => pure (.error status)
       | .ok result => pure (.ok result)
     else match findStream? state.streams frame.header.streamId with
@@ -1695,8 +1975,8 @@ private def processDataWith (registry : Registry) (state : State) (frame : Frame
   match requireClientStreamId frame.header.streamId "DATA" with
   | .error status => pure (.error status)
   | .ok () =>
-    if containsStreamId state.ignoredInboundStreams frame.header.streamId then
-      match processIgnoredInboundData state frame with
+    if drainsInboundStreamBody state frame.header.streamId then
+      match processDrainingInboundData state frame with
       | .error status => pure (.error status)
       | .ok (state, updates) =>
           match ← emitFrameBatch emit updates with
@@ -1734,7 +2014,10 @@ receiver MUST treat the receipt of any other type of frame or a frame on a
 different stream as a connection error (Section 5.4.1) of type
 PROTOCOL_ERROR." -/
 private def requireHeaderBlockContinuation (state : State) (frame : Frame) : Except Status Unit := do
-  match pendingHeaderStream? state.streams with
+  let pending := match state.resetHeaderBlock with
+    | some headersFrame => some headersFrame.header.streamId
+    | none => pendingHeaderStream? state.streams
+  match pending with
   | none => pure ()
   | some streamId =>
       if frame.header.frameType == FrameType.continuation && frame.header.streamId == streamId then
@@ -1784,18 +2067,30 @@ def processFrame (registry : Registry) (state : State) (frame : Frame) :
           match requireHeaderBlockContinuation state frame with
           | .error status => pure (.error status)
           | .ok () =>
-              match frame.header.frameType with
-              | .settings => pure (processSettings state frame)
-              | .headers => withNormalizedHeaders frame (processHeaders registry state)
-              | .data => processData registry state frame
-              | .rstStream => pure (processRstStream state frame)
-              | .windowUpdate => pure (processWindowUpdate state frame)
-              | .ping => pure (processPing state frame)
-              | .continuation => processContinuation registry state frame
-              | .priority => pure (processPriority state frame)
-              | .goAway => pure (processGoAway state frame)
-              | .pushPromise => pure (.error (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported"))
-              | .unknown _ => pure (.ok (state, #[]))
+              match containStreamError? state frame with
+              | .error status => pure (.error status)
+              | .ok (some (state, result)) => pure (.ok (state, result.emitted))
+              | .ok none =>
+                match frame.header.frameType with
+                | .settings => pure (processSettings state frame)
+                | .headers => withNormalizedHeaders frame (fun frame =>
+                    if containsStreamId state.resetInboundStreams frame.header.streamId then
+                      pure (processResetHeaders state frame)
+                    else
+                      processHeaders registry state frame)
+                | .data => processData registry state frame
+                | .rstStream => pure (processRstStream state frame)
+                | .windowUpdate => pure (processWindowUpdate state frame)
+                | .ping => pure (processPing state frame)
+                | .continuation =>
+                    if containsStreamId state.resetInboundStreams frame.header.streamId then
+                      pure (processResetContinuation state frame)
+                    else
+                      processContinuation registry state frame
+                | .priority => pure (processPriority state frame)
+                | .goAway => pure (processGoAway state frame)
+                | .pushPromise => pure (.error (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported"))
+                | .unknown _ => pure (.ok (state, #[]))
 
 def processFrameWith (registry : Registry) (state : State) (frame : Frame)
     (emit : Array Frame -> IO Unit) : IO (Except Status State) := do
@@ -1808,18 +2103,31 @@ def processFrameWith (registry : Registry) (state : State) (frame : Frame)
           match requireHeaderBlockContinuation state frame with
           | .error status => pure (.error status)
           | .ok () =>
-              match frame.header.frameType with
-              | .settings => emitResultFrames emit (processSettings state frame)
-              | .headers => withNormalizedHeaders frame (processHeadersWith registry state · emit)
-              | .data => processDataWith registry state frame emit
-              | .rstStream => emitResultFrames emit (processRstStream state frame)
-              | .windowUpdate => emitResultFrames emit (processWindowUpdate state frame)
-              | .ping => emitResultFrames emit (processPing state frame)
-              | .continuation => processContinuationWith registry state frame emit
-              | .priority => emitResultFrames emit (processPriority state frame)
-              | .goAway => emitResultFrames emit (processGoAway state frame)
-              | .pushPromise => pure (.error (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported"))
-              | .unknown _ => pure (.ok state)
+              match containStreamError? state frame with
+              | .error status => pure (.error status)
+              | .ok (some (state, result)) =>
+                  emitResultFrames emit (.ok (state, result.emitted))
+              | .ok none =>
+                match frame.header.frameType with
+                | .settings => emitResultFrames emit (processSettings state frame)
+                | .headers => withNormalizedHeaders frame (fun frame =>
+                    if containsStreamId state.resetInboundStreams frame.header.streamId then
+                      emitResultFrames emit (processResetHeaders state frame)
+                    else
+                      processHeadersWith registry state frame emit)
+                | .data => processDataWith registry state frame emit
+                | .rstStream => emitResultFrames emit (processRstStream state frame)
+                | .windowUpdate => emitResultFrames emit (processWindowUpdate state frame)
+                | .ping => emitResultFrames emit (processPing state frame)
+                | .continuation =>
+                    if containsStreamId state.resetInboundStreams frame.header.streamId then
+                      emitResultFrames emit (processResetContinuation state frame)
+                    else
+                      processContinuationWith registry state frame emit
+                | .priority => emitResultFrames emit (processPriority state frame)
+                | .goAway => emitResultFrames emit (processGoAway state frame)
+                | .pushPromise => pure (.error (Status.unimplemented "HTTP/2 PUSH_PROMISE frames are not supported"))
+                | .unknown _ => pure (.ok state)
 
 /-- The pure bookkeeping `processHeadersShared` performs before the `IO`
 authorizer call: stream-id validation, buffering the header frame, and
@@ -1975,19 +2283,22 @@ point of this section.
   not affect processing of other streams".  It is reported with RST_STREAM and
   the connection keeps serving.
 
-Two transitions implement the second kind, and both end with the stream id in
-drain-only mode (`ignoredInboundStreams`) — because §5.4.2 continues: "after
-sending the RST_STREAM, the sending endpoint MUST be prepared to receive and
-process additional frames sent on the stream that might have been sent by the
-peer prior to the arrival of the RST_STREAM", and §6.9 requires those frames'
-flow-controlled bytes to stay accounted for.  Drain-only mode is exactly the
-mode already used for a stream rejected at headers, so its inertness is covered
-by `State.StreamInert` and the trace theorems below.
+Three cases implement the second kind. When the stream was open and the peer may
+still have DATA in flight, they retain its id in drain-only mode
+(`resetInboundStreams`) — because §5.4.2 continues: "after sending the
+RST_STREAM, the sending endpoint MUST be prepared to receive and process
+additional frames sent on the stream that might have been sent by the peer prior
+to the arrival of the RST_STREAM", and §6.9 requires those frames'
+flow-controlled bytes to stay accounted for. Reset drain-only mode is excluded
+from active-stream and graceful-drain accounting; it exists only to refund
+connection credit and to decompress any late field block.
 
 * `resetClosedStreamData` (here) — DATA for a stream that has already closed.
 * `rejectStreamAtHeaders` (above, reused by `authorizeRequestHeadersForStream`)
-  — a stream refused at completed request headers, whether by the authorizer or
-  by `SETTINGS_MAX_CONCURRENT_STREAMS`.
+  — a stream refused at completed request headers, whether by the authorizer,
+  or by `SETTINGS_MAX_CONCURRENT_STREAMS`.
+* `resetStreamFlowControl` — DATA that fits the connection window but exceeds
+  an otherwise valid open stream's receive window.
 
 One constraint shapes every decision here: a stream error may only be raised
 once the frame's field block (if any) has been decoded.  RFC 9113 §4.3 —
@@ -1995,10 +2306,10 @@ once the frame's field block (if any) has been decoded.  RFC 9113 §4.3 —
 (Section 5.4.1) of type COMPRESSION_ERROR if it does not decompress a field
 block" — makes the HPACK dynamic table connection-wide state, so skipping a
 block desynchronises the decoder for every later stream.  That is why the
-failures detected *before* HPACK decoding (padding, truncated priority section,
-oversized header block, CONTINUATION sequencing) stay connection-fatal even
-where an RFC rule in isolation would allow a stream error, and why the
-concurrency refusal is deferred until the block has been read.
+failures that prevent safe field-block processing (invalid padding, a truncated
+priority section, oversized header block, CONTINUATION sequencing) stay
+connection-fatal. Conversely, a concurrency or authorization refusal is
+deferred until the complete block has been read.
 -/
 
 /-- A DATA frame naming a stream id that was opened earlier and has since
@@ -2010,10 +2321,10 @@ or 'half-closed (local)' state, the recipient MUST respond with a stream error
 a client that races an extra DATA frame against the END_STREAM it already sent,
 or against our RST_STREAM — and it used to kill the whole connection.
 
-The frame is drained through `processIgnoredInboundData` *before* the
-RST_STREAM is emitted so the receive windows are credited exactly as for any
-other body byte: RFC 9113 §5.4.2 requires the flow-controlled bytes of frames
-that cross a reset to remain accounted for.
+The frame is drained through `processResetInboundData` *before* the RST_STREAM
+is emitted. Only the connection window is credited: the stream is already
+closed, but RFC 9113 §5.4.2 still requires its in-flight bytes to count against
+connection flow control.
 
 An id *above* `lastClientStreamId` has never been opened (`idle`), and §5.1
 says of that state: "Receiving any frame other than HEADERS or PRIORITY on a
@@ -2026,7 +2337,8 @@ private def resetClosedStreamData (state : State) (frame : Frame) :
   let rst ← RstStream.frame streamId ErrorCode.streamClosed
   let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
   let state := removeOutboundStreamState state streamId
-  let (state, updates) ← processIgnoredInboundData (ignoreInboundStreamBody state streamId) frame
+  let (state, updates) ← processResetInboundData
+    (drainResetInboundStreamBody state streamId) frame
   pure (state, { emitted := updates.push rst, cancelDispatches := cancelDispatches })
 
 /-- DATA for a unary request: the body is buffered on the stream and both
@@ -2067,8 +2379,8 @@ def processDataShared (registry : Registry) (state : State) (frame : Frame) :
   match requireClientStreamId frame.header.streamId "DATA" with
   | .error status => .error status
   | .ok () =>
-    if containsStreamId state.ignoredInboundStreams frame.header.streamId then
-      match processIgnoredInboundData state frame with
+    if drainsInboundStreamBody state frame.header.streamId then
+      match processDrainingInboundData state frame with
       | .error status => .error status
       | .ok (drained, updates) => .ok (drained, { emitted := updates })
     else
@@ -2135,27 +2447,56 @@ private def processFrameShared (registry : Registry) (state : State) (frame : Fr
     | .headers =>
         match normalizeHeadersFrame frame with
         | .error status => pure (.error status)
-        | .ok frame => processHeadersShared registry state frame
-    | .continuation => processContinuationShared registry state frame
+        | .ok frame =>
+            if containsStreamId state.resetInboundStreams frame.header.streamId then
+              match processResetHeaders state frame with
+              | .error status => pure (.error status)
+              | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
+            else
+              processHeadersShared registry state frame
+    | .continuation =>
+        if containsStreamId state.resetInboundStreams frame.header.streamId then
+          match processResetContinuation state frame with
+          | .error status => pure (.error status)
+          | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
+        else
+          processContinuationShared registry state frame
     | _ => pure (processNonHeaderFrameShared registry state frame)
 
-def processFrameSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
-    (emit : Array Frame -> IO Unit) : IO (Except Status Unit) := do
+def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
+    (emit : Array Frame -> IO Unit) : Std.Async.Async (Except Status Unit) := do
   match ← stateMutex.atomically (do
     let state ← get
-    match ← processFrameShared registry state frame with
+    let validated : Except Status Unit := do
+      requireInboundFrameSize state frame
+      requireClientSettingsFrame state frame
+      requireHeaderBlockContinuation state frame
+    let step ← match validated with
+      | .error status => pure (.error status)
+      | .ok () =>
+        match containStreamError? state frame with
+        | .error status => pure (.error status)
+        | .ok (some result) => pure (.ok result)
+        | .ok none => processFrameShared registry state frame
+    match step with
     | .error status => pure (Except.error status)
     | .ok (state, result) =>
+        -- The pure transition has detached these stream owners. Mark them
+        -- before publishing that state so late response registration observes
+        -- cancellation and takes the same exactly-once callback path.
+        for dispatch in result.cancelDispatches do
+          dispatch.cancelled.set true
         set state
         pure (Except.ok result)) with
   | .error status => pure (Except.error status)
   | .ok result =>
-      for dispatch in result.cancelDispatches do
-        dispatch.cancelled.set true
-        cancelRequestStream dispatch
-        cancelResponseStream dispatch
-        IO.cancel dispatch.task
-      match ← emitFrameBatch emit result.emitted with
+      -- Select and signal the stream error first, then publish its wire frame.
+      -- User cleanup cannot suppress the peer-visible RST_STREAM. Cleanup is
+      -- still joined below even when emission reports a transport error.
+      signalDispatches result.cancelDispatches
+      let emitResult ← emitFrameBatch emit result.emitted
+      finishDispatchCancellationOwned result.cancelDispatches
+      match emitResult with
       | .error status => pure (.error status)
       | .ok () =>
           for feed in result.requestFeeds do
@@ -2174,33 +2515,40 @@ def processFrameSharedWith (registry : Registry) (stateMutex : Std.Mutex State) 
               spawnDetachedDispatch registry stateMutex emit detached
               pure (.ok ())
 
-private partial def processFrames (registry : Registry) (frames : Array Frame) (i : Nat)
+/-- Synchronous compatibility wrapper around the connection-owner variant. -/
+def processFrameSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
+    (emit : Array Frame -> IO Unit) : IO (Except Status Unit) :=
+  Std.Async.Async.block (processFrameSharedWithOwned registry stateMutex frame emit)
+
+private def processFrames (registry : Registry) (frames : Array Frame) (i : Nat)
     (state : State) (out : Array Frame) : IO (Except Status (State × Array Frame)) := do
-  if i >= frames.size then
-    pure (.ok (state, out))
-  else
-    match (← processFrame registry state frames[i]!) with
-    | .error status => pure (Except.error status)
-    | .ok (state, emitted) => processFrames registry frames (i + 1) state (out.append emitted)
+  let mut state := state
+  let mut out := out
+  for j in [i:frames.size] do
+    match ← processFrame registry state frames[j]! with
+    | .error status => return .error status
+    | .ok (nextState, emitted) =>
+        state := nextState
+        out := out.append emitted
+  pure (.ok (state, out))
 
-private partial def processFramesWith (registry : Registry) (frames : Array Frame) (i : Nat)
+private def processFramesWith (registry : Registry) (frames : Array Frame) (i : Nat)
     (state : State) (emit : Array Frame -> IO Unit) : IO (Except Status State) := do
-  if i >= frames.size then
-    pure (.ok state)
-  else
-    match (← processFrameWith registry state frames[i]! emit) with
-    | .error status => pure (.error status)
-    | .ok state => processFramesWith registry frames (i + 1) state emit
+  let mut state := state
+  for j in [i:frames.size] do
+    match ← processFrameWith registry state frames[j]! emit with
+    | .error status => return .error status
+    | .ok nextState => state := nextState
+  pure (.ok state)
 
-private partial def processFramesSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
+private def processFramesSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
     (frames : Array Frame) (i : Nat) (emit : Array Frame -> IO Unit) :
-    IO (Except Status Unit) := do
-  if i >= frames.size then
-    pure (.ok ())
-  else
-    match ← processFrameSharedWith registry stateMutex frames[i]! emit with
-    | .error status => pure (.error status)
-    | .ok () => processFramesSharedWith registry stateMutex frames (i + 1) emit
+    Std.Async.Async (Except Status Unit) := do
+  for j in [i:frames.size] do
+    match ← processFrameSharedWithOwned registry stateMutex frames[j]! emit with
+    | .error status => return .error status
+    | .ok () => pure ()
+  pure (.ok ())
 
 def processBytes (registry : Registry) (state : State) (chunk : ByteArray) :
     IO (Except Status (State × Array Frame)) := do
@@ -2230,8 +2578,9 @@ def processBytesWith (registry : Registry) (state : State) (chunk : ByteArray)
             let state := { state with decoder := { buffered := decoded.buffered } }
             processFramesWith registry decoded.frames 0 state emit
 
-def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (chunk : ByteArray)
-    (emit : Array Frame -> IO Unit) : IO (Except Status Unit) := do
+def processBytesSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State)
+    (chunk : ByteArray)
+    (emit : Array Frame -> IO Unit) : Std.Async.Async (Except Status Unit) := do
   match ← stateMutex.atomically (do
     let state ← get
     match consumePreface state chunk with
@@ -2249,6 +2598,11 @@ def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) 
   | .error status => pure (Except.error status)
   | .ok frames => processFramesSharedWith registry stateMutex frames 0 emit
 
+/-- Synchronous compatibility wrapper around the connection-owner variant. -/
+def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (chunk : ByteArray)
+    (emit : Array Frame -> IO Unit) : IO (Except Status Unit) :=
+  Std.Async.Async.block (processBytesSharedWithOwned registry stateMutex chunk emit)
+
 def encodeFrames (frames : Array Frame) : Except Status ByteArray :=
   frames.foldlM (init := ByteArray.empty) fun out frame => do
     let bytes ← Frame.encode frame
@@ -2262,13 +2616,19 @@ def processBytesEncodedWith (registry : Registry) (state : State) (chunk : ByteA
         if bytes.isEmpty then pure () else emit bytes
     | .error status => throw (IO.userError status.messageD)
 
-def processBytesEncodedSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
-    (chunk : ByteArray) (emit : ByteArray -> IO Unit) : IO (Except Status Unit) := do
-  processBytesSharedWith registry stateMutex chunk fun frames => do
+def processBytesEncodedSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State)
+    (chunk : ByteArray) (emit : ByteArray -> IO Unit) :
+    Std.Async.Async (Except Status Unit) := do
+  processBytesSharedWithOwned registry stateMutex chunk fun frames => do
     match encodeFrames frames with
     | .ok bytes =>
         if bytes.isEmpty then pure () else emit bytes
     | .error status => throw (IO.userError status.messageD)
+
+/-- Synchronous compatibility wrapper around the connection-owner variant. -/
+def processBytesEncodedSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
+    (chunk : ByteArray) (emit : ByteArray -> IO Unit) : IO (Except Status Unit) :=
+  Std.Async.Async.block (processBytesEncodedSharedWithOwned registry stateMutex chunk emit)
 
 def processBytesEncoded (registry : Registry) (state : State) (chunk : ByteArray) :
     IO (Except Status (State × ByteArray)) := do
@@ -2338,10 +2698,10 @@ yet proved):
   DATA needs stream identity attached to `RequestStreamFeed` artifacts.
 -/
 
-/-- `true` when the connection rejected the stream at request headers and is
-draining its remaining body without dispatch. -/
+/-- `true` when the connection is draining a request body without dispatch,
+either after a headers rejection or after a locally generated RST_STREAM. -/
 def State.rejectedAtHeaders (state : State) (streamId : Nat) : Bool :=
-  containsStreamId state.ignoredInboundStreams streamId
+  drainsInboundStreamBody state streamId
 
 /-- A stream id that can never reach a handler in this connection state: no
 buffered header/body frames, no incremental request feed, and the id is
@@ -2377,8 +2737,10 @@ theorem rejectStreamAtHeaders_rejected (state : State) (streamId : Nat)
     (rejectStreamAtHeaders state streamId inboundHpack outboundHpack false).rejectedAtHeaders
       streamId = true := by
   unfold rejectStreamAtHeaders ignoreInboundStreamBody State.rejectedAtHeaders
-  simp only [Bool.false_eq_true]
-  exact containsStreamId_pushUniqueStreamId _ _
+    drainsInboundStreamBody
+  simp only [Bool.false_eq_true, if_false]
+  rw [containsStreamId_pushUniqueStreamId]
+  rfl
 
 /-- Rejecting a stream at headers makes it inert: its buffered frames are
 gone, it never entered the incremental request path, and its id cannot be
@@ -2494,6 +2856,64 @@ private theorem processIgnoredInboundData_ok {state state' : State} {frame : Fra
             rw [ha2, ha1] at hmem
             exact hmem
 
+private theorem processResetInboundData_state {state state' : State} {frame : Frame}
+    {updates : Array Frame}
+    (h : processResetInboundData state frame = .ok (state', updates)) :
+    state' = state ∨ ∃ streamId, state' = removeInboundStreamState state streamId := by
+  unfold processResetInboundData at h
+  simp only [bind, Except.bind, discard, Functor.discard, Functor.mapConst,
+    pure, Except.pure] at h
+  split at h
+  next => cases h
+  next =>
+    split at h
+    next =>
+      split at h
+      next => cases h
+      next frame' hstrip =>
+        split at h
+        next => cases h
+        next _ hnorm =>
+          cases h
+          split
+          · exact .inr ⟨frame'.header.streamId, rfl⟩
+          · exact .inl rfl
+    next =>
+      split at h
+      next => cases h
+      next update hupdate =>
+        split at h
+        next => cases h
+        next frame' hstrip =>
+          split at h
+          next => cases h
+          next _ hnorm =>
+            cases h
+            split
+            · exact .inr ⟨frame'.header.streamId, rfl⟩
+            · exact .inl rfl
+
+private theorem processResetInboundData_ok {state state' : State} {frame : Frame}
+    {updates : Array Frame}
+    (h : processResetInboundData state frame = .ok (state', updates)) :
+    state'.streams = state.streams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams) := by
+  rcases processResetInboundData_state h with rfl | ⟨streamId, rfl⟩
+  · exact ⟨rfl, rfl, fun _ hactive => hactive⟩
+  · exact removeInboundStreamState_fields state streamId
+
+private theorem processDrainingInboundData_ok {state state' : State} {frame : Frame}
+    {updates : Array Frame}
+    (h : processDrainingInboundData state frame = .ok (state', updates)) :
+    state'.streams = state.streams
+      ∧ state'.lastClientStreamId = state.lastClientStreamId
+      ∧ (∀ active ∈ state'.activeRequestStreams, active ∈ state.activeRequestStreams) := by
+  unfold processDrainingInboundData at h
+  split at h
+  · exact processResetInboundData_ok h
+  · exact processIgnoredInboundData_ok h
+
 
 /-- A DATA frame for a stream rejected at headers is drained: the step
 produces no request feed, no detached dispatch, no request-streaming
@@ -2512,14 +2932,14 @@ private theorem processDataShared_rejected {registry : Registry} {state state' :
   split at h
   next => cases h
   next =>
-    rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = true
+    rw [show drainsInboundStreamBody state frame.header.streamId = true
       from hrej] at h
     simp only [if_true] at h
     split at h
     next => cases h
     next drained updates hproc =>
       cases h
-      obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
+      obtain ⟨hs, hl, ha⟩ := processDrainingInboundData_ok hproc
       exact ⟨rfl, rfl, rfl, rfl, hs, hl, ha⟩
 
 /-- A DATA frame for an inert stream that is not in drain mode — the stream was
@@ -2549,7 +2969,7 @@ theorem processDataShared_inert_reset {registry : Registry} {state state' : Stat
   split at h
   next => cases h
   next =>
-    rw [show containsStreamId state.ignoredInboundStreams frame.header.streamId = false
+    rw [show drainsInboundStreamBody state frame.header.streamId = false
       from hnotrej] at h
     simp only [Bool.false_eq_true, if_false] at h
     have hactive : findActiveRequestStream? state.activeRequestStreams
@@ -2576,17 +2996,17 @@ theorem processDataShared_inert_reset {registry : Registry} {state state' : Stat
       next pair hproc =>
         obtain ⟨drained, updates⟩ := pair
         cases h
-        obtain ⟨hs, hl, ha⟩ := processIgnoredInboundData_ok hproc
+        obtain ⟨hs, hl, ha⟩ := processResetInboundData_ok hproc
         refine ⟨rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_⟩
         · intro dispatch hd
           have := (Array.mem_filter.mp hd).2
           simpa using this
         · rw [hs]
-          simp [ignoreInboundStreamBody, removeOutboundStreamState]
+          simp [drainResetInboundStreamBody, removeOutboundStreamState]
         · rw [hl]; rfl
         · intro active hmem
           have hmem' := ha active hmem
-          simpa [ignoreInboundStreamBody, removeOutboundStreamState] using hmem'
+          simpa [drainResetInboundStreamBody, removeOutboundStreamState] using hmem'
         · refine ⟨rst, Array.mem_push_self, ?_, ?_⟩
           · exact RstStream.frame_frameType hrst
           · exact RstStream.frame_streamId hrst
@@ -2925,10 +3345,7 @@ private theorem processPriority_ok {state : State} {frame : Frame} {res : State 
     Except.pure] at h
   split at h
   next => cases h
-  next =>
-    split at h
-    next => cases h
-    next => cases h; exact ⟨rfl, rfl, rfl⟩
+  next => cases h; exact ⟨rfl, rfl, rfl⟩
 
 private theorem processRstStreamShared_ok {state : State} {frame : Frame}
     {res : State × SharedFrameResult}
@@ -3819,10 +4236,7 @@ private theorem processPriority_wellFormed {state : State} {frame : Frame}
     Except.pure] at heq
   split at heq
   next => cases heq
-  next =>
-    split at heq
-    next => cases heq
-    next => cases heq; exact h
+  next => cases heq; exact h
 
 private theorem removeInboundStreamState_same (state : State) (streamId : Nat) :
     SameOutbound (removeInboundStreamState state streamId) state :=
@@ -3834,6 +4248,10 @@ private theorem removeOutboundStreamState_same (state : State) (streamId : Nat) 
 
 private theorem ignoreInboundStreamBody_same (state : State) (streamId : Nat) :
     SameOutbound (ignoreInboundStreamBody state streamId) state :=
+  ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
+
+private theorem drainResetInboundStreamBody_same (state : State) (streamId : Nat) :
+    SameOutbound (drainResetInboundStreamBody state streamId) state :=
   ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩
 
 private theorem processRstStreamShared_wellFormed {state : State} {frame : Frame}
@@ -3933,6 +4351,30 @@ private theorem processIgnoredInboundData_wellFormed {state state' : State} {fra
           split
           · exact SameOutbound.trans (removeInboundStreamState_same _ _) hbase
           · exact hbase
+
+private theorem processResetInboundData_same {state state' : State} {frame : Frame}
+    {updates : Array Frame}
+    (heq : processResetInboundData state frame = .ok (state', updates)) :
+    SameOutbound state' state := by
+  rcases processResetInboundData_state heq with rfl | ⟨streamId, rfl⟩
+  · exact SameOutbound.refl _
+  · exact removeInboundStreamState_same _ streamId
+
+private theorem processResetInboundData_wellFormed {state state' : State} {frame : Frame}
+    {updates : Array Frame} (h : WellFormed state)
+    (heq : processResetInboundData state frame = .ok (state', updates)) :
+    WellFormed state' := by
+  obtain ⟨hstreams, hlast, -⟩ := processResetInboundData_ok heq
+  exact h.ofFields (processResetInboundData_same heq) hstreams hlast
+
+private theorem processDrainingInboundData_wellFormed {state state' : State}
+    {frame : Frame} {updates : Array Frame} (h : WellFormed state)
+    (heq : processDrainingInboundData state frame = .ok (state', updates)) :
+    WellFormed state' := by
+  unfold processDrainingInboundData at heq
+  split at heq
+  · exact processResetInboundData_wellFormed h heq
+  · exact processIgnoredInboundData_wellFormed h heq
 
 private theorem stripPadding_streamId {frame frame' : Frame} {frameName : String}
     (heq : stripPadding frame frameName = .ok frame') :
@@ -4117,10 +4559,10 @@ private theorem resetClosedStreamData_wellFormed {state : State} {frame : Frame}
     next pair hproc =>
       obtain ⟨drained, updates⟩ := pair
       cases heq
-      refine processIgnoredInboundData_wellFormed ?_ hproc
+      refine processResetInboundData_wellFormed ?_ hproc
       refine h.ofSame ?_ ?_ rfl
       · exact SameOutbound.trans
-          (ignoreInboundStreamBody_same _ _) (removeOutboundStreamState_same _ _)
+          (drainResetInboundStreamBody_same _ _) (removeOutboundStreamState_same _ _)
       · intro s hs
         have hs' : s ∈ removeStream (removeOutboundStreamState state frame.header.streamId).streams
             frame.header.streamId := hs
@@ -4140,7 +4582,7 @@ private theorem processDataShared_wellFormed {registry : Registry} {state : Stat
       next => cases heq
       next drained updates hproc =>
         cases heq
-        exact processIgnoredInboundData_wellFormed h hproc
+        exact processDrainingInboundData_wellFormed h hproc
     next =>
       split at heq
       next => exact processActiveRequestData_wellFormed h heq

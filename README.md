@@ -42,9 +42,9 @@ flowchart TB
 | Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses newer streams with `REFUSED_STREAM`, `wait` drains with a timeout — over both h2c and TLS |
-| Connection lifecycle | No managed connection dies silently, plaintext or TLS: every teardown records a `CloseCause` (peer close, shutdown, keepalive timeout, connection error, connection-task failure), the peer gets a GOAWAY carrying that cause before the socket is retired — sealed through the TLS session where there is one — and the last 64 causes are readable from `Grpc.Server.closedConnections`. `acceptFailure?`/`checkAccepting` expose the accept loop while the server runs |
-| Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and their streams; handler exceptions become gRPC statuses |
-| Error scope | Framing failures are split per RFC 9113 §5.4. A stream error (a DATA frame on a stream that has closed, a HEADERS frame over `MAX_CONCURRENT_STREAMS`) answers RST_STREAM and the connection keeps serving every other stream; a connection error (preface violation, CONTINUATION sequencing, stream-id monotonicity, flow-control overflow, an undecodable field block) still ends the connection with GOAWAY. Every connection-scoped framing check carries a comment naming the RFC rule it follows, including the two places where a rule that would permit a stream error is deliberately widened to a connection error and why |
+| Connection lifecycle | Every managed plaintext/TLS teardown records one `CloseCause`, with the last 64 readable from `Grpc.Server.closedConnections`. Once HTTP/2 is established and the peer is still readable, teardown makes a best-effort GOAWAY carrying that cause (sealed through TLS); a peer that already closed, or a connection still in TLS handshake, cannot receive one. After shutdown, exact connection owners are observed with a finite bound but never cancelled out from under nested work: timeout leaves the owner and connection registered and returns an ownership error. `acceptFailure?`/`checkAccepting` expose the accept loop while it runs |
+| Cancellation | RST_STREAM and peer disconnect cancel in-flight dispatches and take request/response stream callbacks exactly once; each handler and arbitrary callback remains beneath the exact connection owner until it finishes. Handler exceptions become gRPC statuses |
+| Error scope | Framing failures are split per RFC 9113 §5.4. Newly invalid DATA on a previously closed stream, HEADERS over `MAX_CONCURRENT_STREAMS`, or an open stream exceeding its own receive window answer RST_STREAM while the connection keeps serving. Once a stream has been locally reset, late in-flight DATA is absorbed with connection-only flow credit and no repeat reset, and late field blocks are HPACK-decoded before being discarded. Connection errors — preface violation, CONTINUATION sequencing, stream-id monotonicity, connection-window overflow, or an undecodable field block — still end the connection with GOAWAY. Deprecated PRIORITY dependency semantics are ignored after structural validation, including on idle streams. Every connection-scoped check names the RFC rule it follows, and a header refusal is deferred until HPACK has consumed the complete field block |
 
 ## Server
 
@@ -67,27 +67,41 @@ and shutdown bookkeeping), `serveTls`, `serveForever`/`acceptOne` (unmanaged),
 and `serveClient`/`serveClientWithState` for bring-your-own-socket or shared
 `Std.Mutex` frame-driver embedding. `Grpc.Server.Config` covers address,
 backlog, read size, `TCP_NODELAY`, `maxConcurrentStreams`, `maxHeaderListSize`,
-and keepalive interval/timeout.
+and keepalive interval/timeout. The unmanaged and bring-your-own-socket entry
+points return `Std.Async.Async`; spawn them with `Async.toIO` when crossing into
+an `IO` lifecycle. Likewise, all in-flight client call and stream operations
+run in `Async`, including bounded cooperative `Client.close`; connection setup
+and explicit `Async.block` boundaries stay in `IO`.
 
-A managed connection never dies silently. Every teardown path records a
+A managed connection never dies without a local record. Every teardown path records a
 `CloseCause` — peer close, server shutdown, keepalive timeout, connection error,
-or a failure of the connection task itself. The peer is told: unless it has
-already gone, it receives a GOAWAY whose debug data is that cause, emitted
-before the socket is retired, so the EOF that follows is attributable rather
-than a bare disconnect. Locally the last 64 causes are readable from
+or a failure of the connection task itself. If HTTP/2 has started and the peer
+has not already gone, teardown makes a best-effort GOAWAY whose debug data is
+that cause before transport retirement. Peer-initiated EOF and failures during
+the TLS handshake cannot be announced with an HTTP/2 frame. Locally the last 64 causes are readable from
 `Grpc.Server.closedConnections`. `Grpc.Server.acceptFailure?` /
 `checkAccepting` expose the accept loop while the server runs, so a dead accept
 loop is a reportable failure instead of clients hanging on connect.
 
-For every cause the peer was told about, teardown then retires the socket in
-`Async`, racing the write-side shutdown against a short timer: a peer that has
-stopped reading cannot stall it, and no worker thread is parked. (A peer that
-closed first already sent its FIN, so that path skips the shutdown.) When the
-timer wins, `Async.race` leaves the shutdown task running — bounded at one
-suspended task per stalled peer, holding no worker — and the file descriptor is
-released by finalization when `uv_shutdown` eventually settles. Lean 4.31's
+`Grpc.Server.wait` is bounded by its finite drain timeout only after
+`Grpc.Server.shutdown`; before shutdown it is intentionally the serving
+process's blocking join. Nested handler and `MessageStream.cancel` work is
+retained by the exact connection task. If arbitrary user code ignores
+cancellation, finite post-shutdown `wait` returns an ownership-timeout error
+with that task and its `ActiveConnection` still visible rather than orphaning
+it. A later wait can complete if the user work eventually returns.
+
+Every teardown then attempts to retire the local socket in `Async`, including after peer
+EOF (which is only a read-side half-close). The plaintext/TLS writer drain and
+write-side shutdown are each raced against a short timer: a peer that has
+stopped reading cannot stall teardown, and no worker thread is parked. When the
+shutdown timer wins, `Async.race` leaves that native promise running, holding no
+worker, and the file descriptor is released by finalization only when
+`uv_shutdown` eventually settles. A TLS server handshake send uses the same
+bounded ownership rule: its TLS continuation ends on shutdown, but the
+uncancellable native send promise can remain. Lean 4.31's
 `Std.Internal.UV.TCP.Socket` offers `shutdown` but no `close`, so prompt FIN is
-reachable and deterministic fd release is not; a single `Socket.close` over
+best-effort and deterministic fd release is not; a single `Socket.close` over
 `uv_close` would remove both residues, and the rationale in
 `Grpc/Http2/Server.lean` states that ask in full.
 
@@ -114,6 +128,12 @@ over one HTTP/2 connection (background reader + writer tasks). On top of it:
 deadline of the request a handler is currently serving. The client advertises `grpc-accept-encoding: identity,gzip` and
 transparently inflates gzip responses; it never compresses requests.
 `Test/ClientTest.lean` and `Test/StreamingTest.lean` are the reference usage.
+`Client.close` cooperatively joins the exact reader/writer owners with bounds.
+A plaintext writer failure has its own sticky signal, so it wakes a reader even
+when the peer keeps its write side open; that reader marks calls failed and
+retires the transport. As on the server, the available TCP primitive is bounded
+write-side `shutdown`, not hard `uv_close`: a losing shutdown promise may remain
+suspended without a worker until the OS settles it.
 
 ## Codegen
 
@@ -163,12 +183,22 @@ Deliberately out of scope or ignored (a candid list):
   affected calls with `UNAVAILABLE`).
 - Peer `MAX_CONCURRENT_STREAMS` / `MAX_HEADER_LIST_SIZE` settings are
   accepted but not enforced against outbound work.
-- Malformed framing is connection-fatal: the server answers
-  GOAWAY(INTERNAL_ERROR) rather than containing the error per-stream.
+- Connection-scoped malformed framing answers GOAWAY; stream-scoped failures
+  answer RST_STREAM and leave unrelated streams serving (see the table above).
+- Cancellation cleanup is owned at connection granularity. A stream reset is
+  emitted before user cleanup begins, but a `MessageStream.cancel` callback or
+  handler that never returns parks that connection owner; unrelated streams on
+  the same connection cannot progress until it returns. This is deliberate
+  exact ownership, not per-stream retirement concurrency.
 - No HTTP/1.1 → h2c upgrade; plaintext is prior-knowledge h2c only.
-- The server never half-closes the TCP write side (documented rationale in
-  `Grpc/Http2/Server.lean`: a peer that stops reading would leak a worker per
-  connection).
+- Outbound plaintext and TLS writer channels are currently unbounded; flow
+  control bounds DATA progress, but sustained encoded control/response
+  production can still grow those queues.
+- Transport retirement cooperatively drains each connection's sole writer,
+  bounds that drain and the TCP write-side shutdown, and sends a local FIN even
+  after peer EOF when the OS accepts it (peer EOF is only a half-close). There
+  is no hard `uv_close`, so a timed-out native send/shutdown and its descriptor
+  can outlive the Lean-level owner without occupying a worker.
 
 ## Compression
 
@@ -191,7 +221,11 @@ certificate chain and a raw Ed25519 signing key. `Client.connectTls` validates
 the peer chain and hostname against `trustAnchorsPEM` (leaving it `none` skips
 validation — test use only). `Grpc.Tls.Rest` additionally provides a minimal
 HTTP/1.1 JSON server over the same TLS stack (one request per connection; not
-a general HTTP server).
+a general HTTP server). Its accept/connection owners and waits are bounded and
+tracked like the gRPC server; it has the same unavoidable losing native
+send/shutdown promise when a peer stops reading because no hard close exists.
+`Grpc.Tls.Rest.connectionFailures` exposes the bounded last 64 non-fatal
+connection failures as connection ID, lifecycle stage, and message.
 
 The server negotiates a single suite — TLS_CHACHA20_POLY1305_SHA256, X25519
 (P-256 only when configured), Ed25519 — but selects it from the client's
@@ -222,8 +256,8 @@ Honest summary: there is no official gRPC interop-suite or h2spec run yet.
   defined in an imported file, plus unary calls with enum/map/optional
   fields, `DEADLINE_EXCEEDED` via client deadline, error mapping, a 90 kB
   payload, and server-, client- and bidi-streaming calls. It is tagged
-  `manual` and `requires-grpcurl`, so `bazel test //...` skips it — run it
-  explicitly, with grpcurl on `PATH`, to reproduce those results.
+  `manual` and `requires-grpcurl`, so a bare `bazel test //...` skips it; CI
+  runs it explicitly with grpcurl on `PATH` on pushes and on the weekly gate.
 - `//examples/lean_proto:note_grpcurl_tls_interop_test` drives the same server
   through `Grpc.Server.serveTls` — TLS 1.3 terminated by `../tls13-lean`,
   ALPN `h2`, HTTP/2 and gRPC by this repo — with **grpcurl** and **OpenSSL
@@ -232,8 +266,8 @@ Honest summary: there is no official gRPC interop-suite or h2spec run yet.
   wrong `-servername` is rejected, then repeats the reflection-only
   `list`/`describe`/invoke flow, error mapping, a 90 kB payload that spans
   many 16 kB TLS records, and server-, client- and bidi-streaming over one
-  encrypted connection. Also `manual` and `requires-grpcurl`; run it with
-  grpcurl and openssl on `PATH`.
+  encrypted connection. It is also `manual` and `requires-grpcurl`; CI runs it
+  explicitly with grpcurl and openssl on pushes and on the weekly gate.
 - Wire behaviors (trailers-only responses, percent-encoded `grpc-message`,
   `-bin` metadata, status mapping) follow the gRPC over HTTP/2 spec and are
   covered by the in-repo test suite.
@@ -328,7 +362,11 @@ What holds today:
     `processDataShared_inert_reset` — a DATA frame for a stream that has
     already closed produces no request feed, no dispatch, cancels nothing
     outside that stream, emits an RST_STREAM naming only it, and leaves the
-    connection serving;
+    connection serving — together with `rejectStreamAtHeaders_tables` (a
+    rejected field block still commits both connection-wide HPACK tables) and
+    `resetStreamFlowControl_scoped` (a stream-window overrun preserves
+    connection identity and HPACK state, schedules no work, cancels only that
+    stream, and emits exactly the connection-credit refund plus its reset);
   - `Grpc.Http2.Connection` flow control — conservation, not just bounds:
     `consumeInboundDataWindow_conserves` (a DATA frame debits both receive
     windows by exactly its payload, and the `Nat` equation witnesses that

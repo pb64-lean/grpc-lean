@@ -32,17 +32,17 @@ def bind (config : Config := {}) : IO Instance :=
 
 def serveClientWithState (registry : Registry) (config : Config)
     (client : Std.Async.TCP.Socket.Client) (state : Http2.Connection.State := {}) :
-    IO Http2.Connection.State :=
+    Std.Async.Async Http2.Connection.State :=
   Http2.Server.serveClientWithState registry config client state
 
 def serveClient (registry : Registry) (config : Config)
-    (client : Std.Async.TCP.Socket.Client) : IO Unit :=
+    (client : Std.Async.TCP.Socket.Client) : Std.Async.Async Unit :=
   Http2.Server.serveClient registry config client
 
-def acceptOne (server : Instance) (registry : Registry) : IO Unit :=
+def acceptOne (server : Instance) (registry : Registry) : Std.Async.Async Unit :=
   Http2.Server.acceptOne server registry
 
-partial def serveForever (server : Instance) (registry : Registry) : IO Unit :=
+partial def serveForever (server : Instance) (registry : Registry) : Std.Async.Async Unit :=
   Http2.Server.serveForever server registry
 
 def serve (registry : Registry) (config : Config := {}) : IO Instance :=
@@ -59,8 +59,12 @@ def serveTls (registry : Registry) (tlsConfig : TlsConfig) (config : Config := {
 def shutdown (server : Instance) : IO Unit :=
   Http2.Server.shutdown server
 
-def wait (server : Instance) : IO Unit :=
-  Http2.Server.wait server
+/-- Wait for graceful drain. After `shutdown`, a finite timeout is followed by
+bounded exact-owner cleanup; pass `none` only when an intentionally unbounded
+post-shutdown drain is desired. Before `shutdown`, this is intentionally the
+serving process's unbounded blocking join. -/
+def wait (server : Instance) (drainTimeoutMs : Option Nat := some 30000) : IO Unit :=
+  Http2.Server.wait server drainTimeoutMs
 
 def isShutdown (server : Instance) : IO Bool :=
   Http2.Server.isShutdown server

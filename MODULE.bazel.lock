@@ -383,7 +383,7 @@
     },
     "@@rules_lean+//lean:extensions.bzl%lean": {
       "general": {
-        "bzlTransitiveDigest": "f7up7BGRP+PsrTRmEW73ieN8UVBZgAIHx/PvsuqNqns=",
+        "bzlTransitiveDigest": "sNAKOvirNsXUwCR12JmUfmNEK6pQLBjbMBBgEL4Kl+w=",
         "usagesDigest": "6UKLQr7o8IhEybSWTafmDLtfp0U/l2N2q5fvd9d3CUs=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},

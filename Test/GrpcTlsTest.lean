@@ -32,7 +32,7 @@ def clientWork (port : UInt16) (certPem : String) : IO Unit := do
           serverName := some "not-localhost.invalid"
           trustAnchorsPEM := some certPem
         }
-      Client.close unexpected
+      Async.block (Client.close unexpected)
       pure false
     catch _ =>
       pure true
@@ -70,7 +70,7 @@ def clientWork (port : UInt16) (certPem : String) : IO Unit := do
       if response != big then throw (IO.userError "TLS large echo mismatch")
   IO.println "gRPC-over-TLS large message ok"
 
-  Client.close client
+  Async.block (Client.close client)
 
 def main : IO Unit := do
   -- Local policy validation precedes socket creation/connection.
@@ -78,7 +78,7 @@ def main : IO Unit := do
       let unexpected ← Client.connectTls
         { address := Http2.Server.loopback 1 }
         { trustAnchorsPEM := some "not a PEM certificate" }
-      Client.close unexpected
+      Async.block (Client.close unexpected)
       pure none
     catch error =>
       pure (some error)

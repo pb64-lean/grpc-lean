@@ -1298,16 +1298,39 @@ def testHttp2Frames : IO Unit := do
   expectEq priority.streamDependency 0 "PRIORITY stream dependency should decode"
   expectEq priority.weight 15 "PRIORITY weight should decode"
   let selfDependentPriority : Http2.Frame := {
-    priorityFrame with payload := bytes [0, 0, 0, 1, 15]
+    priorityFrame with
+    header := { priorityFrame.header with streamId := 101 },
+    payload := bytes [0, 0, 0, 101, 15]
   }
-  let selfDependentPriorityStatus ← expectStatusError (Http2.Priority.decode selfDependentPriority)
-  expectEq selfDependentPriorityStatus.code Code.internal
-    "PRIORITY self-dependency should reject"
-  let selfDependentPriorityResult ← Http2.Connection.processFrame
-    Registry.empty readyConnectionState selfDependentPriority
-  let selfDependentPriorityConnectionStatus ← expectStatusError selfDependentPriorityResult
-  expectEq selfDependentPriorityConnectionStatus.code Code.internal
-    "connection should reject PRIORITY self-dependency"
+  let legacyPriority ← expectStatusOk (Http2.Priority.decode selfDependentPriority)
+  expectEq legacyPriority.streamDependency 101
+    "deprecated PRIORITY dependency should remain structurally decodable"
+  let (priorityPureState, priorityPureFrames) ← expectStatusOk
+    (← Http2.Connection.processFrame Registry.empty readyConnectionState selfDependentPriority)
+  expectEq priorityPureFrames.size 0
+    "RFC 9113 should ignore dependency semantics on idle PRIORITY"
+  expectEq priorityPureState.lastClientStreamId readyConnectionState.lastClientStreamId
+    "idle PRIORITY must not create or advance a stream"
+  let priorityWithFrames ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitPriorityWith (frames : Array Http2.Frame) : IO Unit :=
+    priorityWithFrames.modify (fun old => old.append frames)
+  discard <| expectStatusOk (← Http2.Connection.processFrameWith
+    Registry.empty readyConnectionState selfDependentPriority emitPriorityWith)
+  let priorityWithFrames ← priorityWithFrames.get
+  expectEq priorityWithFrames.size 0
+    "emitting transition should ignore idle PRIORITY without RST_STREAM"
+  let priorityState ← Std.Mutex.new readyConnectionState
+  let priorityEmitted ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitPriority (frames : Array Http2.Frame) : IO Unit :=
+    priorityEmitted.modify (fun old => old.append frames)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    Registry.empty priorityState selfDependentPriority emitPriority)
+  let priorityFrames ← priorityEmitted.get
+  expectEq priorityFrames.size 0
+    "shared transition must not emit RST_STREAM for idle PRIORITY"
+  let priorityStateAfter ← priorityState.atomically get
+  expectEq priorityStateAfter.lastClientStreamId readyConnectionState.lastClientStreamId
+    "shared idle PRIORITY must not change stream state"
 
 def testHpack : IO Unit := do
   let state : Http2.Hpack.State := {}
@@ -2174,7 +2197,9 @@ def testPaddedPriorityUnaryHttp2Transport : IO Unit := do
 
   let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} requestHeaders)
   let headerPadding := bytes [0, 0]
-  let priorityFields := bytes [0, 0, 0, 0, 16]
+  -- Dependency == stream id is legal to ignore under RFC 9113; this direct
+  -- transport test pins the public normalizer as well as the connection path.
+  let priorityFields := bytes [0, 0, 0, 1, 16]
   let paddedHeaderPayload := (bytes [headerPadding.size])
     |>.append priorityFields
     |>.append encodedHeaders.1
@@ -2230,26 +2255,44 @@ def testPaddedPriorityUnaryHttp2Transport : IO Unit := do
   expectEq responseMessages[0]!.data requestMessage.data
     "padded unary request should preserve request payload"
 
-def testHeadersPrioritySelfDependencyRejected : IO Unit := do
+def testDeprecatedHeadersPriorityIgnored : IO Unit := do
   let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} requestHeaders)
   let priorityFields := bytes [0, 0, 0, 1, 16]
+  let padding := bytes [0xaa, 0xbb]
+  let payload := (bytes [padding.size])
+    |>.append priorityFields
+    |>.append encodedHeaders.1
+    |>.append padding
   let headersFrame : Http2.Frame := {
     header := {
-      length := priorityFields.size + encodedHeaders.1.size,
+      length := payload.size,
       frameType := Http2.FrameType.headers,
       flags := Http2.FrameFlag.combine #[
         Http2.FrameFlag.endHeaders,
         Http2.FrameFlag.endStream,
+        Http2.FrameFlag.padded,
         Http2.FrameFlag.priority
       ],
       streamId := 1
     },
-    payload := priorityFields.append encodedHeaders.1
+    payload := payload
   }
   let result ← Http2.Connection.processFrame Registry.empty readyConnectionState headersFrame
-  let status ← expectStatusError result
-  expectEq status.code Code.internal
-    "HEADERS priority dependency on the same stream should reject"
+  let (state, emitted) ← expectStatusOk result
+  expect (!emitted.any (fun frame => frame.header.frameType == Http2.FrameType.rstStream))
+    "RFC 9113 must not apply legacy dependency errors to padded HEADERS"
+  let decoded ← expectStatusOk (Http2.Hpack.decodeHeaderBlock {} encodedHeaders.1)
+  expectEq state.hpack.dynamic.size decoded.state.dynamic.size
+    "deprecated priority metadata must not prevent the field block from advancing HPACK"
+  let stateMutex ← Std.Mutex.new readyConnectionState
+  let sharedEmittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let emit (frames : Array Http2.Frame) : IO Unit :=
+    sharedEmittedRef.modify (fun old => old.append frames)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    Registry.empty stateMutex headersFrame emit)
+  let sharedEmitted ← sharedEmittedRef.get
+  expect (!sharedEmitted.any (fun frame => frame.header.frameType == Http2.FrameType.rstStream))
+    "shared transition must ignore legacy dependency semantics after stripping padding"
 
 def testInboundHeaderListSizeLimit : IO Unit := do
   let headers := requestHeaders.insert "x-large-metadata" "abcdefghijklmnopqrstuvwxyz"
@@ -2858,6 +2901,182 @@ def testInboundFlowControlLimit : IO Unit := do
   let dataResult ← Http2.Connection.processFrame registry state1 dataFrame
   let status ← expectStatusError dataResult
   expectEq status.code Code.internal "DATA exceeding inbound flow-control window should reject"
+
+  -- A stream-only overrun is contained to that stream.  Keep ample
+  -- connection credit while retaining the ten-byte stream window.
+  let streamState0 : Http2.Connection.State := {
+    readyConnectionState with
+    inboundConnectionWindow := 100,
+    inboundInitialStreamWindow := 10
+  }
+  let streamHeadersResult ← Http2.Connection.processFrame registry streamState0 requestHeadersFrame
+  let (streamState1, _) ← expectStatusOk streamHeadersResult
+
+  -- RFC 9113 §6.1 padding validation is connection-scoped and must happen
+  -- before stream-overrun containment. This raw eleven-byte payload exceeds
+  -- the ten-byte stream window, but its pad length is itself malformed.
+  let malformedPaddedPayload := (bytes [20]).append (repeatByte 10 0)
+  let malformedPaddedData : Http2.Frame := {
+    header := {
+      length := malformedPaddedPayload.size,
+      frameType := Http2.FrameType.data,
+      flags := Http2.FrameFlag.combine #[Http2.FrameFlag.endStream, Http2.FrameFlag.padded],
+      streamId := 1
+    },
+    payload := malformedPaddedPayload
+  }
+  let malformedPaddingStatus ← expectStatusError
+    (← Http2.Connection.processFrame registry streamState1 malformedPaddedData)
+  expectEq malformedPaddingStatus.code Code.internal
+    "invalid DATA padding must remain connection-fatal before stream flow-control containment"
+
+  let (pureAfter, pureEmitted) ← expectStatusOk
+    (← Http2.Connection.processFrame registry streamState1 dataFrame)
+  expectEq pureAfter.inboundConnectionWindow streamState1.inboundConnectionWindow
+    "aggregate stream reset should immediately conserve connection receive credit"
+  expect (!pureAfter.resetInboundStreams.contains 1)
+    "a reset on peer END_STREAM should not leave a late-frame tombstone"
+  let some pureRst := pureEmitted.find? (fun frame =>
+      frame.header.frameType == Http2.FrameType.rstStream)
+    | throw (IO.userError "aggregate stream overrun should emit RST_STREAM")
+  expectEq (← expectStatusOk (Http2.RstStream.decode pureRst))
+    Http2.ErrorCode.flowControlError
+    "aggregate transition should contain a stream-window overrun"
+  let withEmittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitWith (frames : Array Http2.Frame) : IO Unit :=
+    withEmittedRef.modify (fun old => old.append frames)
+  let withAfter ← expectStatusOk
+    (← Http2.Connection.processFrameWith registry streamState1 dataFrame emitWith)
+  expectEq withAfter.inboundConnectionWindow streamState1.inboundConnectionWindow
+    "emitting stream reset should immediately conserve connection receive credit"
+  let withEmitted ← withEmittedRef.get
+  let some withRst := withEmitted.find? (fun frame =>
+      frame.header.frameType == Http2.FrameType.rstStream)
+    | throw (IO.userError "emitting stream overrun should emit RST_STREAM")
+  expectEq (← expectStatusOk (Http2.RstStream.decode withRst))
+    Http2.ErrorCode.flowControlError
+    "emitting transition should contain a stream-window overrun"
+  let stateMutex ← Std.Mutex.new streamState1
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let emit (frames : Array Http2.Frame) : IO Unit :=
+    emittedRef.modify (fun old => old.append frames)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith registry stateMutex dataFrame emit)
+  let emitted ← emittedRef.get
+  let some rst := emitted.find? (fun frame => frame.header.frameType == Http2.FrameType.rstStream)
+    | throw (IO.userError "stream receive-window overrun should emit RST_STREAM")
+  expectEq rst.header.streamId 1 "flow-control reset must name only the offending stream"
+  expectEq (← expectStatusOk (Http2.RstStream.decode rst)) Http2.ErrorCode.flowControlError
+    "stream receive-window overrun should use FLOW_CONTROL_ERROR"
+  expect (!emitted.any (fun frame => frame.header.frameType == Http2.FrameType.goAway))
+    "stream receive-window overrun must not emit GOAWAY"
+
+  -- The same connection remains usable by an unrelated stream.
+  let stream3Headers : Http2.Frame := {
+    requestHeadersFrame with
+    header := { requestHeadersFrame.header with streamId := 3 }
+  }
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry stateMutex stream3Headers emit)
+  let after ← stateMutex.atomically get
+  expectEq after.lastClientStreamId 3
+    "an unrelated stream should still open after a stream flow-control error"
+
+  -- A locally reset stream remains as a late-DATA tombstone, but it is already
+  -- closed for MAX_CONCURRENT_STREAMS and graceful-drain accounting.
+  let limitedState0 : Http2.Connection.State := {
+    readyConnectionState with
+    inboundConnectionWindow := 100,
+    inboundInitialStreamWindow := 10,
+    inboundMaxConcurrentStreams := some 1
+  }
+  let (limitedState1, _) ← expectStatusOk
+    (← Http2.Connection.processFrame registry limitedState0 requestHeadersFrame)
+  let openOverrun : Http2.Frame := {
+    dataFrame with header := { dataFrame.header with flags := 0 }
+  }
+  let limitedMutex ← Std.Mutex.new limitedState1
+  let limitedEmitted ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitLimited (frames : Array Http2.Frame) : IO Unit :=
+    limitedEmitted.modify (fun old => old.append frames)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry limitedMutex openOverrun emitLimited)
+  let limitedAfterReset ← limitedMutex.atomically get
+  expect (limitedAfterReset.resetInboundStreams.contains 1)
+    "a local reset should retain a tombstone for late DATA"
+  expectEq (Http2.Connection.activeInboundStreamCount limitedAfterReset) 0
+    "a locally reset stream must immediately release its concurrency slot"
+  expect (Http2.Connection.isDrainedAfterOutboundGoAway
+      { limitedAfterReset with outboundGoAwayLastStreamId := some 1 })
+    "a locally reset stream tombstone must not delay graceful drain"
+  limitedEmitted.set #[]
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry limitedMutex stream3Headers emitLimited)
+  expectEq (← limitedEmitted.get).size 0
+    "stream 3 should be admitted at limit 1 after stream 1 is locally reset"
+  expectEq (← limitedMutex.atomically get).lastClientStreamId 3
+    "the admitted stream should advance the client stream frontier"
+
+  -- Late DATA on the reset stream refunds connection credit only: sending a
+  -- stream WINDOW_UPDATE after RST_STREAM would revive a closed stream window.
+  limitedEmitted.set #[]
+  let lateData : Http2.Frame := {
+    openOverrun with
+    header := { openOverrun.header with length := 1 },
+    payload := bytes [7]
+  }
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry limitedMutex lateData emitLimited)
+  let lateDataEmitted ← limitedEmitted.get
+  expectEq lateDataEmitted.size 1
+    "late DATA after local reset should emit only one WINDOW_UPDATE"
+  expectEq lateDataEmitted[0]!.header.frameType Http2.FrameType.windowUpdate
+    "late reset DATA should refund connection flow credit"
+  expectEq lateDataEmitted[0]!.header.streamId 0
+    "late reset DATA must not replenish the closed stream window"
+  let afterLateData ← limitedMutex.atomically get
+  expect (afterLateData.resetInboundStreams.contains 1)
+    "non-final late DATA should retain the reset tombstone"
+
+  -- A late trailer block still advances connection-wide HPACK. Split it over a
+  -- CONTINUATION to exercise both paths; END_STREAM then retires the tombstone.
+  let beforeLateHeaders ← limitedMutex.atomically get
+  let lateMetadata := Metadata.empty.insert "x-reset-late" "dynamic-value"
+  let lateEncoded ← expectStatusOk
+    (Http2.Hpack.encodeHeaderBlock beforeLateHeaders.hpack lateMetadata)
+  let expectedLateDecode ← expectStatusOk
+    (Http2.Hpack.decodeHeaderBlock beforeLateHeaders.hpack lateEncoded.1)
+  let firstLatePayload := lateEncoded.1.extract 0 1
+  let restLatePayload := lateEncoded.1.extract 1 lateEncoded.1.size
+  let lateHeaders : Http2.Frame := {
+    header := {
+      length := firstLatePayload.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.endStream,
+      streamId := 1
+    },
+    payload := firstLatePayload
+  }
+  let lateContinuation : Http2.Frame := {
+    header := {
+      length := restLatePayload.size,
+      frameType := Http2.FrameType.continuation,
+      flags := Http2.FrameFlag.endHeaders,
+      streamId := 1
+    },
+    payload := restLatePayload
+  }
+  limitedEmitted.set #[]
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry limitedMutex lateHeaders emitLimited)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    registry limitedMutex lateContinuation emitLimited)
+  let afterLateHeaders ← limitedMutex.atomically get
+  expectEq afterLateHeaders.hpack.dynamic.size expectedLateDecode.state.dynamic.size
+    "discarded late reset headers must still advance HPACK"
+  expect (!afterLateHeaders.resetInboundStreams.contains 1)
+    "END_STREAM on discarded late headers should retire the reset tombstone"
+  expectEq (← limitedEmitted.get).size 0
+    "discarded late reset headers should not produce another response"
 
 def testClientStreamIdValidation : IO Unit := do
   let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} requestHeaders)
@@ -4131,7 +4350,7 @@ def testHttp2H2CServer : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4334,7 +4553,7 @@ def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4426,7 +4645,7 @@ def testHttp2H2CServerFlushesActiveStreamOnWindowUpdate : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4530,7 +4749,7 @@ def testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4610,10 +4829,12 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "CancelStream" }
   let startedRef ← IO.mkRef false
   let cancelledRef ← IO.mkRef false
+  let cancelCountRef ← IO.mkRef 0
   let registry := Registry.empty.registerServerStreamingStream method fun _request => do
     startedRef.set true
     let stream : MessageStream ByteArray := {
-      recv? := cancelledRecvLoop cancelledRef
+      recv? := cancelledRecvLoop cancelledRef,
+      cancel := cancelCountRef.modify fun count => count + 1
     }
     pure {
       metadata := Metadata.empty.insert "handled-by" "h2c-cancel-stream",
@@ -4622,7 +4843,7 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4670,6 +4891,8 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
   let rstWire ← expectStatusOk (Http2.Frame.encode rst)
   (client.send rstWire).block
   waitUntil "h2c RST_STREAM did not cancel the active response stream" observeTimeoutMs cancelledRef.get
+  waitUntil "h2c RST_STREAM did not invoke the response cancel callback" observeTimeoutMs do
+    pure ((← cancelCountRef.get) == 1)
 
   let pingPayload := bytes [1, 2, 3, 4, 5, 6, 7, 8]
   let ping ← expectStatusOk (Http2.Ping.frame pingPayload)
@@ -4685,6 +4908,12 @@ def testHttp2H2CServerCancelsStreamOnRst : IO Unit := do
         && frame.header.streamId == 1
         && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream)
     "RST_STREAM cancellation should not emit response trailers for the reset stream"
+  expect (!stateAfterPing.frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.rstStream
+        && frame.header.streamId == 1)
+    "deliberate dispatch cancellation must not emit a second INTERNAL_ERROR reset"
+  expectEq (← cancelCountRef.get) 1
+    "RST_STREAM and handler cleanup must take the response cancel callback exactly once"
 
   (client.shutdown).block
   awaitIoTask serverTask
@@ -4710,7 +4939,7 @@ def testHttp2H2CServerCancelsStreamOnDisconnect : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -4794,7 +5023,7 @@ def testHttp2H2CServerCancelsPipeStreamOnRst : IO Unit := do
     }
 
   let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
-  let serverTask ← IO.asTask (Grpc.Server.acceptOne server registry)
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
   let client ← Std.Async.TCP.Socket.Client.mk
   (client.connect server.localAddress).block
   client.noDelay
@@ -5092,7 +5321,7 @@ def main : IO Unit := do
   testClientStreamingHttp2Transport
   testBidirectionalStreamingHttp2Transport
   testPaddedPriorityUnaryHttp2Transport
-  testHeadersPrioritySelfDependencyRejected
+  testDeprecatedHeadersPriorityIgnored
   testInboundHeaderListSizeLimit
   testTrailersOnlyUnaryFailure
   testDeadlineExceededHttp2Transport

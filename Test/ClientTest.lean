@@ -138,9 +138,9 @@ def main : IO Unit := do
   | .ok (_, response) =>
       expectEq response smallPayload
         "connection should remain usable after rejecting an oversized response"
-  Client.close limited
+  Async.block (Client.close limited)
   IO.println "client request/response message caps ok"
 
-  Client.close client
+  Async.block (Client.close client)
   Grpc.Server.shutdown server
   IO.println "all client assertions passed"

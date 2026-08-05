@@ -591,8 +591,9 @@ def decode (frame : Frame) : Except Status Value := do
     throw (Status.internal "HTTP/2 PRIORITY payload must be exactly 5 bytes")
   let rawDependency := Frame.readUInt32BE frame.payload 0
   let streamDependency := rawDependency % (maxStreamId + 1)
-  if streamDependency == frame.header.streamId then
-    throw (Status.internal "HTTP/2 PRIORITY dependency cannot reference the same stream")
+  -- RFC 9113 §5.3.2 removed the dependency tree and deprecated PRIORITY.
+  -- Decode the legacy wire shape for compatibility, but do not enforce RFC
+  -- 7540's self-dependency rule or change stream state.
   pure {
     exclusive := rawDependency >= (maxStreamId + 1),
     streamDependency := streamDependency,

@@ -216,9 +216,10 @@ partial def cancellableHandlerLoop : IO (Except Status UnaryResponse) := do
     IO.sleep 5
     cancellableHandlerLoop
 
-/-- Cancelling a dispatch mid-handler (client RST) resets connection stream state and
-sends RST_STREAM rather than leaving the stream in limbo. -/
-def testRstStreamOnCancelledDispatch : IO Unit := do
+/-- A peer RST is already the terminal stream signal. It cancels the in-flight
+dispatch and removes stream state without echoing a second RST_STREAM after the
+cancelled handler unwinds. -/
+def testPeerRstCancelsDispatchWithoutEchoReset : IO Unit := do
   let registry := Registry.empty.registerUnary echoMethod fun _ =>
     ExceptT.mk cancellableHandlerLoop
   let headerBlock ← encodedRequestHeaderBlock
@@ -237,8 +238,11 @@ def testRstStreamOnCancelledDispatch : IO Unit := do
   match ← Http2.Connection.processBytesSharedWith registry stateMutex rstWire emit with
   | .error status => throw (IO.userError status.messageD)
   | .ok () => pure ()
+  let state ← stateMutex.atomically get
+  expect state.activeDispatches.isEmpty
+    "peer RST should remove the cancelled dispatch from connection state"
   let sawRst ← awaitFrame emittedRef Http2.FrameType.rstStream 200
-  expect sawRst "cancelled dispatch should emit RST_STREAM for its stream"
+  expect (!sawRst) "peer RST should not provoke a second server RST_STREAM"
 
 def main : IO Unit := do
   testPaddedDataFrame
@@ -253,6 +257,6 @@ def main : IO Unit := do
   IO.println "keepalive PING ack ok"
   testHandlerCrashReturnsStatus
   IO.println "handler crash returns status ok"
-  testRstStreamOnCancelledDispatch
-  IO.println "RST_STREAM on cancelled dispatch ok"
+  testPeerRstCancelsDispatchWithoutEchoReset
+  IO.println "peer RST cancels dispatch without an echo reset"
   IO.println "all hardening assertions passed"

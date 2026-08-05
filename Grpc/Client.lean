@@ -1,6 +1,7 @@
 module
 
 public import Std.Async.TCP
+public import Std.Async.Timer
 public import Std.Sync.CancellationToken
 public import Std.Sync.Notify
 public import Std.Sync.Channel
@@ -29,8 +30,8 @@ an inbound message, or terminal state) it awaits a `Std.Notify` signal that the
 reader fires on every state change, suspending cooperatively and returning its
 worker to the pool rather than parking a thread. This lets thousands of calls be
 in flight concurrently (e.g. via `Async.concurrentlyAll`) on a small pool; drive
-one to completion synchronously with `Async.block`. `connect` and `close` stay in
-`IO`.
+one to completion synchronously with `Async.block`. Connection setup (`connect` /
+`connectTls`) stays in `IO`; `close` is cooperative `Async` like the call API.
 
 Flow control is handled in both directions: sends wait for server window credit,
 and received data is credited back at the stream level only as the application
@@ -145,7 +146,7 @@ structure ConnState where
   deriving Inhabited
 
 private structure BackgroundTasks where
-  writer : Option (Task Unit) := none
+  writer : Option (AsyncTask Unit) := none
   reader : Option (AsyncTask Unit) := none
 
 structure Connection where
@@ -161,14 +162,35 @@ structure Connection where
   wakeup : Std.Notify
   /-- Cancelled by `close` to stop the background reader task's blocked `recv?`. -/
   stopToken : Std.CancellationToken
+  /-- First failure of the sole outbound writer.  The writer publishes here and
+  cancels `writerFailureToken`; the reader remains the single owner that marks
+  calls dead and retires the transport. -/
+  writerFailure : IO.Ref (Option IO.Error)
+  /-- Sticky wakeup for a plaintext or outer TLS writer failure.  Keeping this
+  distinct from `stopToken` preserves the transport error as the close cause. -/
+  writerFailureToken : Std.CancellationToken
   /--
   Exact background task handles. Construction publishes a `Connection` only
-  after both handles have been installed; `close` joins both before returning.
+  after both handles have been installed; `close` awaits each up to its bounded
+  drain deadline and cancels a task that cannot finish because the peer is stuck.
   -/
   private background : IO.Ref BackgroundTasks
   /-- When present, the connection runs over TLS: outbound bytes are sealed and
   inbound raw bytes are decrypted through this session. `none` is plaintext. -/
   tls : Option Tls.ClientSession := none
+
+/-- Non-blocking lifecycle diagnostic: `true` once both exact background owners
+have terminated (or before either was installed).  This exposes no task handle
+and is useful for asserting that transport failure did not leave a hidden reader. -/
+def backgroundTasksFinished (connection : Connection) : IO Bool := do
+  let background ← connection.background.get
+  let writerFinished ← match background.writer with
+    | none => pure true
+    | some writer => IO.hasFinished writer
+  let readerFinished ← match background.reader with
+    | none => pure true
+    | some reader => IO.hasFinished reader
+  pure (writerFinished && readerFinished)
 
 /-- Handle for one RPC on a `Connection`. -/
 structure Call where
@@ -461,17 +483,38 @@ private def handleInboundFrame (connection : Connection) (frame : Http2.Frame) :
       | .unknown _ => pure ()
   wake connection
 
+private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
+  try
+    Async.race
+      socket.shutdown
+      (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 200))
+  catch _ =>
+    pure ()
+
 private inductive ReaderEvent where
   | received (chunk? : Option ByteArray)
   | stop
+  | writerFailed (status : Status)
 
 private def nextReaderEvent (connection : Connection) : Async ReaderEvent :=
-  Selectable.one #[
-    Selectable.case (connection.socket.recvSelector connection.config.readSize) fun chunk? =>
-      pure (ReaderEvent.received chunk?),
-    Selectable.case connection.stopToken.selector fun _ =>
-      pure ReaderEvent.stop
-  ]
+  let transportCases := #[
+      Selectable.case (connection.socket.recvSelector connection.config.readSize) fun chunk? =>
+        pure (ReaderEvent.received chunk?),
+      Selectable.case connection.stopToken.selector fun _ =>
+        pure ReaderEvent.stop,
+      Selectable.case connection.writerFailureToken.selector fun _ => do
+        let error? ← connection.writerFailure.get
+        let error := error?.getD (IO.userError "connection writer failed")
+        pure (ReaderEvent.writerFailed (Status.ofIOError error))
+    ]
+  match connection.tls with
+  | none => Selectable.one transportCases
+  | some session =>
+      Selectable.one <| transportCases.push <|
+        Selectable.case session.writerFailureSelector fun _ => do
+          let error? ← session.writerFailure?
+          let error := error?.getD (IO.userError "TLS record writer failed")
+          pure (ReaderEvent.writerFailed (Status.ofIOError error))
 
 /-- Connection reader. Runs in `Async`: while idle (no inbound bytes) it suspends
 cooperatively instead of parking a worker thread, so open-but-idle connections are
@@ -488,9 +531,13 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
   let localStop : Bool := match event with
     | .ok .stop => true
     | _ => false
+  let writerFailed : Bool := match event with
+    | .ok (.writerFailed _) => true
+    | _ => false
   let chunk? : Except Status (Option ByteArray) := match event with
     | .error status => .error status
     | .ok .stop => .ok none
+    | .ok (.writerFailed status) => .error status
     | .ok (.received chunk?) => .ok chunk?
   -- Over TLS, decrypt the raw chunk into application bytes first; `none` means the
   -- peer closed (close_notify or EOF). A `some #[]` (control-only record) decodes to
@@ -503,7 +550,13 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
         | .error err => pure (.error (Status.ofIOError err))
     | other, _ => pure other
   match chunk? with
-  | .error status => failConnection connection status
+  | .error status => do
+      failConnection connection status
+      -- A failed writer cannot make further protocol progress.  Retire the
+      -- write side here, in the reader owner, so a silent peer cannot leave a
+      -- blocked reader/background owner behind until a later explicit close.
+      if writerFailed then
+        shutdownSocket connection.socket
   | .ok none =>
       if localStop then
         failConnection connection (Status.error .unavailable "connection shut down locally")
@@ -529,47 +582,58 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
             handleInboundFrame connection frame
           readerLoop connection
 
-/-- Drain the outbound channel to the socket. Runs as its own task so socket writes
-never block the reader or app calls; a write error kills the connection. Over TLS the
-bytes are sealed by the session (which serializes seal+send). -/
-private def writerBody (connection : Connection) (bytes : ByteArray) : BaseIO Unit := do
-  let sent : IO Unit :=
-    match connection.tls with
-    | some session => session.send bytes
-    | none => (connection.socket.send bytes).block
-  match ← sent.toBaseIO with
-  | .ok () => pure ()
-  | .error err =>
-      connection.state.atomically do
-        modify fun state => failStateLocked state (Status.ofIOError err)
-      wake connection
-      discard <| connection.outbound.close.toBaseIO
+/-- Drain the outbound channel from one cooperative writer.  In particular the
+plaintext path awaits `socket.send` in `Async`; it never parks a worker with
+`.block`, and FIFO ownership preserves frame order. -/
+private partial def writerLoop (connection : Connection) : Async Unit := do
+  match ← await (← connection.outbound.recv) with
+  | none => pure ()
+  | some bytes =>
+      try
+        match connection.tls with
+        | some session => session.send bytes
+        | none => connection.socket.send bytes
+        writerLoop connection
+      catch err =>
+        -- Do not mutate connection state here.  Publishing through a sticky
+        -- selector wakes the exact reader even while the peer keeps its write
+        -- side open; that reader remains the sole failure/retirement owner.
+        if (← connection.writerFailure.get).isNone then
+          connection.writerFailure.set (some err)
+        discard <| connection.outbound.close.toBaseIO
+        discard <| Grpc.CancellationToken.cancel connection.writerFailureToken
+          (reason := Std.CancellationReason.shutdown)
 
 private def startBackgroundTasks (connection : Connection) : IO Unit := do
   let reader ← Async.toIO (readerLoop connection)
   connection.background.set { reader := some reader }
-  let writer ← connection.outbound.forAsync (writerBody connection)
+  let writer ← Async.toIO (writerLoop connection)
   connection.background.set { writer := some writer, reader := some reader }
 
-private def joinBackgroundTasks (connection : Connection) : IO Unit := do
+private def awaitBackgroundTask (task : AsyncTask Unit) : Async Unit := do
+  let finished ← Async.race
+    (do
+      try Async.ofAsyncTask task catch _ => pure ()
+      pure true)
+    (do
+      Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 200)
+      pure false)
+  unless finished do
+    IO.cancel task
+
+private def joinBackgroundTasks (connection : Connection) : Async Unit := do
   let background ← connection.background.get
   match background.writer with
-  | some writer => discard <| IO.wait writer
+  | some writer => awaitBackgroundTask writer
   | none => pure ()
   match background.reader with
   | some reader =>
       -- The reader converts transport errors into connection state before it
       -- terminates. A task-level error must not skip the other join.
-      discard <| IO.wait reader
+      awaitBackgroundTask reader
   | none => pure ()
 
-private def shutdownSocket (socket : TCP.Socket.Client) : IO Unit := do
-  try
-    socket.shutdown.block
-  catch _ =>
-    pure ()
-
-private def shutdownConnection (connection : Connection) : IO Unit := do
+private def shutdownConnection (connection : Connection) : Async Unit := do
   failConnection connection (Status.cancelled "connection closed locally")
   discard <| Grpc.CancellationToken.cancel connection.stopToken
     (reason := Std.CancellationReason.shutdown)
@@ -607,6 +671,8 @@ private def initializeConnection
     outbound := ← Std.CloseableChannel.new,
     wakeup := ← Std.Notify.new,
     stopToken := ← Std.CancellationToken.new,
+    writerFailure := ← IO.mkRef (none : Option IO.Error),
+    writerFailureToken := ← Std.CancellationToken.new,
     background := ← IO.mkRef {},
     tls := tls
   }
@@ -624,7 +690,7 @@ private def initializeConnection
     startBackgroundTasks connection
     pure connection
   catch error =>
-    shutdownConnection connection
+    Async.block (shutdownConnection connection)
     throw error
 
 /-- Connect, perform the HTTP/2 client preface exchange (preface string +
@@ -641,7 +707,7 @@ def connect (config : Config := {}) : IO Connection := do
     -- Once `connect` has returned or thrown, there is no pending receive owned
     -- by this adapter. Shut down every socket that was not transferred into a
     -- successfully returned `Connection`; finalization then releases its handle.
-    shutdownSocket socket
+    Async.block (shutdownSocket socket)
     throw error
 
 /-- TLS options for a gRPC-over-TLS client connection. -/
@@ -701,7 +767,7 @@ private def connectTlsOnSocket
     verifyTlsPeer session trustStore? tlsConfig
     initializeConnection socket config prefaceWire (some session)
   catch error =>
-    session.close
+    Async.block session.close
     throw error
 
 /-- Connect over TLS 1.3, then run the gRPC client exactly as `connect` does but
@@ -720,17 +786,20 @@ def connectTls (config : Config := {}) (tlsConfig : TlsConfig := {}) : IO Connec
   try
     connectTlsOnSocket socket config tlsConfig trustStore? prefaceWire
   catch error =>
-    shutdownSocket socket
+    Async.block (shutdownSocket socket)
     throw error
 
-/-- Close the connection and join all of its exact reader and writer tasks.
+/-- Cooperatively close the connection and retire its exact reader and writer tasks.
 
 The socket API exposes a write-side shutdown rather than an explicit handle
-close. The FIN lets a peer observe EOF; after the HTTP/2 tasks (and, for TLS,
-the record writer) have terminated, the native handle is quiescent and is
-released by finalization with the remaining `Connection` references.
+close. The FIN lets a peer observe EOF; each drain and shutdown wait is bounded,
+so a non-reading peer cannot make `close` hang or park a worker. `Async.race`
+does not cancel its losing branch: when the timer wins, the native shutdown
+promise and descriptor reference can remain suspended until the OS settles it.
+A hard `uv_close` is not exposed; finalization releases the native handle after
+remaining `Connection`/promise references are gone.
 -/
-def close (connection : Connection) : IO Unit := do
+def close (connection : Connection) : Async Unit := do
   shutdownConnection connection
 
 private def chunkFlags (isLast : Bool) : UInt8 :=
