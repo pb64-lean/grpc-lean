@@ -103,6 +103,18 @@ lean_assurance_test(
         "Grpc",
         "Zlib",
     ],
+    # Environment partition, discovered from the audit's own coverage report:
+    # `Tls`/`TLS13`/`HaclStar` are tls13-lean modules audited by that
+    # repository's own assurance targets; `Binary`/`Protobuf` are the vendored
+    # third-party Lean-zh libraries (third_party/Lean-zh), deliberately outside
+    # this audit's scope — no assurance target audits them today.
+    unaudited_module_prefixes = [
+        "Binary",
+        "HaclStar",
+        "Protobuf",
+        "TLS13",
+        "Tls",
+    ],
     principal_theorems = [
         # Registry: well-formedness holds of the empty registry, is preserved by
         # checked registration, and makes method lookup unambiguous.
@@ -249,6 +261,11 @@ lean_assurance_test(
 # The TLS-facing layer declares no C of its own: every cryptographic primitive
 # it reaches comes from tls13-lean's own audited HaclStar boundary, so no
 # `@[extern]` may appear under `Grpc.Tls`.
+#
+# The audited environment is partitioned: `Grpc.Tls` is audited here;
+# `Grpc.CancellationToken` is audited by `//:grpc_assurance` (under its `Grpc`
+# prefix); the `Tls`/`TLS13`/`HaclStar` roots are tls13-lean modules audited by
+# that repository's own assurance targets.
 lean_assurance_test(
     name = "grpc_tls_assurance",
     policy_mode = "exact",
@@ -260,6 +277,12 @@ lean_assurance_test(
         "Quot.sound",
     ],
     module_prefixes = ["Grpc.Tls"],
+    unaudited_module_prefixes = [
+        "Grpc.CancellationToken",
+        "HaclStar",
+        "TLS13",
+        "Tls",
+    ],
     expected_unsafe_constants = [],
     expected_partial_definitions = [
         "Grpc.Tls.Rest.acceptLoop",
