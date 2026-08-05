@@ -1640,8 +1640,14 @@ private def resetLocalStream (state : State) (streamId : Nat) (peerEnded : Bool 
 private def processPriority (state : State) (frame : Frame) : Except Status (State × Array Frame) := do
   discard <| Priority.decode frame
   -- RFC 9113 §6.3 permits deprecated PRIORITY frames in any stream state and
-  -- says they do not create or alter a stream. Structural decoding above is
-  -- therefore the entire transition.
+  -- says they do not create or alter a stream, so a structurally valid
+  -- PRIORITY changes nothing here.  §6.3's two error cases never reach this
+  -- function through the transition APIs: `containStreamError?` runs first
+  -- and turns a malformed length into that stream's
+  -- RST_STREAM(FRAME_SIZE_ERROR) and stream id 0 into a connection error.
+  -- The `Priority.decode` above re-checks the same structure, so a caller
+  -- that skips that classification still cannot ignore a malformed frame —
+  -- it merely escalates it.
   pure (state, #[])
 
 private def streamWindowOverrun (state : State) (frame : Frame) : Bool :=
@@ -1706,10 +1712,29 @@ theorem resetStreamFlowControl_scoped {state state' : State} {frame : Frame}
         simpa using hstream
       · exact ⟨connectionUpdate, rst, hconnectionUpdate, hrst, rfl⟩
 
-/-- Classify frame-local failures after the caller has completed all
-connection-scoped validation.  Every transition API consults this same helper,
-so choosing the aggregate, emitting, or shared runtime API cannot change an
-RFC 9113 stream error into a connection error. -/
+/-- Stream error.  RFC 9113 §6.3: "A PRIORITY frame with a length other than
+5 octets MUST be treated as a stream error (Section 5.4.2) of type
+FRAME_SIZE_ERROR."  PRIORITY is not flow controlled, so unlike
+`resetStreamFlowControl` there is no connection credit to refund; the stream's
+local state — if the id was ever opened — is torn down exactly as for any
+other locally generated RST_STREAM, and work attributable to it is
+cancelled. -/
+private def resetPriorityFrameSize (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) := do
+  let rst ← RstStream.frame frame.header.streamId ErrorCode.frameSizeError
+  let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
+  let state := resetLocalStream state frame.header.streamId
+  pure (state, { emitted := #[rst], cancelDispatches := cancelDispatches })
+
+/-- Classify the frame-local failures whose per-frame-type processors would
+otherwise escalate them, after the caller has completed all connection-scoped
+validation: a DATA overrun of an otherwise valid open stream's receive window,
+and a PRIORITY frame whose length is not 5 (RFC 9113 §6.3).  Every transition
+API consults this same helper before dispatching on the frame type, so for
+exactly these cases choosing the aggregate, emitting, or shared runtime API
+cannot change the required RFC 9113 stream error into a connection error.
+The remaining stream errors are contained inside their own frame processors
+(`resetClosedStreamData`, `rejectStreamAtHeaders`). -/
 private def containStreamError? (state : State) (frame : Frame) :
     Except Status (Option (State × SharedFrameResult)) := do
   match frame.header.frameType with
@@ -1724,6 +1749,16 @@ private def containStreamError? (state : State) (frame : Frame) :
           || ((findStream? state.streams frame.header.streamId).map streamHeaderComplete).getD false
       if validOpenStream && streamWindowOverrun state frame then
         some <$> resetStreamFlowControl state frame
+      else
+        pure none
+  | .priority =>
+      -- Connection error.  RFC 9113 §6.3: "If a PRIORITY frame is received
+      -- with a stream identifier of 0x00, the recipient MUST respond with a
+      -- connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+      if frame.header.streamId == 0 then
+        throw (Status.internal "HTTP/2 PRIORITY frame must use a stream id")
+      if frame.payload.size != 5 then
+        some <$> resetPriorityFrameSize state frame
       else
         pure none
   | _ => pure none

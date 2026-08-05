@@ -4060,6 +4060,73 @@ def testPriorityFrameIgnored : IO Unit := do
   let (_state, emitted) ← expectStatusOk result
   expectEq emitted.size 0 "PRIORITY frame should be ignored without emitting frames"
 
+/-- RFC 9113 §6.3: "A PRIORITY frame with a length other than 5 octets MUST be
+treated as a stream error (Section 5.4.2) of type FRAME_SIZE_ERROR" — every
+transition API answers RST_STREAM on the offending stream instead of tearing
+the connection down, while PRIORITY on stream 0 stays a connection error of
+type PROTOCOL_ERROR. -/
+def testPriorityFrameSizeStreamError : IO Unit := do
+  let malformedPriority : Http2.Frame := {
+    header := {
+      length := 4,
+      frameType := Http2.FrameType.priority,
+      flags := 0,
+      streamId := 1
+    },
+    payload := bytes [0, 0, 0, 0]
+  }
+  let expectFrameSizeReset (emitted : Array Http2.Frame) (api : String) : IO Unit := do
+    expectEq emitted.size 1 s!"{api}: malformed-length PRIORITY should answer exactly one frame"
+    expectEq emitted[0]!.header.frameType Http2.FrameType.rstStream
+      s!"{api}: malformed-length PRIORITY should answer RST_STREAM"
+    expectEq emitted[0]!.header.streamId 1
+      s!"{api}: the RST_STREAM should name the PRIORITY frame's stream"
+    expectEq (← expectStatusOk (Http2.RstStream.decode emitted[0]!)) Http2.ErrorCode.frameSizeError
+      s!"{api}: RFC 9113 §6.3 prescribes FRAME_SIZE_ERROR for a malformed PRIORITY length"
+
+  let (pureState, pureEmitted) ← expectStatusOk
+    (← Http2.Connection.processFrame Registry.empty readyConnectionState malformedPriority)
+  expectFrameSizeReset pureEmitted "aggregate"
+  expectEq pureState.lastClientStreamId readyConnectionState.lastClientStreamId
+    "a malformed PRIORITY must not claim a stream id"
+
+  let withEmitted ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitWith (frames : Array Http2.Frame) : IO Unit :=
+    withEmitted.modify (fun old => old.append frames)
+  discard <| expectStatusOk (← Http2.Connection.processFrameWith
+    Registry.empty readyConnectionState malformedPriority emitWith)
+  expectFrameSizeReset (← withEmitted.get) "emitting"
+
+  let sharedState ← Std.Mutex.new readyConnectionState
+  let sharedEmitted ← IO.mkRef (#[] : Array Http2.Frame)
+  let emitShared (frames : Array Http2.Frame) : IO Unit :=
+    sharedEmitted.modify (fun old => old.append frames)
+  expectStatusOk (← Http2.Connection.processFrameSharedWith
+    Registry.empty sharedState malformedPriority emitShared)
+  expectFrameSizeReset (← sharedEmitted.get) "shared"
+  let sharedStateAfter ← sharedState.atomically get
+  expectEq sharedStateAfter.lastClientStreamId readyConnectionState.lastClientStreamId
+    "shared malformed PRIORITY must not claim a stream id"
+
+  -- Connection error.  RFC 9113 §6.3: PRIORITY on stream 0 is PROTOCOL_ERROR,
+  -- whether or not its length is also malformed.
+  let priorityOnStreamZero : Http2.Frame := {
+    malformedPriority with
+    header := { malformedPriority.header with length := 5, streamId := 0 },
+    payload := bytes [0, 0, 0, 0, 15]
+  }
+  let zeroStatus ← expectStatusError
+    (← Http2.Connection.processFrame Registry.empty readyConnectionState priorityOnStreamZero)
+  expectEq zeroStatus.code Code.internal "PRIORITY on stream 0 should stay connection-fatal"
+  let malformedOnStreamZero : Http2.Frame := {
+    malformedPriority with
+    header := { malformedPriority.header with streamId := 0 }
+  }
+  let zeroMalformedStatus ← expectStatusError
+    (← Http2.Connection.processFrame Registry.empty readyConnectionState malformedOnStreamZero)
+  expectEq zeroMalformedStatus.code Code.internal
+    "malformed PRIORITY on stream 0 should stay connection-fatal"
+
 def testUnknownFrameIgnored : IO Unit := do
   let unknownFrame : Http2.Frame := {
     header := {
@@ -5208,6 +5275,103 @@ def testHttp2StreamErrorContainment : IO Unit := do
       IO.cancel waitTask
       throw (IO.userError "stream-error containment server did not drain")
 
+/-- RFC 9113 §6.3 over a live connection: a PRIORITY frame with a length other
+than 5 octets answers RST_STREAM(FRAME_SIZE_ERROR) on its stream — no GOAWAY —
+and the connection then serves a fresh request. -/
+def testHttp2PriorityFrameSizeContainment : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let registry := Registry.empty.registerUnary method fun request => do
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let path := "/lean.example.proto.NoteService/Echo"
+  let (block3, _) ← expectStatusOk
+    (Http2.Hpack.encodeHeaderBlock {} (requestHeadersForPath path))
+
+  let headersFrameFor (streamId : Nat) (block : ByteArray) : Http2.Frame := {
+    header := {
+      length := block.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.endHeaders,
+      streamId := streamId
+    },
+    payload := block
+  }
+  let dataFrameFor (streamId : Nat) (payload : ByteArray) (endStream : Bool) : Http2.Frame := {
+    header := {
+      length := payload.size,
+      frameType := Http2.FrameType.data,
+      flags := if endStream then Http2.FrameFlag.endStream else 0,
+      streamId := streamId
+    },
+    payload := payload
+  }
+  let trailersFor (streamId : Nat) (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == streamId
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+
+  let clientSettings ← expectStatusOk (Http2.Settings.frame #[])
+  let clientSettingsWire ← expectStatusOk (Http2.Frame.encode clientSettings)
+  let malformedPriority : Http2.Frame := {
+    header := {
+      length := 6,
+      frameType := Http2.FrameType.priority,
+      flags := 0,
+      streamId := 1
+    },
+    payload := bytes [0, 0, 0, 0, 15, 0]
+  }
+  let firstWire := Http2.connectionPreface
+    |>.append clientSettingsWire
+    |>.append (← expectStatusOk (Http2.Frame.encode malformedPriority))
+  (client.send firstWire).block
+
+  let afterPriority ← readHttp2FramesUntilWithTimeout client {}
+    (fun frames => frames.any fun frame => frame.header.frameType == Http2.FrameType.rstStream)
+    observeTimeoutMs "malformed-length PRIORITY should be answered with RST_STREAM"
+  let rst? := afterPriority.frames.find? fun frame =>
+    frame.header.frameType == Http2.FrameType.rstStream
+  match rst? with
+  | none => throw (IO.userError "expected an RST_STREAM for the malformed PRIORITY")
+  | some rst =>
+      expectEq rst.header.streamId 1 "RST_STREAM must name only the PRIORITY frame's stream"
+      expectEq (← expectStatusOk (Http2.RstStream.decode rst)) Http2.ErrorCode.frameSizeError
+        "RFC 9113 §6.3 prescribes FRAME_SIZE_ERROR for a malformed PRIORITY length"
+  expect (!afterPriority.frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway)
+    "a malformed-length PRIORITY must not tear the connection down with GOAWAY"
+
+  -- The connection must keep serving: a fresh stream still completes.
+  let body ← expectStatusOk ({ data := bytes [9, 9, 9] } : Message).encode
+  let secondWire := (← expectStatusOk (Http2.Frame.encode (headersFrameFor 3 block3)))
+    |>.append (← expectStatusOk (Http2.Frame.encode (dataFrameFor 3 body true)))
+  (client.send secondWire).block
+  let afterSecond ← readHttp2FramesUntilWithTimeout client
+    { afterPriority with frames := #[] } (trailersFor 3)
+    observeTimeoutMs "the connection must keep serving new streams after a malformed PRIORITY"
+  expect (!afterSecond.frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway)
+    "serving a later stream must not produce GOAWAY either"
+  let responseData := afterSecond.frames.filter fun frame =>
+    frame.header.frameType == Http2.FrameType.data && frame.header.streamId == 3
+  expect (responseData.size > 0) "stream 3 should carry a response body"
+  let messages ← expectStatusOk (Message.decodeAll (dataPayloads responseData))
+  expectEq messages.size 1 "stream 3 response should contain one message"
+  expectEq messages[0]!.data (bytes [9, 9, 9]) "stream 3 response should echo the request"
+
+  (client.shutdown).block
+  Grpc.Server.shutdown server
+  let waitTask ← IO.asTask (Grpc.Server.wait server)
+  match ← awaitTaskWithin waitTask observeTimeoutMs with
+  | some _ => pure ()
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "PRIORITY frame-size containment server did not drain")
+
 /-- Deadline propagation: the remaining time of an inbound request becomes the
 `grpc-timeout` of a downstream call, and an exhausted deadline refuses the call
 instead of issuing one that cannot succeed. -/
@@ -5349,12 +5513,14 @@ def main : IO Unit := do
   testEarlyRejectedStreamResetClearsIgnoredBody
   testStreamNativeMalformedDataReturnsGrpcStatus
   testPriorityFrameIgnored
+  testPriorityFrameSizeStreamError
   testUnknownFrameIgnored
   testPeerSettingsAffectOutbound
   testHttp2Connection
   testHttp2H2CServer
   testHttp2ServeManagedLifecycle
   testHttp2StreamErrorContainment
+  testHttp2PriorityFrameSizeContainment
   testDeadlinePropagation
   testHttp2H2CServerReadsWhileStreamOpen
   testHttp2H2CServerFlushesActiveStreamOnWindowUpdate
