@@ -451,7 +451,13 @@ def connectRawTls (server : Grpc.Server.Instance) : IO Grpc.Tls.ClientSession :=
     serverName := some "localhost",
     alpnProtocols := #["h2"]
   }
-  Std.Async.Async.block (Grpc.Tls.ClientSession.establish socket config 16384)
+  let (session, handshakeLeftover) ←
+    Std.Async.Async.block (Grpc.Tls.ClientSession.establish socket config 16384)
+  -- This server never sends 0.5-RTT application data, so callers may treat the
+  -- socket as the sole frame source; fail loudly if that ever changes.
+  unless handshakeLeftover.isEmpty do
+    throw (IO.userError "unexpected TLS application bytes coalesced with the server flight")
+  pure session
 
 partial def readTlsFramesUntilFromSession (session : Grpc.Tls.ClientSession)
     (state : ReadHttp2FrameState) (done : Array Http2.Frame -> Bool) :
@@ -482,6 +488,95 @@ def readTlsFramesUntil (session : Grpc.Tls.ClientSession) (state : ReadHttp2Fram
   | none =>
       IO.cancel readTask
       throw (IO.userError message)
+
+def expectTlsClientOk {α} (result : Except _root_.Tls.Client.Error α) (message : String) :
+    IO α :=
+  match result with
+  | .ok value => pure value
+  | .error err => throw (IO.userError s!"{message}: {err}")
+
+/-- Feed server handshake flights until the client is connected, but do NOT send
+the final client flight (CCS + Finished): return it with the connected state so
+the caller controls what shares its transport chunk. -/
+partial def completeTlsHandshakeKeepingFlight (socket : Std.Async.TCP.Socket.Client)
+    (state : _root_.Tls.Client.State) : IO (_root_.Tls.Client.State × ByteArray) := do
+  let some chunk ← (socket.recv? 8192).block
+    | throw (IO.userError "server closed during the coalescing-test handshake")
+  let output ← expectTlsClientOk (_root_.Tls.Client.feed state chunk)
+    "coalescing-test handshake feed"
+  if output.state.connected then
+    pure (output.state, output.wireBytes)
+  else do
+    unless output.wireBytes.isEmpty do
+      (socket.send output.wireBytes).block
+    completeTlsHandshakeKeepingFlight socket output.state
+
+partial def readCoalescedTestFrames (socket : Std.Async.TCP.Socket.Client)
+    (state : _root_.Tls.Client.State) (decode : ReadHttp2FrameState)
+    (done : Array Http2.Frame -> Bool) : IO ReadHttp2FrameState := do
+  if done decode.frames then
+    pure decode
+  else
+    match ← (socket.recv? 8192).block with
+    | none => pure decode
+    | some raw =>
+        let output ← expectTlsClientOk (_root_.Tls.Client.feed state raw)
+          "coalescing-test application feed"
+        let decoded ← expectStatusOk (Http2.Frame.decodeChunk decode.decoder output.plaintext)
+        readCoalescedTestFrames socket output.state
+          { decoder := { buffered := decoded.buffered },
+            frames := decode.frames.append decoded.frames }
+          done
+
+/-- A fast client's HTTP/2 preface routinely rides in the same transport chunk as
+its TLS Finished flight (the kernel coalesces the two back-to-back writes).  The
+server decrypts those application bytes while still inside its handshake loop, so
+losing them desynchronizes the connection at its very first frame — the failure
+surfaces as `invalid HTTP/2 client connection preface`.  Drive the handshake by
+hand so Finished, preface, SETTINGS, and a PING are one `send`, then require the
+PING ack and no GOAWAY. -/
+def testTlsCoalescedPrefaceAfterFinished : IO Unit := do
+  let server ← Grpc.Server.serveTls Registry.empty (← tlsIdentity)
+    { address := Grpc.Server.loopback 0 }
+  let socket ← Std.Async.TCP.Socket.Client.mk
+  (socket.connect server.localAddress).block
+  socket.noDelay
+  let entropy ← IO.getRandomBytes 96
+  let config : _root_.Tls.Client.Config := {
+    clientRandom := entropy.extract 0 32,
+    x25519Private := entropy.extract 32 64,
+    legacySessionId := entropy.extract 64 96,
+    serverName := some "localhost",
+    alpnProtocols := #["h2"]
+  }
+  let hello ← expectTlsClientOk (_root_.Tls.Client.start config) "coalescing-test ClientHello"
+  (socket.send hello.wireBytes).block
+  let (state, finishedFlight) ← completeTlsHandshakeKeepingFlight socket hello.state
+  let pingPayload := ByteArray.mk (Array.replicate 8 7)
+  let ping ← expectStatusOk (Http2.Ping.frame pingPayload)
+  let pingWire ← expectStatusOk (Http2.Frame.encode ping)
+  let appBytes := (Http2.connectionPreface.append (← clientSettingsWire false)).append pingWire
+  let sealed ← expectTlsClientOk (_root_.Tls.Client.sealApplication state appBytes)
+    "coalescing-test seal"
+  (socket.send (finishedFlight.append sealed.wireBytes)).block
+  let donePingAck (frames : Array Http2.Frame) : Bool :=
+    frames.any Http2.Ping.isAck || hasGoAway frames
+  let readTask ← IO.asTask (readCoalescedTestFrames socket sealed.state {} donePingAck)
+  let frames ← match ← awaitTaskWithin readTask observeTimeoutMs with
+    | some result => pure result.frames
+    | none =>
+        IO.cancel readTask
+        -- Half-close so the reader's parked recv observes the server teardown
+        -- instead of pinning a worker (and the process) past the failure.
+        try (socket.shutdown).block catch _ => pure ()
+        try discard <| awaitTaskWithin readTask 1000 catch _ => pure ()
+        throw (IO.userError "coalesced preface: no PING ack within the observation window")
+  expect (!hasGoAway frames)
+    "a preface coalesced behind TLS Finished must not be treated as a protocol error"
+  expect (frames.any Http2.Ping.isAck)
+    "the server must answer the PING that rode in with the TLS Finished chunk"
+  Grpc.Server.shutdown server
+  Grpc.Server.wait server
 
 /-- A connection error over TLS kills the connection, and the GOAWAY naming the
 status is sealed through the session so the peer can actually read it.  As in the
@@ -646,6 +741,8 @@ def main : IO Unit := do
   testTlsConnectionErrorIsAttributable
   IO.println "  TLS peer close"
   testTlsPeerCloseIsAttributable
+  IO.println "  TLS coalesced preface after Finished"
+  testTlsCoalescedPrefaceAfterFinished
   IO.println "  TLS silent handshake shutdown"
   testTlsShutdownCancelsSilentHandshake
   IO.println "  TLS stalled-send handshake shutdown"

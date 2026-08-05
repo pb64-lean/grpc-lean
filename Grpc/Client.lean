@@ -516,10 +516,41 @@ private def nextReaderEvent (connection : Connection) : Async ReaderEvent :=
           let error := error?.getD (IO.userError "TLS record writer failed")
           pure (ReaderEvent.writerFailed (Status.ofIOError error))
 
+/-- Decode one decrypted chunk into frames and dispatch them; `true` means the
+reader should continue.  Shared by the socket path and the TLS handshake
+leftover (application bytes the server coalesced behind its Finished flight). -/
+private def processInboundChunk (connection : Connection) (chunk : ByteArray) :
+    Async Bool := do
+  let frames? ← connection.state.atomically do
+    let state ← get
+    if state.dead.isSome then
+      pure none
+    else
+      match Http2.Frame.decodeChunk state.decoder chunk with
+      | .error status =>
+          set (failStateLocked state status)
+          pure none
+      | .ok decoded =>
+          set { state with decoder := { buffered := decoded.buffered } }
+          pure (some decoded.frames)
+  match frames? with
+  | none => pure false
+  | some frames => do
+      for frame in frames do
+        handleInboundFrame connection frame
+      pure true
+
 /-- Connection reader. Runs in `Async`: while idle (no inbound bytes) it suspends
 cooperatively instead of parking a worker thread, so open-but-idle connections are
-free. Frame handling in the body is ordinary `IO`. -/
-private partial def readerLoop (connection : Connection) : Async Unit := do
+free. Frame handling in the body is ordinary `IO`.  `pending?` carries decrypted
+application bytes that arrived before the reader existed (the TLS handshake
+leftover); they enter exactly where a decrypted socket chunk would. -/
+private partial def readerLoop (connection : Connection)
+    (pending? : Option ByteArray := none) : Async Unit := do
+  if let some chunk := pending? then
+    if ← processInboundChunk connection chunk then
+      readerLoop connection none
+    return
   let event ← try
       Except.ok <$> nextReaderEvent connection
     catch err =>
@@ -563,24 +594,8 @@ private partial def readerLoop (connection : Connection) : Async Unit := do
       else
         failConnection connection (Status.error .unavailable "connection closed by peer")
   | .ok (some chunk) =>
-      let frames? ← connection.state.atomically do
-        let state ← get
-        if state.dead.isSome then
-          pure none
-        else
-          match Http2.Frame.decodeChunk state.decoder chunk with
-          | .error status =>
-              set (failStateLocked state status)
-              pure none
-          | .ok decoded =>
-              set { state with decoder := { buffered := decoded.buffered } }
-              pure (some decoded.frames)
-      match frames? with
-      | none => pure ()
-      | some frames => do
-          for frame in frames do
-            handleInboundFrame connection frame
-          readerLoop connection
+      if ← processInboundChunk connection chunk then
+        readerLoop connection none
 
 /-- Drain the outbound channel from one cooperative writer.  In particular the
 plaintext path awaits `socket.send` in `Async`; it never parks a worker with
@@ -604,8 +619,10 @@ private partial def writerLoop (connection : Connection) : Async Unit := do
         discard <| Grpc.CancellationToken.cancel connection.writerFailureToken
           (reason := Std.CancellationReason.shutdown)
 
-private def startBackgroundTasks (connection : Connection) : IO Unit := do
-  let reader ← Async.toIO (readerLoop connection)
+private def startBackgroundTasks (connection : Connection)
+    (initialInbound : ByteArray := ByteArray.empty) : IO Unit := do
+  let pending? := if initialInbound.isEmpty then none else some initialInbound
+  let reader ← Async.toIO (readerLoop connection pending?)
   connection.background.set { reader := some reader }
   let writer ← Async.toIO (writerLoop connection)
   connection.background.set { writer := some writer, reader := some reader }
@@ -662,7 +679,8 @@ private def clientPrefaceWire : IO ByteArray := do
 
 private def initializeConnection
     (socket : TCP.Socket.Client) (config : Config)
-    (prefaceWire : ByteArray) (tls : Option Tls.ClientSession := none) :
+    (prefaceWire : ByteArray) (tls : Option Tls.ClientSession := none)
+    (initialInbound : ByteArray := ByteArray.empty) :
     IO Connection := do
   let connection : Connection := {
     socket := socket,
@@ -687,7 +705,10 @@ private def initializeConnection
     -- delay between spawning the reader and enqueuing here, so it appears only
     -- under load and only on some connections.
     enqueueBytes connection prefaceWire
-    startBackgroundTasks connection
+    -- TLS-handshake-leftover bytes (the server's 0.5-RTT SETTINGS riding behind
+    -- its Finished flight) are handed to the reader, which processes them before
+    -- its first socket read; enqueueing our preface first preserves §3.4 order.
+    startBackgroundTasks connection initialInbound
     pure connection
   catch error =>
     Async.block (shutdownConnection connection)
@@ -761,11 +782,11 @@ private def connectTlsOnSocket
     serverName := tlsConfig.serverName
     alpnProtocols := tlsConfig.alpnProtocols
   }
-  let session ← Async.block
+  let (session, handshakeLeftover) ← Async.block
     (Tls.ClientSession.establish socket clientConfig config.readSize)
   try
     verifyTlsPeer session trustStore? tlsConfig
-    initializeConnection socket config prefaceWire (some session)
+    initializeConnection socket config prefaceWire (some session) handshakeLeftover
   catch error =>
     Async.block session.close
     throw error

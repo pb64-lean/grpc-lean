@@ -49,24 +49,31 @@ private def serverErr {α} (result : Except Server.Error α) : IO α :=
 feeds server flights and writes each reply until the connection is established.
 Runs in `Async` so its socket waits suspend cooperatively — a blocking handshake
 would park a worker, and in a same-process client+server (a loopback test) the few
-pool workers can all be parked at once, deadlocking the peer's handshake. -/
+pool workers can all be parked at once, deadlocking the peer's handshake.
+
+Returns the established state together with any application plaintext that was
+coalesced behind the peer's final handshake flight in the same transport chunk
+(TLS 1.3 permits the server to seal application data — e.g. an eager HTTP/2
+SETTINGS — directly after its Finished).  Dropping those bytes desynchronizes the
+application stream, so the caller must hand them to whatever consumes the
+session before its first read. -/
 private partial def clientHandshakeLoop (socket : TCP.Socket.Client) (readSize : UInt64)
-    (state : Client.State) : Async Client.State := do
+    (state : Client.State) (leftover : ByteArray) : Async (Client.State × ByteArray) := do
   if state.connected then
-    pure state
+    pure (state, leftover)
   else
     let some chunk ← socket.recv? readSize
       | throw (IO.userError "peer closed the connection during the TLS handshake")
     let output ← clientErr (Client.feed state chunk)
     unless output.wireBytes.isEmpty do
       socket.send output.wireBytes
-    clientHandshakeLoop socket readSize output.state
+    clientHandshakeLoop socket readSize output.state (leftover.append output.plaintext)
 
 def clientHandshake (socket : TCP.Socket.Client) (config : Client.Config)
-    (readSize : UInt64 := 16384) : Async Client.State := do
+    (readSize : UInt64 := 16384) : Async (Client.State × ByteArray) := do
   let hello ← clientErr (Client.start config)
   socket.send hello.wireBytes
-  clientHandshakeLoop socket readSize hello.state
+  clientHandshakeLoop socket readSize hello.state ByteArray.empty
 
 private inductive ServerHandshakeEvent where
   | received (chunk? : Option ByteArray)
@@ -144,11 +151,19 @@ private def nextServerHandshakeEvent (socket : TCP.Socket.Client) (readSize : UI
 /-- Drive a server handshake to completion over `socket` (cooperatively — see
 `clientHandshakeLoop`). Waits for ClientHello, emits the server flight, then
 consumes the client Finished. An optional server lifecycle token makes a silent
-pre-handshake peer observable and cancellable during shutdown. -/
+pre-handshake peer observable and cancellable during shutdown.
+
+Returns the established state together with any application plaintext the client
+coalesced behind its Finished flight in the same transport chunk (a fast client
+writes Finished and its first application bytes — e.g. the HTTP/2 preface —
+back to back, and the kernel routinely delivers them as one read).  Dropping
+those bytes desynchronizes the application stream, so the caller must hand them
+to whatever consumes the session before its first read. -/
 private partial def serverHandshakeLoop (socket : TCP.Socket.Client) (readSize : UInt64)
-    (state : Server.State) (stopToken : Option Std.CancellationToken) : Async Server.State := do
+    (state : Server.State) (stopToken : Option Std.CancellationToken)
+    (leftover : ByteArray) : Async (Server.State × ByteArray) := do
   if state.connected then
-    pure state
+    pure (state, leftover)
   else
     let chunk ← match ← nextServerHandshakeEvent socket readSize stopToken with
       | .stop => throw (IO.userError "TLS server handshake cancelled")
@@ -159,11 +174,12 @@ private partial def serverHandshakeLoop (socket : TCP.Socket.Client) (readSize :
     unless output.wireBytes.isEmpty do
       sendServerHandshakeBytes socket output.wireBytes stopToken
     serverHandshakeLoop socket readSize output.state stopToken
+      (leftover.append output.plaintext)
 
 def serverHandshake (socket : TCP.Socket.Client) (config : Server.Config)
     (readSize : UInt64 := 16384) (stopToken : Option Std.CancellationToken := none) :
-    Async Server.State :=
-  serverHandshakeLoop socket readSize (Server.start config) stopToken
+    Async (Server.State × ByteArray) :=
+  serverHandshakeLoop socket readSize (Server.start config) stopToken ByteArray.empty
 
 /-! ## Sessions. -/
 
@@ -249,19 +265,24 @@ private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
 
 namespace ClientSession
 
-/-- Establish a TLS client session over an already-connected socket. -/
+/-- Establish a TLS client session over an already-connected socket.
+
+Also returns any application plaintext the server coalesced behind its final
+handshake flight (TLS 1.3 lets a server seal application data right after its
+Finished).  The caller must feed those bytes to the session's consumer before
+its first read; discarding them loses the head of the application stream. -/
 def establish (socket : TCP.Socket.Client) (config : Client.Config)
-    (readSize : UInt64 := 16384) : Async ClientSession := do
-  let state ← clientHandshake socket config readSize
+    (readSize : UInt64 := 16384) : Async (ClientSession × ByteArray) := do
+  let (state, leftover) ← clientHandshake socket config readSize
   let outbound ← Std.CloseableChannel.new
   let stateMutex ← Std.Mutex.new state
   let writer ← startWriter socket outbound
-  pure {
+  pure ({
     socket := socket
     state := stateMutex
     outbound := outbound
     writer := writer
-  }
+  }, leftover)
 
 /-- The ALPN protocol the peer selected, if any. -/
 def alpnSelected (session : ClientSession) : IO (Option String) :=
@@ -327,15 +348,22 @@ end ClientSession
 
 namespace ServerSession
 
-/-- Establish a TLS server session over an accepted socket (runs the handshake). -/
+/-- Establish a TLS server session over an accepted socket (runs the handshake).
+
+Also returns any application plaintext the client coalesced behind its Finished
+flight (a fast client's first application bytes — e.g. the HTTP/2 preface —
+routinely arrive in the same transport chunk).  The caller must feed those bytes
+to the session's consumer before its first read; discarding them loses the head
+of the application stream. -/
 def establish (socket : TCP.Socket.Client) (config : Server.Config)
     (readSize : UInt64 := 16384) (stopToken : Option Std.CancellationToken := none) :
-    Async ServerSession := do
-  let state ← serverHandshake socket config readSize stopToken
+    Async (ServerSession × ByteArray) := do
+  let (state, leftover) ← serverHandshake socket config readSize stopToken
   let outbound ← Std.CloseableChannel.new
   let stateMutex ← Std.Mutex.new state
   let writer ← startWriter socket outbound
-  pure { socket := socket, state := stateMutex, outbound := outbound, writer := writer }
+  pure ({ socket := socket, state := stateMutex, outbound := outbound, writer := writer },
+    leftover)
 
 /-- The ALPN protocol negotiated with the client, if any (e.g. "h2"). -/
 def alpnSelected (session : ServerSession) : IO (Option String) :=

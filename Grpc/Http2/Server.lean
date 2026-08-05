@@ -954,6 +954,27 @@ private def nextTlsConnectionEvent (config : Config) (session : Grpc.Tls.ServerS
       pure TlsConnectionEvent.writerFailed
   ]
 
+/-- Apply one decrypted inbound chunk to the HTTP/2 connection; `true` means the
+connection should keep serving.  Shared by the event loop below and by the
+handshake leftover — application bytes the peer coalesced behind its TLS
+Finished flight — so both paths report causes identically. -/
+private def serveTlsInboundPlaintext (registry : Registry)
+    (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
+    (closeCause : IO.Ref (Option CloseCause)) (plaintext : ByteArray) :
+    Std.Async.Async Bool := do
+  match ← Connection.processBytesEncodedSharedWithOwned
+      registry stateMutex plaintext (tlsServerSend session) with
+  | .ok () =>
+      if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
+        reportCloseCause closeCause CloseCause.peerClosed
+        pure false
+      else
+        pure true
+  | .error status =>
+      reportCloseCause closeCause (CloseCause.protocolError status)
+      discard <| Connection.cancelActiveSharedOwned stateMutex
+      pure false
+
 /-- Per-connection event loop over TLS.  Structurally the same as
 `serveManagedClientLoop`, including its cause reporting: every exit records why,
 and the GOAWAY naming it is emitted once by `finishManagedTlsClient` rather than
@@ -982,16 +1003,8 @@ private partial def serveTlsClientLoop (registry : Registry) (config : Config)
           reportCloseCause closeCause CloseCause.peerClosed
           discard <| Connection.cancelActiveSharedOwned stateMutex
       | some plaintext =>
-          match ← Connection.processBytesEncodedSharedWithOwned
-              registry stateMutex plaintext (tlsServerSend session) with
-          | .ok () =>
-              if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
-                reportCloseCause closeCause CloseCause.peerClosed
-              else
-                serveTlsClientLoop registry config session stateMutex stopToken closeCause
-          | .error status =>
-              reportCloseCause closeCause (CloseCause.protocolError status)
-              discard <| Connection.cancelActiveSharedOwned stateMutex
+          if ← serveTlsInboundPlaintext registry session stateMutex closeCause plaintext then
+            serveTlsClientLoop registry config session stateMutex stopToken closeCause
 
 /-- Single teardown point for a managed TLS connection, mirroring
 `finishManagedClient`: record the cause, seal the GOAWAY that names it through the
@@ -1031,15 +1044,24 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       if config.noDelay then
         client.noDelay
       let serverConfig ← freshTlsServerConfig tlsConfig
-      let session ← Grpc.Tls.ServerSession.establish client serverConfig config.readSize
-        (stopToken := some stopToken)
+      let (session, handshakeLeftover) ← Grpc.Tls.ServerSession.establish client serverConfig
+        config.readSize (stopToken := some stopToken)
       -- Publish the session before any byte of HTTP/2: from here on every
       -- teardown byte must be sealed instead of written plaintext.
       tlsSession.set (some session)
       let preface ← ofStatusExcept
         (Connection.serverPrefaceBytes config.maxConcurrentStreams config.maxHeaderListSize)
       session.send preface
-      serveTlsClientLoop registry config session stateMutex stopToken closeCause
+      -- A fast client's HTTP/2 preface can ride in the same transport chunk as
+      -- its TLS Finished; those bytes were decrypted during the handshake and
+      -- must reach the connection before the first socket read.
+      let continue? ←
+        if handshakeLeftover.isEmpty then
+          pure true
+        else
+          serveTlsInboundPlaintext registry session stateMutex closeCause handshakeLeftover
+      if continue? then
+        serveTlsClientLoop registry config session stateMutex stopToken closeCause
       pure none
     catch err =>
       -- A handshake that failed has no session and cannot carry HTTP/2 GOAWAY,

@@ -23,6 +23,11 @@ port="${TEST_GRPC_TLS_PORT:-50054}"
 log="${TEST_TMPDIR:-/tmp}/note_tls_server.log"
 
 cleanup() {
+  status=$?
+  if [[ "${status}" -ne 0 && -f "${log}" ]]; then
+    echo "--- note_server log (test exit ${status}):" >&2
+    cat "${log}" >&2 || true
+  fi
   if [[ -n "${server_pid:-}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true

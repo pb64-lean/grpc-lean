@@ -244,7 +244,7 @@ private def serveRestConnection (connectionId : Nat) (handler : Handler) (config
     (client : TCP.Socket.Client) : Async Unit := do
   let reportFailure (stage : ConnectionFailureStage) (message : String) : IO Unit :=
     recordConnectionFailure failures { connectionId, stage, message }
-  let established : Except IO.Error ServerSession ← try
+  let established : Except IO.Error (ServerSession × ByteArray) ← try
       if config.noDelay then
         client.noDelay
       let entropy ← IO.getRandomBytes 64
@@ -266,11 +266,13 @@ private def serveRestConnection (connectionId : Nat) (handler : Handler) (config
       unless ← shutdownToken.isCancelled do
         reportFailure .handshake (toString err)
       shutdownSocket client
-  | Except.ok session =>
+  | Except.ok (session, handshakeLeftover) =>
       -- Cleanup is deliberately outside request processing so every exit after
       -- a successful handshake closes the record queue and retires the socket.
+      -- A fast client's request head can ride in the same transport chunk as its
+      -- TLS Finished; those decrypted bytes seed the request buffer.
       try
-        serveOneRequest session handler shutdownToken reportFailure ByteArray.empty
+        serveOneRequest session handler shutdownToken reportFailure handshakeLeftover
       catch err =>
         unless ← shutdownToken.isCancelled do
           reportFailure .request (toString err)
