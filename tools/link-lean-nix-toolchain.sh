@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOLCHAIN_NAME="${1:-$(tr -d '[:space:]' < "${ROOT}/lean-toolchain")}"
+TOOLCHAIN_NAME="${1:-rules-lean-grpc-nix-4.31}"
 NIX_ATTR="${LEAN_NIX_ATTR:-lean4_upstream_std}"
 NIX_FILE="${LEAN_NIX_FILE:-${ROOT}/third_party/Lean-zh/protobuf/nixpkgs.nix}"
 
@@ -13,7 +13,7 @@ fi
 
 if [[ "${TOOLCHAIN_NAME}" == *['/:']* ]]; then
   echo "${TOOLCHAIN_NAME} is not a local Nix toolchain name" >&2
-  echo "Use a plain alias in ${ROOT}/lean-toolchain (no '/' or ':')." >&2
+  echo "Pass a plain local alias (no '/' or ':')." >&2
   exit 1
 fi
 

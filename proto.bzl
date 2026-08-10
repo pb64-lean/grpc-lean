@@ -2,7 +2,7 @@
 """Rules for generating Lean code from Protocol Buffer definitions."""
 
 load("@rules_proto//proto:defs.bzl", "ProtoInfo")
-load("@rules_lean//lean:library.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "LeanGeneratedSourceInfo", "lean_library")
 
 def _default_module_prefix(name):
     parts = []
@@ -121,6 +121,7 @@ trap 'rm -rf "$TMP"' EXIT
     return [
         DefaultInfo(files = depset(outputs)),
         OutputGroupInfo(lean_srcs = depset(outputs)),
+        LeanGeneratedSourceInfo(lean_srcs = depset(outputs)),
         _LeanProtoLibraryGenInfo(
             lean_srcs = depset(outputs),
             module_prefix = module_prefix,
@@ -134,6 +135,7 @@ trap 'rm -rf "$TMP"' EXIT
 _lean_proto_generate = rule(
     implementation = _lean_proto_generate_impl,
     doc = "Generates pure Lean protobuf modules with the Lean protoc plugin.",
+    provides = [LeanGeneratedSourceInfo, _LeanProtoLibraryGenInfo],
     attrs = {
         "proto": attr.label(
             doc = "The proto_library target to generate Lean code for.",

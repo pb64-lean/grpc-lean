@@ -286,11 +286,13 @@ cd grpc-lean
 bazel test //...
 ```
 
-Prerequisites: Bazel 8.5 (`.bazelversion`) and **Nix** — the Lean toolchain
+Prerequisites: Bazel 8.5 (`.bazelversion`) and **Nix** — Bazel's Lean toolchain
 (4.31.0-pre, pinned by `third_party/Lean-zh/protobuf/nixpkgs.{nix,json}`) is
-built by Nix. `lakefile.lean` is an IDE/LSP project model only; `lake build`
-is not a supported build. Run `tools/link-lean-nix-toolchain.sh` once to give
-your editor the same nix-built Lean that Bazel uses.
+built by Nix. The `lean-toolchain` selector uses nightly 2026-04-25, which is
+the same Lean commit, for Lake and editor portability. `lakefile.lean` is an
+IDE/LSP project model; Bazel remains the authoritative build. The optional
+`tools/link-lean-nix-toolchain.sh` helper exposes the Nix build under the local
+alias `rules-lean-grpc-nix-4.31` for direct comparison or manual selection.
 
 `bazel test //...` runs the hermetic suite: the ~69-case runtime test
 (protocol validation, all four dispatch shapes, HTTP/2 frame codecs, flow

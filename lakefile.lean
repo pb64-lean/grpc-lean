@@ -17,6 +17,8 @@ Use Bazel for validation:
 package «rules-lean-grpc» where
   leanOptions := #[⟨`experimental.module, true⟩]
 
+require «tls13-lean» from "../tls13-lean"
+
 /- Keep the editor's Lake module graph aligned with the local repositories in
    MODULE.bazel.  These are source roots only; Bazel remains the build system. -/
 lean_lib «Binary» where
@@ -24,6 +26,10 @@ lean_lib «Binary» where
 
 lean_lib «Protobuf» where
   srcDir := "third_party/Lean-zh/protobuf"
+
+lean_lib «Zlib» where
+  srcDir := "."
+  roots := #[`Zlib.Gzip]
 
 lean_lib «Grpc» where
   srcDir := "."

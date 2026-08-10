@@ -1,5 +1,13 @@
-{"version": "1.1.0",
+{"version": "1.2.0",
  "packagesDir": ".lake/packages",
- "packages": [],
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "«tls13-lean»",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "../tls13-lean",
+   "configFile": "lakefile.lean"}],
  "name": "«rules-lean-grpc»",
- "lakeDir": ".lake"}
+ "lakeDir": ".lake",
+ "fixedToolchain": false}
