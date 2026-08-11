@@ -1,10 +1,22 @@
 module
 
 public import Grpc.Protocol
+import Std.Async.Timer
 
 public section
 
 namespace Grpc
+
+/-- Per-call hook used by a transport to retain the exact child currently
+executing a deadline-controlled handler or stream receive.  A managed HTTP/2
+transport also owns the deadline timer, multiplexing all active calls onto its
+independent per-connection scheduler; standalone callers leave
+`externalTimer` false and use the local native-timer fallback.  The returned
+action releases a normally completed child.  A cancelled child stays
+registered until the transport has emitted its terminal status and joins it. -/
+structure DeadlineRuntime where
+  externalTimer : Bool := false
+  registerTask : Nat -> IO Unit -> IO Unit -> Std.Async.Async Unit -> IO (IO Unit)
 
 abbrev UnaryHandler := UnaryRequest -> GrpcM UnaryResponse
 abbrev ServerStreamingHandler := UnaryRequest -> GrpcM ServerStreamingResponse
@@ -171,9 +183,12 @@ structure DuplicateMethod where
 structure Registry where
   maxReceiveMessageSize : Option Nat := none
   maxSendMessageSize : Option Nat := none
-  requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
+  private requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
     pure (.accept entry.handler)
   entries : Array MethodEntry := #[]
+  /-- Lets the transport keep the zero-overhead registered-handler fast path
+  while deadline-racing only user-installed authorization IO. -/
+  private customRequestHeaderAuthorizer : Bool := false
 
 namespace Registry
 
@@ -188,7 +203,17 @@ def withMaxSendMessageSize (registry : Registry) (size : Nat) : Registry :=
 /-- Install the callback that authorizes complete request headers. -/
 def withRequestHeaderAuthorizer (registry : Registry)
     (authorizer : RequestHeaderAuthorizer) : Registry :=
-  { registry with requestHeaderAuthorizer := authorizer }
+  {
+    registry with
+    requestHeaderAuthorizer := authorizer,
+    customRequestHeaderAuthorizer := true
+  }
+
+/-- Whether header authorization contains user IO that must share the call's
+deadline.  The backing fields are private so installing a callback cannot
+silently bypass this invariant; use `withRequestHeaderAuthorizer`. -/
+def usesCustomRequestHeaderAuthorizer (registry : Registry) : Bool :=
+  registry.customRequestHeaderAuthorizer
 
 /-- Run the installed request-header authorizer for a looked-up entry. -/
 def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)
@@ -449,24 +474,25 @@ def findBidirectionalStreamingStream? (registry : Registry) (name : MethodName) 
 private inductive DeadlineResult (α : Type) where
   | completed : Except Status α -> DeadlineResult α
   | expired : DeadlineResult α
-
-private def maxDeadlineSleepChunkMilliseconds : Nat := 50
-
-private partial def sleepUntilDeadline (remainingMilliseconds : Nat) : IO Unit := do
-  if remainingMilliseconds == 0 then
-    pure ()
-  else if ← IO.checkCanceled then
-    pure ()
-  else
-    let chunk := Nat.min remainingMilliseconds maxDeadlineSleepChunkMilliseconds
-    IO.sleep (UInt32.ofNat chunk)
-    sleepUntilDeadline (remainingMilliseconds - chunk)
+  | failed : IO.Error -> DeadlineResult α
+  deriving Inhabited
 
 private def deadlineFromNow? : Option Timeout -> IO (Option Nat)
   | none => pure none
   | some timeout => do
       let now ← IO.monoNanosNow
       pure (some (now + timeout.toNanoseconds))
+
+/-- Use the transport's header-time instant when it has one; direct Registry
+callers have no header lifecycle, so they start the timeout at decode time. -/
+private def deadlineForTimeout (timeout : Option Timeout) (headerDeadline : Option Nat) :
+    IO (Option Nat) :=
+  match timeout with
+  | none => pure none
+  | some _ =>
+      match headerDeadline with
+      | some deadline => pure (some deadline)
+      | none => deadlineFromNow? timeout
 
 private def remainingUntilDeadlineMilliseconds (deadlineNanoseconds : Nat) : IO Nat := do
   let now ← IO.monoNanosNow
@@ -485,34 +511,131 @@ private def runHandler (action : GrpcM α) : IO (Except Status α) := do
   catch err =>
     pure (.error (Status.ofIOError err))
 
+/-
+`IO.waitAny` blocks a Lean scheduler worker and does not provision a replacement
+worker (unlike `Task.get`).  In the old implementation every timed RPC blocked
+its dispatch worker while a handler task and an `IO.sleep` task were queued;
+enough concurrent calls could therefore occupy the whole pool before any
+handler ran.  This race is continuation based: the dispatch task depends on a
+winner promise and returns its worker while the handler and libuv timer run.
+-/
+/-- Run one call phase against an absolute monotonic deadline without parking
+a scheduler worker.  Managed transports supply `runtime?` to retain the exact
+child across cancellation; callers that install custom authorization use the
+same primitive and join its retained child before returning. -/
+def runWithDeadlineUntilAsync (deadline? : Option Nat) (action : GrpcM α)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status α) := do
+  match deadline? with
+  | none => runHandler action
+  | some deadline => do
+      let externalTimer := runtime?.any (fun runtime => runtime.externalTimer)
+      -- A managed scheduler already owns the absolute instant.  Only the
+      -- standalone fallback needs a clock read here to size its relative UV
+      -- timer; the handler still checks the absolute instant before and after
+      -- arbitrary IO in both modes.
+      let remainingMilliseconds ←
+        if externalTimer then pure 0
+        else remainingUntilDeadlineMilliseconds deadline
+      if !externalTimer && remainingMilliseconds == 0 then
+        return .error Deadline.exceededStatus
+      let winner ← IO.Promise.new
+      -- Standalone calls get one native timer. Managed transports register
+      -- the absolute instant with their independent per-connection scheduler,
+      -- so allocating and then cancelling another UV timer per RPC is pure
+      -- overhead there.
+      let stopDeadlineTimer : IO Unit ←
+        if externalTimer then
+          pure (pure ())
+        else do
+          -- Arm before starting arbitrary handler IO.  A timer-allocation
+          -- failure therefore cannot strand an already-running child.
+          let sleeper ← Std.Async.Sleep.mk
+            (Std.Time.Millisecond.Offset.ofNat remainingMilliseconds)
+          let deadlineTask ← Std.Async.Async.toIO sleeper.wait
+          BaseIO.chainTask deadlineTask (sync := true) fun
+            | .ok () => winner.resolve (.expired : DeadlineResult α)
+            | .error error => winner.resolve (.failed error)
+          pure do
+            IO.cancel deadlineTask
+            try
+              sleeper.stop
+            catch _ =>
+              pure ()
+      -- `IO.asTask` is `BaseIO`, so once this binding returns the catch below
+      -- always owns an exact task handle; no auxiliary publication Ref is
+      -- needed on the hot timed-call path.
+      let handlerTask ← IO.asTask do
+        if ← deadlineExceededAt deadline then
+          winner.resolve (.expired : DeadlineResult α)
+          pure ()
+        else
+          let result ← runHandler action
+          if ← deadlineExceededAt deadline then
+            winner.resolve (.expired : DeadlineResult α)
+          else
+            winner.resolve (.completed result)
+          pure ()
+      -- A managed transport retains this exact join through `runtime?` and
+      -- deliberately performs it only after publishing the terminal response.
+      -- Standalone callers have no later lifecycle owner, so they must finish
+      -- cancellation before this primitive returns instead of orphaning an
+      -- uncooperative handler/stream receive.
+      let joinHandlerIfUnmanaged : Std.Async.Async Unit := do
+        if runtime?.isNone then
+          try
+            discard <| Std.Async.Async.ofAsyncTask handlerTask
+          catch _ =>
+            pure ()
+      try
+        -- Resolve at the actual handler completion point.  A callback queued
+        -- after the timer would otherwise turn a pre-deadline completion into
+        -- a false timeout under scheduler load.
+        let unregister ← match runtime? with
+          | none => pure (pure ())
+          | some runtime =>
+              let cancel : IO Unit := do
+                winner.resolve (.failed (IO.userError Status.dispatchCancelledMessage))
+                IO.cancel handlerTask
+              let expire : IO Unit := do
+                winner.resolve (.expired : DeadlineResult α)
+                IO.cancel handlerTask
+              let join : Std.Async.Async Unit := do
+                try
+                  discard <| Std.Async.Async.ofAsyncTask handlerTask
+                catch _ =>
+                  pure ()
+              runtime.registerTask deadline cancel expire join
+        let selected ← Std.Async.Async.ofPurePromise (pure winner)
+        -- `Sleep.stop` drops its waiter; cancelling the converted task first
+        -- makes that cleanup explicit and keeps no losing timer continuation.
+        stopDeadlineTimer
+        match selected with
+        | .completed result =>
+            unregister
+            pure result
+        | .expired =>
+            IO.cancel handlerTask
+            joinHandlerIfUnmanaged
+            pure (.error Deadline.exceededStatus)
+        | .failed error =>
+            IO.cancel handlerTask
+            joinHandlerIfUnmanaged
+            pure (.error (Status.ofIOError error))
+      catch error =>
+        IO.cancel handlerTask
+        try
+          discard <| Std.Async.Async.ofAsyncTask handlerTask
+        catch _ =>
+          pure ()
+        stopDeadlineTimer
+        pure (.error (Status.ofIOError error))
+
 private def runWithDeadlineUntil (deadline? : Option Nat) (action : GrpcM α) : GrpcM α :=
   match deadline? with
   | none => ExceptT.mk (runHandler action)
-  | some deadline =>
-      ExceptT.mk do
-        let remainingMilliseconds ← remainingUntilDeadlineMilliseconds deadline
-        if remainingMilliseconds == 0 then
-          return .error (Status.deadlineExceeded "gRPC deadline exceeded")
-        let handlerTask ← IO.asTask do
-          let result ← runHandler action
-          pure (DeadlineResult.completed result)
-        let deadlineTask ← IO.asTask do
-          sleepUntilDeadline remainingMilliseconds
-          pure (DeadlineResult.expired : DeadlineResult α)
-        match (← IO.waitAny [handlerTask, deadlineTask]) with
-        | .error err =>
-            IO.cancel handlerTask
-            IO.cancel deadlineTask
-            pure (.error (Status.ofIOError err))
-        | .ok (.completed result) =>
-            IO.cancel deadlineTask
-            if ← deadlineExceededAt deadline then
-              pure (.error (Status.deadlineExceeded "gRPC deadline exceeded"))
-            else
-              pure result
-        | .ok .expired =>
-            IO.cancel handlerTask
-            pure (.error (Status.deadlineExceeded "gRPC deadline exceeded"))
+  | some deadline => ExceptT.mk <|
+      Std.Async.Async.block (runWithDeadlineUntilAsync (some deadline) action)
 
 private def checkSendDataSize (registry : Registry) (data : ByteArray) : GrpcM Unit := do
   match registry.maxSendMessageSize with
@@ -596,7 +719,8 @@ private def withDeadlineUntil (deadline? : Option Nat) (stream : MessageStream �
     cancel := stream.cancel
   }
 
-private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray) :
+private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (headerDeadline : Option Nat := none) :
     GrpcM UnaryRequest := do
   let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
   let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
@@ -607,7 +731,7 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
   let message : Message := messages[0]!
   if message.compressed != CompressionFlag.identity then
     throw (Status.unimplemented "compressed requests are not supported")
-  let deadline? ← deadlineFromNow? timeout
+  let deadline? ← deadlineForTimeout timeout headerDeadline
   pure {
     method := method,
     metadata := metadata,
@@ -616,7 +740,8 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
     data := message.data
   }
 
-private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata) (body : ByteArray) :
+private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (headerDeadline : Option Nat := none) :
     GrpcM ClientStreamingRequest := do
   let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
   let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
@@ -625,7 +750,7 @@ private def decodeClientStreamingRequest (registry : Registry) (metadata : Metad
   for message in messages do
     if message.compressed != CompressionFlag.identity then
       throw (Status.unimplemented "compressed requests are not supported")
-  let deadline? ← deadlineFromNow? timeout
+  let deadline? ← deadlineForTimeout timeout headerDeadline
   pure {
     method := method,
     metadata := metadata,
@@ -635,17 +760,17 @@ private def decodeClientStreamingRequest (registry : Registry) (metadata : Metad
   }
 
 private def decodeClientStreamingStreamRequest (metadata : Metadata)
-    (messages : MessageStream ByteArray) :
+    (messages : MessageStream ByteArray) (headerDeadline : Option Nat := none) :
     GrpcM (ClientStreamingStreamRequest × Option Nat) := do
   let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
   let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
-  let deadline? ← deadlineFromNow? timeout
+  let deadline? ← deadlineForTimeout timeout headerDeadline
   pure ({
     method := method,
     metadata := metadata,
     timeout := timeout,
     deadline := deadline?,
-    messages := withDeadlineUntil deadline? messages
+    messages := messages
   }, deadline?)
 
 private def clientStreamingRequestOfStream (request : ClientStreamingStreamRequest) :
@@ -676,110 +801,283 @@ def streamHandlerOfBidirectionalStreaming (handler : BidirectionalStreamingHandl
   fun request => do
     streamResponseOfAggregate (← handler (← clientStreamingRequestOfStream request))
 
-def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option UnaryHandler := none) :
-    GrpcM UnaryResponse := do
-  let request ← decodeUnaryRequest registry metadata body
+private structure PreparedDispatch (α : Type) where
+  deadline : Option Nat
+  action : GrpcM α
+
+private def runPreparedDispatchAsync (prepared : PreparedDispatch α)
+    (cancelOnDeadline : IO Unit := pure ()) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status α) := do
+  let result ← runWithDeadlineUntilAsync prepared.deadline prepared.action runtime?
+  match result with
+  | .error status =>
+      if status.code == Code.deadlineExceeded then
+        cancelOnDeadline
+      pure (.error status)
+  | .ok value => pure (.ok value)
+
+private def runPreparedDispatch (prepared : PreparedDispatch α)
+    (cancelOnDeadline : IO Unit := pure ()) : GrpcM α :=
+  ExceptT.mk do
+    let result ← (runWithDeadlineUntil prepared.deadline prepared.action).run
+    match result with
+    | .error status =>
+        if status.code == Code.deadlineExceeded then
+          cancelOnDeadline
+        pure (.error status)
+    | .ok value => pure (.ok value)
+
+private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option UnaryHandler) (headerDeadline : Option Nat) :
+    GrpcM (PreparedDispatch UnaryResponse) := do
+  let request ← decodeUnaryRequest registry metadata body headerDeadline
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
         match registry.findUnary? request.method with
         | some handler => pure handler
         | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-  -- Enforce the same instant the handler is told about, so
-  -- `request.deadline` is authoritative for propagation.
-  let response ← runWithDeadlineUntil request.deadline (handler request)
-  validateUnaryResponse registry response
-
-def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option ServerStreamingStreamHandler := none) :
-    GrpcM ServerStreamingStreamResponse := do
-  let request ← decodeUnaryRequest registry metadata body
-  let deadline? := request.deadline
-  let response ← match handler? with
-    | some handler => runWithDeadlineUntil deadline? (handler request)
-    | none =>
-        match registry.findServerStreamingStream? request.method with
-        | some handler =>
-            runWithDeadlineUntil deadline? (handler request)
-        | none =>
-            match registry.findServerStreaming? request.method with
-            | some handler => do
-                let response ← runWithDeadlineUntil deadline? (handler request)
-                streamResponseOfAggregate response
-            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-  validateServerStreamingStreamResponse registry {
-    response with
-    messages := withDeadlineUntil deadline? response.messages
+  pure {
+    deadline := request.deadline,
+    action := do
+      let response ← handler request
+      validateUnaryResponse registry response
   }
 
+private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (handler? : Option ServerStreamingStreamHandler)
+    (headerDeadline : Option Nat) :
+    GrpcM (PreparedDispatch ServerStreamingStreamResponse) := do
+  let request ← decodeUnaryRequest registry metadata body headerDeadline
+  let handler ← match handler? with
+    | some handler => pure handler
+    | none =>
+        match registry.findServerStreamingStream? request.method with
+        | some handler => pure handler
+        | none =>
+            match registry.findServerStreaming? request.method with
+            | some handler => pure (streamHandlerOfServerStreaming handler)
+            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
+  pure {
+    deadline := request.deadline,
+    action := do
+      let response ← handler request
+      validateServerStreamingStreamResponse registry response
+  }
+
+private def prepareClientStreamingDispatch (registry : Registry) (metadata : Metadata)
+    (messages : MessageStream ByteArray) (handler? : Option ClientStreamingStreamHandler)
+    (headerDeadline : Option Nat) : GrpcM (PreparedDispatch UnaryResponse) := do
+  let (request, deadline?) ←
+    decodeClientStreamingStreamRequest metadata messages headerDeadline
+  let handler ← match handler? with
+    | some handler => pure handler
+    | none =>
+        match registry.findClientStreamingStream? request.method with
+        | some handler => pure handler
+        | none =>
+            match registry.findClientStreaming? request.method with
+            | some handler => pure (streamHandlerOfClientStreaming handler)
+            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
+  pure {
+    deadline := deadline?,
+    action := do
+      let response ← handler request
+      validateUnaryResponse registry response
+  }
+
+private def prepareBidirectionalStreamingDispatch (registry : Registry) (metadata : Metadata)
+    (messages : MessageStream ByteArray) (handler? : Option BidirectionalStreamingStreamHandler)
+    (headerDeadline : Option Nat) :
+    GrpcM (PreparedDispatch ServerStreamingStreamResponse) := do
+  let (request, deadline?) ←
+    decodeClientStreamingStreamRequest metadata messages headerDeadline
+  let handler ← match handler? with
+    | some handler => pure handler
+    | none =>
+        match registry.findBidirectionalStreamingStream? request.method with
+        | some handler => pure handler
+        | none =>
+            match registry.findBidirectionalStreaming? request.method with
+            | some handler => pure (streamHandlerOfBidirectionalStreaming handler)
+            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
+  pure {
+    deadline := deadline?,
+    action := do
+      let response ← handler request
+      validateServerStreamingStreamResponse registry response
+  }
+
+def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none) :
+    GrpcM UnaryResponse := do
+  let prepared ← prepareUnaryDispatch registry metadata body handler? headerDeadline
+  runPreparedDispatch prepared
+
+/-- Async-native managed-server dispatch.  The no-deadline branch executes
+inline; a timed call owns one cancellable handler task while a managed
+transport supplies its shared deadline scheduler. -/
+def dispatchUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler (prepareUnaryDispatch registry metadata body handler? headerDeadline) with
+  | .error status => pure (.error status)
+  | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
+
+def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option ServerStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
+    GrpcM ServerStreamingStreamResponse := do
+  let prepared ←
+    prepareServerStreamingStreamDispatch registry metadata body handler? headerDeadline
+  let response ← runPreparedDispatch prepared
+  pure { response with messages := withDeadlineUntil prepared.deadline response.messages }
+
+/-- Returns the unwrapped stream together with the one absolute deadline.  The
+Async HTTP/2 encoder races each receive against that same instant. -/
+def dispatchServerStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (handler? : Option ServerStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler <|
+      prepareServerStreamingStreamDispatch registry metadata body handler? headerDeadline with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      match ← runPreparedDispatchAsync prepared (runtime? := runtime?) with
+      | .error status => pure (.error status)
+      | .ok response => pure (.ok (response, prepared.deadline))
+
 def dispatchServerStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option ServerStreamingStreamHandler := none) :
+    (handler? : Option ServerStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingResponse := do
-  let response ← registry.dispatchServerStreamingStream metadata body handler?
+  let response ← registry.dispatchServerStreamingStream metadata body handler? headerDeadline
   collectServerStreamingStreamResponse response
 
 def dispatchClientStreamingMessageStream (registry : Registry) (metadata : Metadata)
     (messages : MessageStream ByteArray)
-    (handler? : Option ClientStreamingStreamHandler := none) :
+    (handler? : Option ClientStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM UnaryResponse := do
-  let (request, deadline?) ← decodeClientStreamingStreamRequest metadata messages
-  let response ← match handler? with
-    | some handler => runWithDeadlineUntil deadline? (handler request)
-    | none =>
-        match registry.findClientStreamingStream? request.method with
-        | some handler =>
-            runWithDeadlineUntil deadline? (handler request)
-        | none =>
-            match registry.findClientStreaming? request.method with
-            | some handler => do
-                let aggregateRequest ← clientStreamingRequestOfStream request
-                runWithDeadlineUntil deadline? (handler aggregateRequest)
-            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-  validateUnaryResponse registry response
+  let prepared ←
+    prepareClientStreamingDispatch registry metadata messages handler? headerDeadline
+  runPreparedDispatch prepared (cancelAfterDeadline messages)
+
+def dispatchClientStreamingMessageStreamAsync (registry : Registry) (metadata : Metadata)
+    (messages : MessageStream ByteArray)
+    (handler? : Option ClientStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler <|
+      prepareClientStreamingDispatch registry metadata messages handler? headerDeadline with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime?
 
 def dispatchClientStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option ClientStreamingStreamHandler := none) :
+    (handler? : Option ClientStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM UnaryResponse := do
-  let request ← decodeClientStreamingRequest registry metadata body
+  let request ← decodeClientStreamingRequest registry metadata body headerDeadline
   let messages ← MessageStream.ofArray request.messages
-  registry.dispatchClientStreamingMessageStream metadata messages handler?
+  registry.dispatchClientStreamingMessageStream metadata messages handler? request.deadline
+
+def dispatchClientStreamingAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option ClientStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler (decodeClientStreamingRequest registry metadata body headerDeadline) with
+  | .error status => pure (.error status)
+  | .ok request =>
+      match ← runHandler (MessageStream.ofArray request.messages) with
+      | .error status => pure (.error status)
+      | .ok messages =>
+          registry.dispatchClientStreamingMessageStreamAsync
+            metadata messages handler? request.deadline runtime?
 
 def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata : Metadata)
     (messages : MessageStream ByteArray)
-    (handler? : Option BidirectionalStreamingStreamHandler := none) :
+    (handler? : Option BidirectionalStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingStreamResponse := do
-  let (request, deadline?) ← decodeClientStreamingStreamRequest metadata messages
-  let response ← match handler? with
-    | some handler => runWithDeadlineUntil deadline? (handler request)
-    | none =>
-        match registry.findBidirectionalStreamingStream? request.method with
-        | some handler =>
-            runWithDeadlineUntil deadline? (handler request)
-        | none =>
-            match registry.findBidirectionalStreaming? request.method with
-            | some handler => do
-                let aggregateRequest ← clientStreamingRequestOfStream request
-                let response ← runWithDeadlineUntil deadline? (handler aggregateRequest)
-                streamResponseOfAggregate response
-            | none => throw (Status.unimplemented s!"unknown gRPC method {request.method.path}")
-  validateServerStreamingStreamResponse registry {
+  let prepared ←
+    prepareBidirectionalStreamingDispatch registry metadata messages handler? headerDeadline
+  let response ← runPreparedDispatch prepared (cancelAfterDeadline messages)
+  let combinedMessages : MessageStream ByteArray := {
+    recv? := response.messages.recv?,
+    cancel := do
+      response.messages.cancel
+      messages.cancel
+  }
+  let responseMessages := withDeadlineUntil prepared.deadline combinedMessages
+  pure {
     response with
-    messages := withDeadlineUntil deadline? response.messages
+    messages := responseMessages
   }
 
+def dispatchBidirectionalStreamingMessageStreamAsync (registry : Registry)
+    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (handler? : Option BidirectionalStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler <|
+      prepareBidirectionalStreamingDispatch registry metadata messages handler? headerDeadline with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      match ← runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime? with
+      | .error status => pure (.error status)
+      | .ok response =>
+          let response := {
+            response with
+            messages := {
+              recv? := response.messages.recv?,
+              cancel := do
+                response.messages.cancel
+                messages.cancel
+            }
+          }
+          pure (.ok (response, prepared.deadline))
+
 def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : Metadata)
-    (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none) :
+    (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingStreamResponse := do
-  let request ← decodeClientStreamingRequest registry metadata body
+  let request ← decodeClientStreamingRequest registry metadata body headerDeadline
   let messages ← MessageStream.ofArray request.messages
-  registry.dispatchBidirectionalStreamingMessageStream metadata messages handler?
+  registry.dispatchBidirectionalStreamingMessageStream
+    metadata messages handler? request.deadline
+
+def dispatchBidirectionalStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler (decodeClientStreamingRequest registry metadata body headerDeadline) with
+  | .error status => pure (.error status)
+  | .ok request =>
+      match ← runHandler (MessageStream.ofArray request.messages) with
+      | .error status => pure (.error status)
+      | .ok messages =>
+          registry.dispatchBidirectionalStreamingMessageStreamAsync
+            metadata messages handler? request.deadline runtime?
 
 def dispatchBidirectionalStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option BidirectionalStreamingStreamHandler := none) :
+    (handler? : Option BidirectionalStreamingStreamHandler := none)
+    (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingResponse := do
-  let response ← registry.dispatchBidirectionalStreamingStream metadata body handler?
+  let response ←
+    registry.dispatchBidirectionalStreamingStream metadata body handler? headerDeadline
   collectServerStreamingStreamResponse response
+
+/-- Await one stream element without parking the managed server's dispatch
+worker.  Expiry is reported immediately: the owner that turns this status into
+a terminal response must publish that response before running arbitrary stream
+cleanup.  The synchronous Registry streaming API retains its existing
+cancel-before-return behavior through `withDeadlineUntil`. -/
+def recvWithDeadlineUntilAsync (deadline? : Option Nat) (stream : MessageStream α)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (Option α)) :=
+  runWithDeadlineUntilAsync deadline? stream.recv? runtime?
 
 /-! ## Registry well-formedness -/
 

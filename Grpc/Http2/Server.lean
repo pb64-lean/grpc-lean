@@ -375,6 +375,14 @@ private def newConnectionStateMutex (config : Config) (state : Connection.State)
     IO (Std.Mutex Connection.State) :=
   Std.Mutex.new (initialConnectionState config state)
 
+private def installDeadlineScheduler (stateMutex : Std.Mutex Connection.State) : IO Unit := do
+  let installed ← stateMutex.atomically do
+    pure (← get).deadlineScheduler.isSome
+  unless installed do
+    let scheduler ← Connection.DeadlineScheduler.new
+    stateMutex.atomically do
+      modify fun state => { state with deadlineScheduler := some scheduler }
+
 private def nextActiveConnectionId (server : Server) : IO Nat := do
   match server.nextConnectionId with
   | none => pure 0
@@ -509,23 +517,53 @@ private def stopDrainedConnection (connection : ActiveConnection) : IO Bool := d
 private inductive ConnectionEvent where
   | received (chunk? : Option ByteArray)
   | stop
+  | deadline
+
+private def deadlineMillisecondsFromNow (deadline : Nat) : IO Nat := do
+  let now ← IO.monoNanosNow
+  if deadline <= now then
+    pure 0
+  else
+    pure ((deadline - now + 999999) / 1000000)
 
 private def nextConnectionEvent (config : Config) (client : TCP.Socket.Client)
-    (stopToken : Std.CancellationToken) : Std.Async.Async ConnectionEvent :=
-  Std.Async.Selectable.one #[
+    (stopToken : Std.CancellationToken) (deadline? : Option Nat := none) :
+    Std.Async.Async ConnectionEvent := do
+  let events := #[
     Std.Async.Selectable.case (client.recvSelector config.readSize) fun chunk? =>
       pure (ConnectionEvent.received chunk?),
     Std.Async.Selectable.case stopToken.selector fun _ =>
       pure ConnectionEvent.stop
   ]
+  match deadline? with
+  | none => Std.Async.Selectable.one events
+  | some deadline =>
+      let remaining ← deadlineMillisecondsFromNow deadline
+      -- Do not race an already-due zero timer with a continuously readable
+      -- socket: repeated recv wins could otherwise starve deadline delivery.
+      if remaining == 0 then
+        pure ConnectionEvent.deadline
+      else
+        let timer ← Std.Async.Selector.sleep
+          (Std.Time.Millisecond.Offset.ofNat remaining)
+        Std.Async.Selectable.one <| events.push <|
+          Std.Async.Selectable.case timer fun _ => pure ConnectionEvent.deadline
 
 private partial def serveClientLoop (registry : Registry) (config : Config)
     (client : TCP.Socket.Client) (writer : SocketWriter)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken) :
     Std.Async.Async Connection.State := do
-  match ← nextConnectionEvent config client stopToken with
+  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  match ← nextConnectionEvent config client stopToken deadline? with
   | .stop => Connection.cancelActiveSharedOwned stateMutex
   | .received none => Connection.cancelActiveSharedOwned stateMutex
+  | .deadline =>
+      match ← Connection.expirePendingDeadlinesEncodedSharedWith stateMutex (sendBytes writer) with
+      | .ok () => serveClientLoop registry config client writer stateMutex stopToken
+      | .error status =>
+          let state ← getConnectionState stateMutex
+          sendGoAway writer state status
+          Connection.cancelActiveSharedOwned stateMutex
   | .received (some chunk) =>
       if chunk.isEmpty then
         serveClientLoop registry config client writer stateMutex stopToken
@@ -546,9 +584,11 @@ private def serveClientWithStateMutex (registry : Registry) (config : Config)
   let stopToken ← Std.CancellationToken.new
   let writer ← startSocketWriter client fun err => do
     writerFailure.set (some err)
+    Connection.signalCancelActiveShared stateMutex
     discard <| Grpc.CancellationToken.cancel stopToken
       (reason := Std.CancellationReason.shutdown)
   try
+    installDeadlineScheduler stateMutex
     if config.noDelay then
       client.noDelay
     let serverPreface ← ofStatusExcept
@@ -560,6 +600,9 @@ private def serveClientWithStateMutex (registry : Registry) (config : Config)
     | none => pure state
     | some err => throw err
   catch err =>
+    -- Setup can fail before the read loop reaches its normal owned-cancel
+    -- path; retire the independently spawned deadline scheduler here too.
+    discard <| Connection.cancelActiveSharedOwned stateMutex
     drainSocketWriter writer
     throw err
 
@@ -652,7 +695,8 @@ private partial def serveManagedClientLoop (registry : Registry) (config : Confi
     (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
     Std.Async.Async Connection.State := do
-  match ← nextConnectionEvent config client stopToken with
+  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  match ← nextConnectionEvent config client stopToken deadline? with
   | ConnectionEvent.stop =>
       -- Whoever cancelled the token recorded why; a bare shutdown did not.
       reportCloseCause closeCause CloseCause.serverShutdown
@@ -660,6 +704,14 @@ private partial def serveManagedClientLoop (registry : Registry) (config : Confi
   | ConnectionEvent.received none =>
       reportCloseCause closeCause CloseCause.peerClosed
       Connection.cancelActiveSharedOwned stateMutex
+  | ConnectionEvent.deadline =>
+      match ← Connection.expirePendingDeadlinesEncodedSharedWith
+          stateMutex (sendBytes writer) with
+      | .ok () =>
+          serveManagedClientLoop registry config client writer stateMutex stopToken closeCause
+      | .error status =>
+          reportCloseCause closeCause (CloseCause.protocolError status)
+          Connection.cancelActiveSharedOwned stateMutex
   | ConnectionEvent.received (some chunk) =>
       if chunk.isEmpty then
         if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
@@ -746,6 +798,7 @@ private def serveManagedClient (server : Server) (registry : Registry) (id : Nat
       -- The publication gate is part of the owned computation.  Even if its
       -- publisher fails, the catch below still reaches the one cleanup owner.
       waitUntilConnectionTaskRetained retained
+      installDeadlineScheduler stateMutex
       if server.config.noDelay then
         client.noDelay
       let serverPreface ← ofStatusExcept
@@ -913,10 +966,12 @@ private inductive TlsConnectionEvent where
   | received (chunk? : Option ByteArray)
   | stop
   | writerFailed
+  | deadline
 
 private def nextTlsConnectionEvent (config : Config) (session : Grpc.Tls.ServerSession)
-    (stopToken : Std.CancellationToken) : Std.Async.Async TlsConnectionEvent :=
-  Std.Async.Selectable.one #[
+    (stopToken : Std.CancellationToken) (deadline? : Option Nat := none) :
+    Std.Async.Async TlsConnectionEvent := do
+  let events := #[
     Std.Async.Selectable.case (session.socket.recvSelector config.readSize) fun chunk? =>
       pure (TlsConnectionEvent.received chunk?),
     Std.Async.Selectable.case stopToken.selector fun _ =>
@@ -924,6 +979,40 @@ private def nextTlsConnectionEvent (config : Config) (session : Grpc.Tls.ServerS
     Std.Async.Selectable.case session.writerFailureSelector fun _ =>
       pure TlsConnectionEvent.writerFailed
   ]
+  match deadline? with
+  | none => Std.Async.Selectable.one events
+  | some deadline =>
+      let remaining ← deadlineMillisecondsFromNow deadline
+      if remaining == 0 then
+        pure TlsConnectionEvent.deadline
+      else
+        let timer ← Std.Async.Selector.sleep
+          (Std.Time.Millisecond.Offset.ofNat remaining)
+        Std.Async.Selectable.one <| events.push <|
+          Std.Async.Selectable.case timer fun _ => pure TlsConnectionEvent.deadline
+
+/-- Observe TLS writer failure independently of the read loop.  Header
+authorization intentionally runs outside the connection-state mutex but the
+read owner still awaits its exact child; this watcher ensures a failed record
+writer can cancel that child immediately rather than waiting for authorization
+IO to return. -/
+private def watchTlsWriterFailure (session : Grpc.Tls.ServerSession)
+    (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
+    (closeCause : IO.Ref (Option CloseCause)) : Std.Async.Async Unit := do
+  let failed ← Std.Async.Selectable.one #[
+    Std.Async.Selectable.case session.writerFailureSelector fun _ => pure true,
+    Std.Async.Selectable.case stopToken.selector fun _ => pure false
+  ]
+  if failed then
+    let message := match ← session.writerFailure? with
+      | some err => toString err
+      | none => "TLS record writer stopped"
+    reportCloseCause closeCause (CloseCause.transportError message)
+    Connection.signalCancelActiveShared stateMutex
+    discard <| Grpc.CancellationToken.cancel stopToken
+      (reason := Std.CancellationReason.shutdown)
+  else
+    pure ()
 
 /-- Apply one decrypted inbound chunk to the HTTP/2 connection; `true` means the
 connection should keep serving.  Shared by the event loop below and by the
@@ -954,7 +1043,8 @@ private partial def serveTlsClientLoop (registry : Registry) (config : Config)
     (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
     Std.Async.Async Unit := do
-  match ← nextTlsConnectionEvent config session stopToken with
+  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  match ← nextTlsConnectionEvent config session stopToken deadline? with
   | TlsConnectionEvent.stop =>
       reportCloseCause closeCause CloseCause.serverShutdown
       discard <| Connection.cancelActiveSharedOwned stateMutex
@@ -964,6 +1054,14 @@ private partial def serveTlsClientLoop (registry : Registry) (config : Config)
         | none => "TLS record writer stopped"
       reportCloseCause closeCause (CloseCause.transportError message)
       discard <| Connection.cancelActiveSharedOwned stateMutex
+  | TlsConnectionEvent.deadline =>
+      match ← Connection.expirePendingDeadlinesEncodedSharedWith
+          stateMutex (tlsServerSend session) with
+      | .ok () =>
+          serveTlsClientLoop registry config session stateMutex stopToken closeCause
+      | .error status =>
+          reportCloseCause closeCause (CloseCause.protocolError status)
+          discard <| Connection.cancelActiveSharedOwned stateMutex
   | TlsConnectionEvent.received none =>
       reportCloseCause closeCause CloseCause.peerClosed
       discard <| Connection.cancelActiveSharedOwned stateMutex
@@ -1010,8 +1108,10 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
     (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
     (tlsSession : IO.Ref (Option Grpc.Tls.ServerSession))
     (retained : IO.Promise Unit) : Std.Async.Async Unit := do
+  let mut writerWatchTask? : Option (Task (Except IO.Error Unit)) := none
   let runError? ← try
       waitUntilConnectionTaskRetained retained
+      installDeadlineScheduler stateMutex
       if config.noDelay then
         client.noDelay
       let serverConfig ← freshTlsServerConfig tlsConfig
@@ -1021,6 +1121,8 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       -- Publish the session before any byte of HTTP/2: from here on every
       -- teardown byte must be sealed instead of written plaintext.
       tlsSession.set (some session)
+      writerWatchTask? ← some <$> Std.Async.Async.toIO
+        (watchTlsWriterFailure session stateMutex stopToken closeCause)
       let preface ← ofStatusExcept
         (Connection.serverPrefaceBytes config.maxConcurrentStreams config.maxHeaderListSize)
       session.send preface
@@ -1040,6 +1142,15 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       -- but it still has the same one local cause/cleanup owner.
       reportCloseCause closeCause (CloseCause.transportError (toString err))
       pure (some err)
+  discard <| Grpc.CancellationToken.cancel stopToken
+    (reason := Std.CancellationReason.shutdown)
+  match writerWatchTask? with
+  | none => pure ()
+  | some task =>
+      try
+        discard <| Std.Async.Async.ofAsyncTask task
+      catch _ =>
+        pure ()
   finishManagedTlsClient server id client (← tlsSession.get) stateMutex stopToken
     connection? closeCause
   match runError? with

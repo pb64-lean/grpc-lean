@@ -3,12 +3,262 @@ module
 public import Std.Sync.Mutex
 public import Grpc.Http2.Frame
 public import Grpc.Http2.Grpc
+import Std.Async.Timer
+import Std.Data.HashMap
+import Std.Sync.Channel
 
 public section
 
 namespace Grpc
 namespace Http2
 namespace Connection
+
+private structure ScheduledDeadline where
+  deadline : Nat
+  expire : IO Unit
+  fail : IO Unit
+
+private structure DeadlineSchedulerState where
+  nextId : Nat := 0
+  /-- The timer target currently owned by the scheduler.  It may be earlier
+  than every live registration after a fast call unregisters; that is harmless
+  and avoids rearming the shared timer on every RPC. -/
+  scheduled : Option Nat := none
+  registrations : Std.HashMap Nat ScheduledDeadline := {}
+  /-- Header-authorized calls that are still waiting for END_STREAM.  These
+  are keyed by HTTP/2 stream id so frame transitions can update them in place
+  instead of allocating one timer task (or accumulating stale registrations)
+  per request. -/
+  pendingBodies : Std.HashMap Nat ScheduledDeadline := {}
+  failed : Bool := false
+  deriving Inhabited
+
+/-- One independent deadline owner per HTTP/2 connection.  Registrations are
+cheap hash-map operations; a single native timer services all active calls.
+The task is independent of frame processing and the connection-state mutex, so
+deadline delivery does not depend on the socket loop returning from user IO. -/
+structure DeadlineScheduler where
+  private state : Std.Mutex DeadlineSchedulerState
+  private wake : Std.Channel Unit
+  private stopped : IO.Ref Bool
+  private task : IO.Ref (Option (Task (Except IO.Error Unit)))
+
+namespace DeadlineScheduler
+
+private inductive Event where
+  | wake
+  | deadline
+
+private def millisecondsUntil (deadline : Nat) : IO Nat := do
+  let now ← IO.monoNanosNow
+  if deadline <= now then
+    pure 0
+  else
+    pure ((deadline - now + 999999) / 1000000)
+
+private def nextEvent (scheduler : DeadlineScheduler) (deadline? : Option Nat) :
+    Std.Async.Async Event := do
+  match deadline? with
+  | none =>
+      discard <| Std.Async.Async.ofTask (← scheduler.wake.recv)
+      pure .wake
+  | some deadline =>
+      let remaining ← millisecondsUntil deadline
+      if remaining == 0 then
+        pure .deadline
+      else
+        let timer ← Std.Async.Selector.sleep
+          (Std.Time.Millisecond.Offset.ofNat remaining)
+        Std.Async.Selectable.one #[
+          Std.Async.Selectable.case scheduler.wake.recvSelector fun _ => pure Event.wake,
+          Std.Async.Selectable.case timer fun _ => pure Event.deadline
+        ]
+
+private def expireDue (scheduler : DeadlineScheduler) : IO Unit := do
+  let now ← IO.monoNanosNow
+  let expirations ← scheduler.state.atomically do
+    let state ← get
+    let due := state.registrations.valuesArray.filter fun item => item.deadline <= now
+    let future := state.registrations.filter fun _ item => item.deadline > now
+    let pendingDue := state.pendingBodies.valuesArray.filter fun item => item.deadline <= now
+    let pendingFuture := state.pendingBodies.filter fun _ item => item.deadline > now
+    let scheduled := future.fold (init := none) fun nearest _ item =>
+      match nearest with
+      | none => some item.deadline
+      | some deadline => some (Nat.min deadline item.deadline)
+    let scheduled := pendingFuture.fold (init := scheduled) fun nearest _ item =>
+      match nearest with
+      | none => some item.deadline
+      | some deadline => some (Nat.min deadline item.deadline)
+    set {
+      state with
+      scheduled := scheduled,
+      registrations := future,
+      pendingBodies := pendingFuture
+    }
+    pure ((due.append pendingDue).map (·.expire))
+  for expiration in expirations do
+    try
+      expiration
+    catch _ =>
+      pure ()
+
+private def failAll (scheduler : DeadlineScheduler) : IO Unit := do
+  let failures ← scheduler.state.atomically do
+    let state ← get
+    set {
+      state with
+      scheduled := none,
+      registrations := {},
+      pendingBodies := {},
+      failed := true
+    }
+    pure ((state.registrations.valuesArray.append state.pendingBodies.valuesArray).map (·.fail))
+  scheduler.stopped.set true
+  for fail in failures do
+    try
+      fail
+    catch _ =>
+      pure ()
+
+private partial def loop (scheduler : DeadlineScheduler) : Std.Async.Async Unit := do
+  if ← scheduler.stopped.get then
+    pure ()
+  else
+    let scheduled ← scheduler.state.atomically do
+      pure (← get).scheduled
+    match ← nextEvent scheduler scheduled with
+    | .wake => loop scheduler
+    | .deadline =>
+        expireDue scheduler
+        loop scheduler
+
+/-- Start an independent per-connection deadline scheduler. -/
+def new : IO DeadlineScheduler := do
+  let state ← Std.Mutex.new (default : DeadlineSchedulerState)
+  let wake ← Std.Channel.new
+  let stopped ← IO.mkRef false
+  let taskRef ← IO.mkRef (none : Option (Task (Except IO.Error Unit)))
+  let scheduler : DeadlineScheduler := {
+    state := state,
+    wake := wake,
+    stopped := stopped,
+    task := taskRef
+  }
+  let task ← Std.Async.Async.toIO do
+    try
+      loop scheduler
+    catch _ =>
+      -- A failed shared timer must never leave live calls waiting forever.
+      -- Fail their normal cancellation race and make future registration
+      -- fail closed; the connection owner still retains and joins each child.
+      failAll scheduler
+  taskRef.set (some task)
+  pure scheduler
+
+/-- Register a one-shot absolute deadline and return its idempotent release. -/
+def register (scheduler : DeadlineScheduler) (deadline : Nat)
+    (expire fail : IO Unit) :
+    IO (IO Unit) := do
+  let (id?, shouldWake) ← scheduler.state.atomically do
+    let state ← get
+    if state.failed then
+      pure (none, false)
+    else
+      let id := state.nextId
+      let shouldWake := match state.scheduled with
+        | none => true
+        | some scheduled => deadline < scheduled
+      set {
+        state with
+        nextId := id + 1,
+        scheduled := if shouldWake then some deadline else state.scheduled,
+        registrations := state.registrations.insert id {
+          deadline := deadline,
+          expire := expire,
+          fail := fail
+        }
+      }
+      pure (some id, shouldWake)
+  match id? with
+  | none =>
+      fail
+      pure (pure ())
+  | some id =>
+      if shouldWake then
+        discard <| scheduler.wake.trySend ()
+      pure do
+        scheduler.state.atomically do
+          modify fun state => {
+            state with registrations := state.registrations.erase id
+          }
+
+/-- Reconcile the one timer registration owned by an incomplete request body.
+Unchanged DATA frames are a no-op; completion/reset erases by stream id, and a
+newly authorized body installs exactly one callback on the connection timer. -/
+private def reconcilePendingBody (scheduler : DeadlineScheduler) (streamId : Nat)
+    (deadline? : Option Nat) (expire fail : Nat → IO Unit) : IO Unit := do
+  let (failedDeadline?, shouldWake) ← scheduler.state.atomically do
+    let state ← get
+    match deadline? with
+    | none =>
+        set { state with pendingBodies := state.pendingBodies.erase streamId }
+        pure (none, false)
+    | some deadline =>
+        if state.failed then
+          pure (some deadline, false)
+        else
+          match state.pendingBodies.get? streamId with
+          | some existing =>
+              if existing.deadline == deadline then
+                pure (none, false)
+              else
+                let shouldWake := state.scheduled.all fun scheduled => deadline < scheduled
+                set {
+                  state with
+                  scheduled := if shouldWake then some deadline else state.scheduled,
+                  pendingBodies := state.pendingBodies.insert streamId {
+                    deadline := deadline,
+                    expire := expire deadline,
+                    fail := fail deadline
+                  }
+                }
+                pure (none, shouldWake)
+          | none =>
+              let shouldWake := state.scheduled.all fun scheduled => deadline < scheduled
+              set {
+                state with
+                scheduled := if shouldWake then some deadline else state.scheduled,
+                pendingBodies := state.pendingBodies.insert streamId {
+                  deadline := deadline,
+                  expire := expire deadline,
+                  fail := fail deadline
+                }
+              }
+              pure (none, shouldWake)
+  match failedDeadline? with
+  | some deadline =>
+      try fail deadline catch _ => pure ()
+  | none =>
+      if shouldWake then
+        discard <| scheduler.wake.trySend ()
+
+/-- Stop and join the exact scheduler task. -/
+def shutdown (scheduler : DeadlineScheduler) : Std.Async.Async Unit := do
+  -- Close registration before waking/joining.  Otherwise a call racing
+  -- shutdown could register successfully after the scheduler task had exited
+  -- and wait forever for a deadline that no task can deliver.
+  failAll scheduler
+  discard <| scheduler.wake.trySend ()
+  match ← scheduler.task.modifyGet fun task? => (task?, none) with
+  | none => pure ()
+  | some task =>
+      try
+        discard <| Std.Async.Async.ofAsyncTask task
+      catch _ =>
+        pure ()
+
+end DeadlineScheduler
 
 structure StreamState where
   streamId : Nat
@@ -18,6 +268,10 @@ structure StreamState where
   END_HEADERS.  `none` means the header block has not been authorized, so the
   stream must not dispatch. -/
   authorizedEntry? : Option MethodEntry := none
+  /-- Monotonic arrival time of the frame that completed the header block. -/
+  endHeadersReceivedAt : Option Nat := none
+  /-- Absolute request deadline captured when END_HEADERS was received. -/
+  deadline : Option Nat := none
   deriving Inhabited
 
 structure OutboundStreamWindow where
@@ -41,12 +295,30 @@ structure ActiveRequestStream where
   WINDOW_UPDATE is granted only when the handler consumes the message. -/
   pendingRequestCredits : Array Nat := #[]
 
+private structure DeadlineChild where
+  cancel? : Option (IO Unit)
+  expire? : Option (IO Unit)
+  join : Std.Async.Async Unit
+
 structure ActiveDispatch where
   streamId : Nat
   task : Task (Except IO.Error Unit)
   cancelled : IO.Ref Bool
   requestStreamCancel : IO.Ref (Option (IO Unit))
   responseStreamCancel : IO.Ref (Option (IO Unit))
+  /-- Exact handler/stream-receive child currently owned by a timed dispatch.
+  Optional with a default to preserve construction compatibility for callers
+  that use this public diagnostic structure. -/
+  private deadlineChild : Option (IO.Ref (Option DeadlineChild)) := none
+
+/-- A custom request-header authorizer currently owned by the connection.
+The callback itself runs without the connection-state mutex.  Keeping its
+cancellation flag and exact child handle here lets shutdown signal it without
+waiting for arbitrary user IO to release that mutex. -/
+structure ActiveAuthorization where
+  streamId : Nat
+  cancelled : IO.Ref Bool
+  private deadlineChild : IO.Ref (Option DeadlineChild)
 
 def initialFlowControlWindow : Nat := 65535
 
@@ -66,12 +338,18 @@ def maxHeaderBlockSize : Nat := 1048576
 def maxPendingOutboundBytes : Nat := 4194304
 
 structure State where
+  /-- Sticky once forced connection teardown has selected cancellation.  Work
+  prepared before that selection must not publish a new handler afterward. -/
+  closing : Bool := false
   prefaceReceived : Bool := false
   clientSettingsReceived : Bool := false
   prefaceBuffer : ByteArray := ByteArray.empty
   decoder : Frame.DecodeState := {}
   hpack : Hpack.State := {}
-  outboundHpack : Hpack.State := {}
+  /-- Response encoding uses a zero-sized dynamic table.  Concurrent HTTP/2
+  streams may finish out of order; independent header blocks avoid stale
+  encoder snapshots without putting arbitrary handler work behind one lock. -/
+  outboundHpack : Hpack.State := Hpack.withoutDynamicTable {}
   lastClientStreamId : Nat := 0
   outboundGoAwayLastStreamId : Option Nat := none
   outboundConnectionWindow : Nat := initialFlowControlWindow
@@ -103,7 +381,17 @@ structure State where
   refusedInboundStreams : Array Nat := #[]
   activeRequestStreams : Array ActiveRequestStream := #[]
   activeDispatches : Array ActiveDispatch := #[]
+  activeAuthorizations : Array ActiveAuthorization := #[]
+  /-- Requests detached from inbound buffering whose gated handler task has not
+  yet been published in `activeDispatches`.  This is an ownership token, not
+  merely a diagnostic: graceful drain must count it, and a concurrent stream
+  reset removes it so the later publication attempt cannot start a handler for
+  a stream the peer already closed. -/
+  pendingDispatchPublications : Array Nat := #[]
   pendingKeepalivePing : Option ByteArray := none
+  /-- Independent owner for active handler deadlines.  Direct state-machine
+  users may leave this absent and retain the per-call timer fallback. -/
+  deadlineScheduler : Option DeadlineScheduler := none
   deriving Inhabited
 
 def serverSettingsFrame (maxConcurrentStreams : Option Nat := none)
@@ -142,6 +430,8 @@ def isDrainedAfterOutboundGoAway (state : State) : Bool :=
         && state.resetHeaderBlock.isNone
         && state.activeRequestStreams.isEmpty
         && state.activeDispatches.isEmpty
+        && state.activeAuthorizations.isEmpty
+        && state.pendingDispatchPublications.isEmpty
         && state.pendingOutbound.isEmpty
 
 def serverPrefaceBytes (maxConcurrentStreams : Option Nat := none)
@@ -164,6 +454,14 @@ private def appendStreamFrame (streams : Array StreamState) (frame : Frame) : Ar
 
 private def replaceStream (streams : Array StreamState) (stream : StreamState) : Array StreamState :=
   (removeStream streams stream.streamId).push stream
+
+private def recordEndHeadersReceivedAt (state : State) (streamId : Nat)
+    (receivedAt : Option Nat) : State :=
+  match receivedAt, findStream? state.streams streamId with
+  | some receivedAt, some stream =>
+      let stream := { stream with endHeadersReceivedAt := some receivedAt }
+      { state with streams := replaceStream state.streams stream }
+  | _, _ => state
 
 private def findOutboundStreamWindow? (windows : Array OutboundStreamWindow) (streamId : Nat) :
     Option OutboundStreamWindow :=
@@ -228,6 +526,16 @@ private def removeActiveDispatchesForStream (dispatches : Array ActiveDispatch) 
     Array ActiveDispatch :=
   dispatches.filter (fun dispatch => dispatch.streamId != streamId)
 
+private def removeActiveAuthorizationsForStream
+    (authorizations : Array ActiveAuthorization) (streamId : Nat) :
+    Array ActiveAuthorization :=
+  authorizations.filter (fun authorization => authorization.streamId != streamId)
+
+private def activeAuthorizationsForStream
+    (authorizations : Array ActiveAuthorization) (streamId : Nat) :
+    Array ActiveAuthorization :=
+  authorizations.filter (fun authorization => authorization.streamId == streamId)
+
 def containsStreamId (streamIds : Array Nat) (streamId : Nat) : Bool :=
   streamIds.any (· == streamId)
 
@@ -245,6 +553,9 @@ private def activeInboundStreamIds (state : State) : Array Nat :=
     (init := #[])
     (fun ids stream => pushUniqueStreamId ids stream.streamId)
   let streamIds := state.ignoredInboundStreams.foldl
+    (init := streamIds)
+    (fun ids streamId => pushUniqueStreamId ids streamId)
+  let streamIds := state.pendingDispatchPublications.foldl
     (init := streamIds)
     (fun ids streamId => pushUniqueStreamId ids streamId)
   state.activeDispatches.foldl
@@ -271,7 +582,8 @@ private def removeOutboundStreamState (state : State) (streamId : Nat) : State :
     state with
     outboundStreamWindows := removeOutboundStreamWindow state.outboundStreamWindows streamId,
     pendingOutbound := removePendingOutboundForStream state.pendingOutbound streamId,
-    activeDispatches := removeActiveDispatchesForStream state.activeDispatches streamId
+    activeDispatches := removeActiveDispatchesForStream state.activeDispatches streamId,
+    pendingDispatchPublications := removeStreamId state.pendingDispatchPublications streamId
   }
 
 private def removeInboundStreamState (state : State) (streamId : Nat) : State :=
@@ -696,7 +1008,8 @@ private def applyMaxFrameSize (state : State) (value : Nat) : Except Status Stat
 private def applyPeerSetting (state : State) (setting : Setting) : Except Status State := do
   match setting.id with
   | .headerTableSize =>
-      pure { state with outboundHpack := Hpack.setMaxAllowedSize state.outboundHpack setting.value }
+      pure { state with outboundHpack :=
+        Hpack.setMaxAllowedSizeWithoutDynamicTable state.outboundHpack setting.value }
   | .enablePush =>
       if setting.value == 0 || setting.value == 1 then
         pure state
@@ -763,6 +1076,7 @@ structure DetachedDispatch where
   request : Transport.UnaryRequestFrames
   outboundHpack : Hpack.State
   maxDataFrameSize : Nat
+  private deadlineScheduler : Option DeadlineScheduler := none
 
 /-- The dispatch family for a request whose body is fed to the handler
 incrementally, carrying the authorized handler at its exact shape. -/
@@ -780,6 +1094,9 @@ structure RequestStreamingDispatch where
   requestError : Option Status := none
   closeImmediately : Bool := false
   usesGzip : Bool := false
+  /-- Absolute request deadline captured at END_HEADERS. -/
+  deadline : Option Nat := none
+  private deadlineScheduler : Option DeadlineScheduler := none
 
 structure RequestStreamFeed where
   producer : MessageStream.Producer ByteArray
@@ -787,12 +1104,31 @@ structure RequestStreamFeed where
   error : Option Status := none
   close : Bool := false
 
+/-- A validated custom header-authorization phase that must run after the
+connection-state transition has been published.  In particular, no user IO
+runs while the connection-state mutex is held. -/
+private structure PendingAuthorization where
+  streamId : Nat
+  entry : MethodEntry
+  metadata : Metadata
+  deadline : Option Nat
+  endStream : Bool
+  scheduler : DeadlineScheduler
+  active : ActiveAuthorization
+
+private inductive RequestHeaderAuthorization where
+  | accepted
+  | rejected (frames : Array Frame)
+  | pending (authorization : PendingAuthorization)
+
 structure SharedFrameResult where
   emitted : Array Frame := #[]
   detached : Option DetachedDispatch := none
   requestStreaming : Option RequestStreamingDispatch := none
   requestFeeds : Array RequestStreamFeed := #[]
   cancelDispatches : Array ActiveDispatch := #[]
+  cancelAuthorizations : Array ActiveAuthorization := #[]
+  private pendingAuthorization : Option PendingAuthorization := none
 
 /-- Incremental request-body dispatch applies exactly to entries whose shape
 consumes a `MessageStream`; aggregate shapes buffer the body instead. -/
@@ -847,9 +1183,20 @@ private def requestStreamingDispatchForStream? (state : State)
             removeInboundStreamState state streamId
           else
             state
+        -- Removing the buffered stream and publishing its handler are two
+        -- separate mutex transitions.  Retain an explicit ownership token in
+        -- between so graceful drain cannot mistake that interval for an idle
+        -- connection.
+        let state := {
+          state with
+          pendingDispatchPublications :=
+            pushUniqueStreamId state.pendingDispatchPublications streamId
+        }
         pure (state, some {
           streamId := streamId,
           metadata := metadata,
+          deadline := stream.deadline,
+          deadlineScheduler := state.deadlineScheduler,
           outboundHpack := state.outboundHpack,
           maxDataFrameSize := state.outboundMaxFramePayloadLength,
           kind := kind,
@@ -890,7 +1237,7 @@ theorem rejectStreamAtHeaders_tables (state : State) (streamId : Nat)
   split <;> exact ⟨rfl, rfl⟩
 
 private def authorizeRequestHeadersForStream (registry : Registry) (state : State)
-    (streamId : Nat) : IO (Except Status (State × Option (Array Frame))) := do
+    (streamId : Nat) : IO (Except Status (State × RequestHeaderAuthorization)) := do
   let decoded : Except Status (StreamState × Frame × Transport.RequestHeadersFrames) := do
     let stream ← match findStream? state.streams streamId with
       | some stream => pure stream
@@ -906,6 +1253,13 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
   match decoded with
   | .error status => pure (.error status)
   | .ok (stream, _headersFrame, headers) =>
+    -- Capture the absolute deadline before invoking the request authorizer, so
+    -- authorization latency consumes the same budget as body and handler work.
+    -- An invalid timeout is still passed through `authorizeEarlyRequest`, which
+    -- encodes its INVALID_ARGUMENT as a stream-scoped gRPC response.
+    let deadline ← match Headers.timeout? headers.metadata with
+      | .ok timeout? => Deadline.fromTimeoutAt? timeout? stream.endHeadersReceivedAt
+      | .error _ => pure none
     if containsStreamId state.refusedInboundStreams streamId then
       -- The field block is decoded (`headers.hpack` carries the advanced
       -- decoder), so the connection stays in step; the stream itself is reset.
@@ -921,32 +1275,105 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
             state.outboundHpack headers.endStream
           let state :=
             if headers.endStream then state else drainResetInboundStreamBody state streamId
-          pure (.ok (state, some #[rst]))
+          pure (.ok (state, .rejected #[rst]))
     else
-    match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
-        headers.metadata state.outboundMaxFramePayloadLength with
-    | .error status => pure (.error status)
-    | .ok (.accept entry) =>
-        let stream := {
-          stream with
-          requestMetadata := some headers.metadata,
-          authorizedEntry? := some entry
-        }
-        pure (.ok ({
-          state with
-          hpack := headers.hpack,
-          streams := replaceStream state.streams stream
-        }, none))
-    | .ok (.reject frames outboundHpack) =>
-        pure (.ok (rejectStreamAtHeaders state streamId
-          headers.hpack outboundHpack headers.endStream, some frames))
+      match state.deadlineScheduler with
+      | some scheduler =>
+        if registry.usesCustomRequestHeaderAuthorizer then
+          -- Validation and method lookup remain inside the serialized HPACK
+          -- transition.  Only the already-validated user callback is deferred,
+          -- so error precedence and connection-wide compression state are
+          -- identical to the synchronous transport path.
+          match Transport.encodeEarlyRequestRejectionFrames? registry state.outboundHpack
+              streamId headers.metadata state.outboundMaxFramePayloadLength with
+          | .error status => pure (.error status)
+          | .ok (some encoded) =>
+              pure (.ok (rejectStreamAtHeaders state streamId headers.hpack encoded.2
+                headers.endStream, .rejected encoded.1))
+          | .ok none =>
+              let method ← match Headers.validateUnaryRequestHeaders headers.metadata with
+                | .ok method => pure method
+                | .error status => return .error status
+              let entry ← match registry.findEntry? method with
+                | some entry => pure entry
+                | none =>
+                    return .error
+                      (Status.internal "validated request method disappeared from registry")
+              let cancelled ← IO.mkRef false
+              let deadlineChild ← IO.mkRef (none : Option DeadlineChild)
+              let active : ActiveAuthorization := {
+                streamId := streamId,
+                cancelled := cancelled,
+                deadlineChild := deadlineChild
+              }
+              let stream := {
+                stream with
+                requestMetadata := some headers.metadata,
+                deadline := deadline,
+                authorizedEntry? := none
+              }
+              let state := {
+                state with
+                hpack := headers.hpack,
+                streams := replaceStream state.streams stream,
+                activeAuthorizations := state.activeAuthorizations.push active
+              }
+              pure (.ok (state, .pending {
+                streamId := streamId,
+                entry := entry,
+                metadata := headers.metadata,
+                deadline := deadline,
+                endStream := headers.endStream,
+                scheduler := scheduler,
+                active := active
+              }))
+        else
+          match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
+              headers.metadata state.outboundMaxFramePayloadLength deadline with
+          | .error status => pure (.error status)
+          | .ok (.accept entry) =>
+              let stream := {
+                stream with
+                requestMetadata := some headers.metadata,
+                deadline := deadline,
+                authorizedEntry? := some entry
+              }
+              pure (.ok ({
+                state with
+                hpack := headers.hpack,
+                streams := replaceStream state.streams stream
+              }, .accepted))
+          | .ok (.reject frames outboundHpack) =>
+              pure (.ok (rejectStreamAtHeaders state streamId
+                headers.hpack outboundHpack headers.endStream, .rejected frames))
+      | none =>
+          match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
+              headers.metadata state.outboundMaxFramePayloadLength deadline with
+          | .error status => pure (.error status)
+          | .ok (.accept entry) =>
+              let stream := {
+                stream with
+                requestMetadata := some headers.metadata,
+                deadline := deadline,
+                authorizedEntry? := some entry
+              }
+              pure (.ok ({
+                state with
+                hpack := headers.hpack,
+                streams := replaceStream state.streams stream
+              }, .accepted))
+          | .ok (.reject frames outboundHpack) =>
+              pure (.ok (rejectStreamAtHeaders state streamId
+                headers.hpack outboundHpack headers.endStream, .rejected frames))
 
 private def earlyRequestRejectionForStream? (registry : Registry) (state : State) (streamId : Nat) :
     IO (Except Status (State × Option SharedFrameResult)) := do
   match ← authorizeRequestHeadersForStream registry state streamId with
   | .error status => pure (.error status)
-  | .ok (state, none) => pure (.ok (state, none))
-  | .ok (state, some frames) => pure (.ok (state, some { emitted := frames }))
+  | .ok (state, .accepted) => pure (.ok (state, none))
+  | .ok (state, .rejected frames) => pure (.ok (state, some { emitted := frames }))
+  | .ok (state, .pending authorization) =>
+      pure (.ok (state, some { pendingAuthorization := some authorization }))
 
 private def processIgnoredInboundData (state : State) (frame : Frame) :
     Except Status (State × Array Frame) := do
@@ -1074,6 +1501,7 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
   pure {
     streamId := stream.streamId,
     metadata := metadata,
+    deadline := stream.deadline,
     body := body,
     hpack := state.hpack,
     authorizedEntry? := some entry
@@ -1089,10 +1517,16 @@ private def detachStreamForDispatch (state : State) (streamId : Nat) :
     | .ok request =>
         let detachedState := removeInboundStreamState
           { state with streams := removeStream state.streams streamId } streamId
+        let detachedState := {
+          detachedState with
+          pendingDispatchPublications :=
+            pushUniqueStreamId detachedState.pendingDispatchPublications streamId
+        }
         .ok (detachedState, {
           request := request,
           outboundHpack := detachedState.outboundHpack,
-          maxDataFrameSize := detachedState.outboundMaxFramePayloadLength
+          maxDataFrameSize := detachedState.outboundMaxFramePayloadLength,
+          deadlineScheduler := detachedState.deadlineScheduler
         })
 
 private def framePayloadBytes (frames : Array Frame) : Nat :=
@@ -1102,7 +1536,9 @@ private def queueOutboundShared (stateMutex : Std.Mutex State) (emit : Array Fra
     (frames : Array Frame) : IO (Except Status Unit) := do
   let emitted? ← stateMutex.atomically do
     let state ← get
-    if framePayloadBytes state.pendingOutbound + framePayloadBytes frames
+    if state.closing then
+      pure (Except.error (Status.cancelled "HTTP/2 connection is closing"))
+    else if framePayloadBytes state.pendingOutbound + framePayloadBytes frames
         > maxPendingOutboundBytes then
       pure (Except.error
         (Status.resourceExhausted "HTTP/2 outbound buffer limit exceeded: peer is not consuming flow-controlled data"))
@@ -1113,6 +1549,191 @@ private def queueOutboundShared (stateMutex : Std.Mutex State) (emit : Array Fra
   match emitted? with
   | .error status => pure (.error status)
   | .ok emitted => emitFrameBatch emit emitted
+
+/-- A header-authorized request that has not reached dispatch yet.  Incremental
+request handlers already have their own deadline race, so excluding active
+dispatch ids prevents two owners from expiring the same stream. -/
+private def pendingDeadlineStream (state : State) (stream : StreamState) : Bool :=
+  stream.deadline.isSome
+    && stream.authorizedEntry?.isSome
+    && !containsStreamId state.pendingDispatchPublications stream.streamId
+    && !state.activeDispatches.any (fun dispatch => dispatch.streamId == stream.streamId)
+
+private def pendingDeadlineForStream? (state : State) (streamId : Nat) : Option Nat :=
+  match findStream? state.streams streamId with
+  | some stream =>
+      if pendingDeadlineStream state stream then stream.deadline else none
+  | none => none
+
+private def takeDeadlineChildExpiry
+    (childRef : IO.Ref (Option DeadlineChild)) : IO (Option (IO Unit)) :=
+  childRef.modifyGet fun child? =>
+    match child? with
+    | none => (none, none)
+    | some child =>
+        (child.expire?, some { child with cancel? := none, expire? := none })
+
+private def cancelDeadlineChildRef
+    (childRef : IO.Ref (Option DeadlineChild)) : IO Unit := do
+  let cancel? ← childRef.modifyGet fun child? =>
+    match child? with
+    | none => (none, none)
+    | some child =>
+        (child.cancel?, some { child with cancel? := none, expire? := none })
+  match cancel? with
+  | none => pure ()
+  | some cancel =>
+      try
+        cancel
+      catch _ =>
+        pure ()
+
+private def registerDeadlineChild (childRef : IO.Ref (Option DeadlineChild))
+    (scheduler? : Option DeadlineScheduler) (deadline : Nat)
+    (cancel expire : IO Unit) (join : Std.Async.Async Unit) : IO (IO Unit) := do
+  childRef.set (some { cancel? := some cancel, expire? := some expire, join := join })
+  let unregisterDeadline ← match scheduler? with
+    | none => pure (pure ())
+    | some scheduler =>
+        let expireFromScheduler : IO Unit := do
+          match ← takeDeadlineChildExpiry childRef with
+          | none => pure ()
+          | some expire => expire
+        let failFromScheduler : IO Unit := cancelDeadlineChildRef childRef
+        scheduler.register deadline expireFromScheduler failFromScheduler
+  -- Peer/shutdown cancellation may race the scheduler registration.  Install
+  -- timer release into the same one-shot cancellation callback; if that
+  -- callback was already taken, release the just-published registration now.
+  let cancellationOwned ← childRef.modifyGet fun child? =>
+    match child? with
+    | some child =>
+        match child.cancel? with
+        | some cancel =>
+            (true, some { child with cancel? := some do unregisterDeadline; cancel })
+        | none => (false, some child)
+    | none => (false, none)
+  unless cancellationOwned do
+    unregisterDeadline
+  pure do
+    unregisterDeadline
+    childRef.set none
+
+private def nearerDeadline (current candidate : Option Nat) : Option Nat :=
+  match current, candidate with
+  | none, deadline => deadline
+  | some current, some deadline => some (Nat.min current deadline)
+  | some current, none => some current
+
+/-- Earliest deadline among complete headers still waiting for the request
+body. The independent scheduler normally owns these too; this value keeps the
+connection event-loop timer as a fail-safe and compatibility path. -/
+def nextPendingDeadline? (state : State) : Option Nat :=
+  state.streams.foldl (init := none) fun nearest stream =>
+    if pendingDeadlineStream state stream then
+      nearerDeadline nearest stream.deadline
+    else
+      nearest
+
+private def terminatePendingDeadlineStream (state : State) (stream : StreamState)
+    (status : Status) : Except Status (State × Array Frame) := do
+  let encoded ← Transport.encodeUnaryResponseFrames state.outboundHpack stream.streamId
+    { status := status, data := ByteArray.empty }
+    state.outboundMaxFramePayloadLength
+  let state := removeOutboundStreamState
+    { state with outboundHpack := encoded.2 } stream.streamId
+  let peerEnded := stream.frames.any fun frame =>
+    FrameFlag.has frame.header.flags FrameFlag.endStream
+  let state :=
+    if peerEnded then
+      removeInboundStreamState
+        { state with streams := removeStream state.streams stream.streamId }
+        stream.streamId
+    else
+      ignoreInboundStreamBody state stream.streamId
+  pure (state, encoded.1)
+
+/-- Terminate one exact pending-body generation from the independent scheduler.
+The state/deadline checks make timer delivery harmless after END_STREAM, reset,
+or another owner has already won. -/
+private def terminatePendingDeadlineSharedWith (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (streamId expectedDeadline : Nat)
+    (status : Status) (requireDue : Bool) : IO (Except Status Unit) := do
+  let now ← IO.monoNanosNow
+  let prepared ← stateMutex.atomically do
+    let state ← get
+    if state.closing then
+      pure (Except.ok #[])
+    else
+      match findStream? state.streams streamId with
+      | none => pure (Except.ok #[])
+      | some stream =>
+          if !pendingDeadlineStream state stream
+              || stream.deadline != some expectedDeadline
+              || (requireDue && expectedDeadline > now) then
+            pure (Except.ok #[])
+          else
+            match terminatePendingDeadlineStream state stream status with
+            | .error status => pure (.error status)
+            | .ok (state, frames) =>
+                set state
+                pure (.ok frames)
+  match prepared with
+  | .error status => pure (.error status)
+  | .ok frames => emitFrameBatch emit frames
+
+private def reconcilePendingBodyDeadline (scheduler : DeadlineScheduler)
+    (stateMutex : Std.Mutex State) (emit : Array Frame → IO Unit)
+    (streamId : Nat) (deadline? : Option Nat) : IO Unit := do
+  scheduler.reconcilePendingBody streamId deadline?
+    (fun deadline => do
+      discard <| terminatePendingDeadlineSharedWith stateMutex emit streamId deadline
+        Deadline.exceededStatus true)
+    (fun deadline => do
+      -- A broken connection scheduler cannot leave the call live forever.  It
+      -- is an internal transport failure rather than an early deadline.
+      discard <| terminatePendingDeadlineSharedWith stateMutex emit streamId deadline
+        (Status.internal "deadline scheduler failed") false)
+
+private def reconcileCurrentPendingBodyDeadline (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (streamId : Nat) : IO Unit := do
+  let target ← stateMutex.atomically do
+    let state ← get
+    pure (state.deadlineScheduler.bind fun scheduler =>
+      (pendingDeadlineForStream? state streamId).map fun deadline =>
+        (scheduler, deadline))
+  match target with
+  | none => pure ()
+  | some (scheduler, deadline) =>
+      reconcilePendingBodyDeadline scheduler stateMutex emit streamId (some deadline)
+
+/-- Expire every header-authorized request whose peer has not completed its
+body.  A trailers-only DEADLINE_EXCEEDED response closes the local half while
+the remote half remains in drain mode until END_STREAM, preserving HTTP/2
+flow-control and concurrent-stream accounting. -/
+def expirePendingDeadlinesSharedWith (stateMutex : Std.Mutex State)
+    (emit : Array Frame -> IO Unit) : IO (Except Status Unit) := do
+  let now ← IO.monoNanosNow
+  let prepared ← stateMutex.atomically do
+    let state ← get
+    if state.closing then
+      pure (Except.ok #[])
+    else
+      let expired := state.streams.filter fun stream =>
+        pendingDeadlineStream state stream
+          && stream.deadline.any (fun deadline => deadline <= now)
+      let result : Except Status (State × Array Frame) :=
+        expired.foldlM (init := (state, #[])) fun (state, frames) stream => do
+          let (state, terminal) ←
+            terminatePendingDeadlineStream state stream Deadline.exceededStatus
+          pure (state, frames.append terminal)
+      match result with
+      | .error status => pure (Except.error status)
+      | .ok (state, frames) =>
+          set state
+          pure (Except.ok frames)
+  match prepared with
+  | .error status => pure (.error status)
+  | .ok frames => emitFrameBatch emit frames
 
 private def cancelStreamRef (streamCancel : IO.Ref (Option (IO Unit))) : IO Unit := do
   -- Taking the callback before invoking arbitrary user IO gives cancellation
@@ -1132,6 +1753,129 @@ private def cancelResponseStreamRef (responseStreamCancel : IO.Ref (Option (IO U
 private def cancelRequestStreamRef (requestStreamCancel : IO.Ref (Option (IO Unit))) : IO Unit := do
   cancelStreamRef requestStreamCancel
 
+private def joinDeadlineChildRef
+    (childRef : IO.Ref (Option DeadlineChild)) : Std.Async.Async Unit := do
+  match ← childRef.modifyGet fun child? => (child?, none) with
+  | none => pure ()
+  | some child => child.join
+
+private def joinDeadlineChildRef?
+    (childRef? : Option (IO.Ref (Option DeadlineChild))) : Std.Async.Async Unit := do
+  match childRef? with
+  | none => pure ()
+  | some childRef => joinDeadlineChildRef childRef
+
+/-- Run a prepared custom authorizer with exact child ownership.  Timed calls
+share the connection scheduler; untimed custom callbacks still get a retained
+cancellable task so shutdown never loses the computation merely because no
+deadline was supplied. -/
+private def runPendingAuthorization (registry : Registry)
+    (authorization : PendingAuthorization) :
+    Std.Async.Async (Except Status MethodEntry) := do
+  if ← authorization.active.cancelled.get then
+    pure (.error (Status.cancelled "request authorization cancelled"))
+  else
+    let result ← match authorization.deadline with
+      | some _ =>
+          let runtime : DeadlineRuntime := {
+            externalTimer := true,
+            registerTask := fun deadline cancel expire join => do
+              let unregister ← registerDeadlineChild
+                authorization.active.deadlineChild (some authorization.scheduler)
+                deadline cancel expire join
+              if ← authorization.active.cancelled.get then
+                cancelDeadlineChildRef authorization.active.deadlineChild
+              pure unregister
+          }
+          Registry.runWithDeadlineUntilAsync authorization.deadline
+            (registry.authorizeRequestHeaders authorization.entry authorization.metadata)
+            (some runtime)
+      | none => do
+          let task ← IO.asTask do
+            try
+              registry.authorizeRequestHeaders authorization.entry authorization.metadata |>.run
+            catch error =>
+              pure (.error (Status.ofIOError error))
+          let join : Std.Async.Async Unit := do
+            try
+              discard <| Std.Async.Async.ofAsyncTask task
+            catch _ =>
+              pure ()
+          authorization.active.deadlineChild.set (some {
+            cancel? := some (IO.cancel task),
+            expire? := none,
+            join := join
+          })
+          if ← authorization.active.cancelled.get then
+            cancelDeadlineChildRef authorization.active.deadlineChild
+          let result ← try
+              Std.Async.Async.ofAsyncTask task
+            catch error =>
+              pure (.error (Status.ofIOError error))
+          authorization.active.deadlineChild.set none
+          pure result
+    match result with
+    | .error status => pure (.error status)
+    | .ok (.reject status) => pure (.error status)
+    | .ok (.accept handler) =>
+        pure (.ok { authorization.entry with handler := handler })
+
+/-- Commit an authorization result against current connection state.  The
+outbound HPACK encoder is intentionally read only now—not when the callback
+started—because other streams may have completed while user IO was running. -/
+private def commitPendingAuthorization (stateMutex : Std.Mutex State)
+    (authorization : PendingAuthorization) (decision : Except Status MethodEntry) :
+    IO (Except Status SharedFrameResult) := do
+  stateMutex.atomically do
+    let state ← get
+    let isOwned := state.activeAuthorizations.any fun active =>
+      active.streamId == authorization.streamId
+    if state.closing || !isOwned || (← authorization.active.cancelled.get) then
+      pure (.ok {})
+    else
+      match findStream? state.streams authorization.streamId with
+      | none => pure (.ok {})
+      | some stream =>
+          match decision with
+          | .error status =>
+              match Transport.encodeUnaryResponseFrames state.outboundHpack
+                  authorization.streamId
+                  { status := status, data := ByteArray.empty }
+                  state.outboundMaxFramePayloadLength with
+              | .error encodeStatus => pure (.error encodeStatus)
+              | .ok encoded =>
+                  let state := rejectStreamAtHeaders state authorization.streamId
+                    state.hpack encoded.2 authorization.endStream
+                  set state
+                  pure (.ok { emitted := encoded.1 })
+          | .ok entry =>
+              let stream := { stream with authorizedEntry? := some entry }
+              let state := { state with streams := replaceStream state.streams stream }
+              match requestStreamingDispatchForStream? state authorization.streamId with
+              | .error status => pure (.error status)
+              | .ok (state, some requestStreaming) =>
+                  set state
+                  pure (.ok { requestStreaming := some requestStreaming })
+              | .ok (state, none) =>
+                  if authorization.endStream then
+                    match detachStreamForDispatch state authorization.streamId with
+                    | .error status => pure (.error status)
+                    | .ok (state, detached) =>
+                        set state
+                        pure (.ok { detached := some detached })
+                  else
+                    set state
+                    pure (.ok {})
+
+private def retirePendingAuthorization (stateMutex : Std.Mutex State)
+    (authorization : PendingAuthorization) : IO Unit := do
+  stateMutex.atomically do
+    modify fun state => {
+      state with
+      activeAuthorizations := removeActiveAuthorizationsForStream
+        state.activeAuthorizations authorization.streamId
+    }
+
 private def cancelResponseStream (dispatch : ActiveDispatch) : IO Unit :=
   cancelResponseStreamRef dispatch.responseStreamCancel
 
@@ -1139,6 +1883,13 @@ private def cancelRequestStream (dispatch : ActiveDispatch) : IO Unit :=
   cancelRequestStreamRef dispatch.requestStreamCancel
 
 private def signalDispatches (dispatches : Array ActiveDispatch) : IO Unit := do
+  -- A timed dispatch suspends on a child-task completion promise, so cancelling
+  -- only its outer task cannot wake it.  Signal the exact child first; its
+  -- completion resolves the race and lets the retained outer owner retire.
+  for dispatch in dispatches do
+    match dispatch.deadlineChild with
+    | none => pure ()
+    | some childRef => cancelDeadlineChildRef childRef
   for dispatch in dispatches do
     IO.cancel dispatch.task
 
@@ -1156,13 +1907,25 @@ private def finishDispatchCancellationOwned (dispatches : Array ActiveDispatch) 
       Std.Async.Async.ofAsyncTask dispatch.task
     catch _ =>
       pure ()
+  -- Cancellation can make the outer dispatch finish before its suspended
+  -- deadline race resumes.  Join the separately retained child as well, so a
+  -- handler can never outlive the connection/stream owner that cancelled it.
+  for dispatch in dispatches do
+    match dispatch.deadlineChild with
+    | none => pure ()
+    | some childRef => joinDeadlineChildRef childRef
 
-/-- Signal every handler before entering the first arbitrary callback, then
-join every exact handler handle. -/
-private def cancelDispatchesOwned (dispatches : Array ActiveDispatch) :
-    Std.Async.Async Unit := do
-  signalDispatches dispatches
-  finishDispatchCancellationOwned dispatches
+private def signalAuthorizations (authorizations : Array ActiveAuthorization) : IO Unit := do
+  for authorization in authorizations do
+    cancelDeadlineChildRef authorization.deadlineChild
+
+private def finishAuthorizationCancellationOwned
+    (authorizations : Array ActiveAuthorization) : Std.Async.Async Unit := do
+  for authorization in authorizations do
+    try
+      joinDeadlineChildRef authorization.deadlineChild
+    catch _ =>
+      pure ()
 
 /-- Unbounded so that feeding inbound messages from the connection loop never
 blocks on a slow handler (one stalled stream must not stall the connection).
@@ -1222,17 +1985,42 @@ private def abortStreamSharedUnlessCancelled (cancelled : IO.Ref Bool)
     abortStreamShared stateMutex emit streamId code
 
 private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex State)
-    (emit : Array Frame -> IO Unit) (detached : DetachedDispatch) : IO Unit := do
+    (emit : Array Frame -> IO Unit) (detached : DetachedDispatch) : Std.Async.Async Unit := do
   let cancelled ← IO.mkRef false
   let registered ← IO.Promise.new
+  let deadlineChild? ←
+    if detached.request.deadline.isSome then
+      some <$> IO.mkRef (none : Option DeadlineChild)
+    else
+      pure none
   let requestStreamCancel ← IO.mkRef (none : Option (IO Unit))
   let responseStreamCancel ← IO.mkRef (none : Option (IO Unit))
-  let registerResponseStream (stream : MessageStream ByteArray) : IO Unit := do
+  let deadlineRuntime? ← match deadlineChild? with
+    | none => pure none
+    | some deadlineChild =>
+        let deadlineScheduler? := detached.deadlineScheduler
+        pure (some {
+          externalTimer := deadlineScheduler?.isSome,
+          registerTask := fun deadline cancel expire join => do
+            let unregister ← registerDeadlineChild deadlineChild deadlineScheduler?
+              deadline cancel expire join
+            if ← cancelled.get then
+              cancelDeadlineChildRef deadlineChild
+            pure unregister
+        })
+  let registerResponseStream (stream : MessageStream ByteArray) :
+      IO (MessageStream ByteArray) := do
     let cancel : IO Unit := do
       discard <| stream.cancel.run
     responseStreamCancel.set (some cancel)
     if ← cancelled.get then
       cancelResponseStreamRef responseStreamCancel
+    pure {
+      stream with
+      cancel := ExceptT.mk do
+        cancelResponseStreamRef responseStreamCancel
+        pure (.ok ())
+    }
   let emitOutbound (frames : Array Frame) : IO Unit := do
     if ← IO.checkCanceled then
       throw (IO.userError Status.dispatchCancelledMessage)
@@ -1244,10 +2032,14 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
       | .error status => throw (IO.userError status.messageD)
   let task ← Std.Async.Async.toIO do
     waitUntilDispatchRegistered registered
-    try
-      match ← Transport.dispatchDecodedUnaryFramesWith
+    if ← cancelled.get then
+      pure ()
+    else try
+      let result ← Transport.dispatchDecodedUnaryFramesWithAsync
           registry detached.outboundHpack detached.request emitOutbound detached.maxDataFrameSize
-          registerResponseStream with
+          registerResponseStream true deadlineRuntime?
+      joinDeadlineChildRef? deadlineChild?
+      match result with
       | .ok result =>
           stateMutex.atomically do
             let state ← get
@@ -1270,6 +2062,7 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
           abortStreamSharedUnlessCancelled cancelled stateMutex emit
             detached.request.streamId ErrorCode.internalError
     catch _ =>
+      joinDeadlineChildRef? deadlineChild?
       cancelResponseStreamRef responseStreamCancel
       stateMutex.atomically do
         let state ← get
@@ -1280,19 +2073,44 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
         }
       abortStreamSharedUnlessCancelled cancelled stateMutex emit
         detached.request.streamId ErrorCode.internalError
-  stateMutex.atomically do
+  let published ← stateMutex.atomically do
     let state ← get
-    set {
+    let ownsPublication :=
+      containsStreamId state.pendingDispatchPublications detached.request.streamId
+    let state := {
       state with
-      activeDispatches := state.activeDispatches.push {
-        streamId := detached.request.streamId,
-        task := task,
-        cancelled := cancelled,
-        requestStreamCancel := requestStreamCancel,
-        responseStreamCancel := responseStreamCancel
-      }
+      pendingDispatchPublications := removeStreamId
+        state.pendingDispatchPublications detached.request.streamId
     }
+    if state.closing || !ownsPublication then
+      set state
+      pure false
+    else
+      set {
+        state with
+        activeDispatches := state.activeDispatches.push {
+          streamId := detached.request.streamId,
+          task := task,
+          cancelled := cancelled,
+          requestStreamCancel := requestStreamCancel,
+          responseStreamCancel := responseStreamCancel,
+          deadlineChild := deadlineChild?
+        }
+      }
+      pure true
+  unless published do
+    -- Cancellation won the publication race.  The task is still behind its
+    -- gate, so retire the exact handle before arbitrary handler IO can start.
+    cancelled.set true
+    IO.cancel task
   registered.resolve ()
+  unless published do
+    try
+      discard <| Std.Async.Async.ofAsyncTask task
+    catch _ =>
+      pure ()
+    joinDeadlineChildRef? deadlineChild?
+    return
   if ← IO.hasFinished task then
     stateMutex.atomically do
       let state ← get
@@ -1355,22 +2173,53 @@ private def creditingRequestStream (stateMutex : Std.Mutex State)
 
 private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : Std.Mutex State)
     (emit : Array Frame -> IO Unit) (dispatch : RequestStreamingDispatch) :
-    IO (Except Status Unit) := do
+    Std.Async.Async (Except Status Unit) := do
   let producer ← match ← runGrpcPipe with
     | .ok producer => pure producer
     | .error status => return .error status
-  let requestStream := creditingRequestStream stateMutex emit dispatch.streamId producer.stream
+  let rawRequestStream := creditingRequestStream stateMutex emit dispatch.streamId producer.stream
   let acceptsGzip := Headers.clientAcceptsGzip dispatch.metadata
   let cancelled ← IO.mkRef false
   let registered ← IO.Promise.new
+  let deadlineChild? ←
+    if dispatch.deadline.isSome then
+      some <$> IO.mkRef (none : Option DeadlineChild)
+    else
+      pure none
   let requestStreamCancel ← IO.mkRef (some (discard <| producer.cancel.run) : Option (IO Unit))
   let responseStreamCancel ← IO.mkRef (none : Option (IO Unit))
-  let registerResponseStream (stream : MessageStream ByteArray) : IO Unit := do
+  let requestStream : MessageStream ByteArray := {
+    rawRequestStream with
+    cancel := ExceptT.mk do
+      cancelRequestStreamRef requestStreamCancel
+      pure (.ok ())
+  }
+  let deadlineRuntime? ← match deadlineChild? with
+    | none => pure none
+    | some deadlineChild =>
+        let deadlineScheduler? := dispatch.deadlineScheduler
+        pure (some {
+          externalTimer := deadlineScheduler?.isSome,
+          registerTask := fun deadline cancel expire join => do
+            let unregister ← registerDeadlineChild deadlineChild deadlineScheduler?
+              deadline cancel expire join
+            if ← cancelled.get then
+              cancelDeadlineChildRef deadlineChild
+            pure unregister
+        })
+  let registerResponseStream (stream : MessageStream ByteArray) :
+      IO (MessageStream ByteArray) := do
     let cancel : IO Unit := do
       discard <| stream.cancel.run
     responseStreamCancel.set (some cancel)
     if ← cancelled.get then
       cancelResponseStreamRef responseStreamCancel
+    pure {
+      stream with
+      cancel := ExceptT.mk do
+        cancelResponseStreamRef responseStreamCancel
+        pure (.ok ())
+    }
   let emitOutbound (frames : Array Frame) : IO Unit := do
     if ← IO.checkCanceled then
       throw (IO.userError Status.dispatchCancelledMessage)
@@ -1380,17 +2229,39 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       match ← queueOutboundShared stateMutex emit frames with
       | .ok () => pure ()
       | .error status => throw (IO.userError status.messageD)
-  let finish (outboundHpack : Option Hpack.State) : IO Unit := do
+  let finish (outboundHpack : Option Hpack.State) : Std.Async.Async Unit := do
+    joinDeadlineChildRef? deadlineChild?
     cancelRequestStreamRef requestStreamCancel
     stateMutex.atomically do
       let state ← get
+      let peerEnded := (findActiveRequestStream? state.activeRequestStreams dispatch.streamId).isNone
       let state := {
         state with
-        streams := removeStream state.streams dispatch.streamId,
         activeRequestStreams := removeActiveRequestStream state.activeRequestStreams dispatch.streamId,
         activeDispatches := removeActiveDispatchesForStream
           state.activeDispatches dispatch.streamId
       }
+      -- A successful encoder may have queued DATA followed by terminal
+      -- trailers behind a closed peer flow-control window.  Those frames and
+      -- the stream window remain live until `flushOutbound` actually emits
+      -- END_STREAM; its normal cleanup then retires the window.  Only a failed
+      -- encoder/reset may discard pending outbound work here.
+      let state :=
+        if outboundHpack.isSome then
+          state
+        else
+          removeOutboundStreamState state dispatch.streamId
+      -- A handler may finish (most importantly, at its deadline) before the
+      -- peer closes its request half.  The local trailers close only our half
+      -- of the HTTP/2 stream; keep accepting and flow-controlling legal late
+      -- DATA until END_STREAM, but discard it without re-entering the handler.
+      let state :=
+        if peerEnded then
+          removeInboundStreamState
+            { state with streams := removeStream state.streams dispatch.streamId }
+            dispatch.streamId
+        else
+          ignoreInboundStreamBody state dispatch.streamId
       let state := match outboundHpack with
         | none => state
         | some outboundHpack => { state with outboundHpack := outboundHpack }
@@ -1403,29 +2274,32 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
         match ← queueOutboundShared stateMutex emit encoded.1 with
         | .error status => pure (.error status)
         | .ok () => pure (.ok encoded.2)
-  let encodeStreaming (response : ServerStreamingStreamResponse) :
-      IO (Except Status Hpack.State) := do
-    try
+  let encodeStreaming (response : ServerStreamingStreamResponse) (deadline : Option Nat) :
+      Std.Async.Async (Except Status Hpack.State) := do
+    let messages ← try
       registerResponseStream response.messages
     catch err =>
       return .error (Status.ofIOError err)
-    Transport.encodeServerStreamingStreamResponseFramesWith
+    let response := { response with messages := messages }
+    Transport.encodeServerStreamingStreamResponseFramesWithAsync
       dispatch.outboundHpack dispatch.streamId response emitOutbound dispatch.maxDataFrameSize
-      acceptsGzip
+      acceptsGzip deadline deadlineRuntime?
   let emptyStreamingResponse (status : Status) : ServerStreamingStreamResponse := {
     messages := { recv? := pure none },
     status := status
   }
   let task ← Std.Async.Async.toIO do
     waitUntilDispatchRegistered registered
-    try
+    if ← cancelled.get then
+      pure ()
+    else try
       match dispatch.requestError with
       | some status =>
           let encoded ← match dispatch.kind with
             | .clientStreaming _ =>
                 encodeUnary { status := status, data := ByteArray.empty }
             | .bidirectionalStreaming _ =>
-                encodeStreaming (emptyStreamingResponse status)
+                encodeStreaming (emptyStreamingResponse status) none
           match encoded with
           | .ok outboundHpack => finish (some outboundHpack)
           | .error _status =>
@@ -1436,8 +2310,9 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       | none =>
           match dispatch.kind with
           | .clientStreaming handler =>
-              let result ← (registry.dispatchClientStreamingMessageStream
-                dispatch.metadata requestStream (some handler)).run
+              let result ← registry.dispatchClientStreamingMessageStreamAsync
+                dispatch.metadata requestStream (some handler) dispatch.deadline
+                deadlineRuntime?
               let encoded ← match result with
                 | .ok response => encodeUnary response
                 | .error status => encodeUnary { status := status, data := ByteArray.empty }
@@ -1449,11 +2324,17 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
                   abortStreamSharedUnlessCancelled cancelled stateMutex emit
                     dispatch.streamId ErrorCode.internalError
           | .bidirectionalStreaming handler =>
-              let result ← (registry.dispatchBidirectionalStreamingMessageStream
-                dispatch.metadata requestStream (some handler)).run
+              let result ← registry.dispatchBidirectionalStreamingMessageStreamAsync
+                dispatch.metadata requestStream (some handler) dispatch.deadline
+                deadlineRuntime?
               let encoded ← match result with
-                | .ok response => encodeStreaming response
-                | .error status => encodeStreaming (emptyStreamingResponse status)
+                | .ok (response, deadline) => encodeStreaming response deadline
+                | .error status =>
+                    -- Preserve the expired handler child in `deadlineChild`
+                    -- until `finish` queues trailers and joins that exact
+                    -- generation.  The synthetic terminal stream itself has
+                    -- no work that needs another deadline race.
+                    encodeStreaming (emptyStreamingResponse status) none
               match encoded with
               | .ok outboundHpack => finish (some outboundHpack)
               | .error _status =>
@@ -1466,31 +2347,56 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       finish none
       abortStreamSharedUnlessCancelled cancelled stateMutex emit
         dispatch.streamId ErrorCode.internalError
-  stateMutex.atomically do
+  let published ← stateMutex.atomically do
     let state ← get
-    let activeDispatch : ActiveDispatch := {
-      streamId := dispatch.streamId,
-      task := task,
-      cancelled := cancelled,
-      requestStreamCancel := requestStreamCancel,
-      responseStreamCancel := responseStreamCancel
-    }
-    let activeRequestStreams :=
-      if dispatch.closeImmediately then
-        state.activeRequestStreams
-      else
-        state.activeRequestStreams.push {
-          streamId := dispatch.streamId,
-          producer := producer,
-          contentLength := dispatch.contentLength,
-          usesGzip := dispatch.usesGzip
-        }
-    set {
+    let ownsPublication :=
+      containsStreamId state.pendingDispatchPublications dispatch.streamId
+    let state := {
       state with
-      activeDispatches := state.activeDispatches.push activeDispatch,
-      activeRequestStreams := activeRequestStreams
+      pendingDispatchPublications := removeStreamId
+        state.pendingDispatchPublications dispatch.streamId
     }
+    if state.closing || !ownsPublication then
+      set state
+      pure false
+    else
+      let activeDispatch : ActiveDispatch := {
+        streamId := dispatch.streamId,
+        task := task,
+        cancelled := cancelled,
+        requestStreamCancel := requestStreamCancel,
+        responseStreamCancel := responseStreamCancel,
+        deadlineChild := deadlineChild?
+      }
+      let activeRequestStreams :=
+        if dispatch.closeImmediately then
+          state.activeRequestStreams
+        else
+          state.activeRequestStreams.push {
+            streamId := dispatch.streamId,
+            producer := producer,
+            contentLength := dispatch.contentLength,
+            usesGzip := dispatch.usesGzip
+          }
+      set {
+        state with
+        activeDispatches := state.activeDispatches.push activeDispatch,
+        activeRequestStreams := activeRequestStreams
+      }
+      pure true
+  unless published do
+    cancelled.set true
+    IO.cancel task
   registered.resolve ()
+  unless published do
+    try
+      discard <| Std.Async.Async.ofAsyncTask task
+    catch _ =>
+      pure ()
+    joinDeadlineChildRef? deadlineChild?
+    cancelRequestStreamRef requestStreamCancel
+    cancelResponseStreamRef responseStreamCancel
+    return .ok ()
   if dispatch.closeImmediately then
     match ← producer.close.run with
     | .ok () => pure ()
@@ -1509,37 +2415,61 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
   pure (.ok ())
 
 def signalCancelActiveShared (stateMutex : Std.Mutex State) : IO Unit := do
-  let dispatches ← stateMutex.atomically do
+  let (dispatches, authorizations) ← stateMutex.atomically do
     let state ← get
     for dispatch in state.activeDispatches do
       dispatch.cancelled.set true
-    pure state.activeDispatches
+    for authorization in state.activeAuthorizations do
+      authorization.cancelled.set true
+    set { state with closing := true }
+    pure (state.activeDispatches, state.activeAuthorizations)
   -- This entry point is safe for shutdown/error callbacks: it never enters
   -- arbitrary MessageStream.cancel IO and never waits for a handler.
+  signalAuthorizations authorizations
   signalDispatches dispatches
 
 def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async State := do
-  let (state, dispatches, requestStreams) ← stateMutex.atomically do
+  let (state, dispatches, authorizations, requestStreams, scheduler?) ← stateMutex.atomically do
     let state ← get
     let dispatches := state.activeDispatches
+    let authorizations := state.activeAuthorizations
     let requestStreams := state.activeRequestStreams
+    let scheduler? := state.deadlineScheduler
     for dispatch in dispatches do
       dispatch.cancelled.set true
+    for authorization in authorizations do
+      authorization.cancelled.set true
     let state := {
       state with
+      closing := true,
       streams := #[],
       ignoredInboundStreams := #[],
       resetInboundStreams := #[],
       resetHeaderBlock := none,
       activeRequestStreams := #[],
       activeDispatches := #[],
+      activeAuthorizations := #[],
+      pendingDispatchPublications := #[],
       pendingOutbound := #[],
       inboundStreamWindows := #[],
-      outboundStreamWindows := #[]
+      outboundStreamWindows := #[],
+      deadlineScheduler := none
     }
     set state
-    pure (state, dispatches, requestStreams)
-  cancelDispatchesOwned dispatches
+    pure (state, dispatches, authorizations, requestStreams, scheduler?)
+  -- Wake every deadline/authorization race before joining any arbitrary user
+  -- callback.  A callback may be uncooperative, but no other owned phase is
+  -- left waiting merely because it was signalled later in the loop.
+  signalAuthorizations authorizations
+  signalDispatches dispatches
+  -- The scheduler is infrastructure, not arbitrary user IO. Retire it after
+  -- every child has been signalled but before joining callbacks that may be
+  -- uncooperative, so teardown never leaks the shared timer task.
+  match scheduler? with
+  | none => pure ()
+  | some scheduler => scheduler.shutdown
+  finishDispatchCancellationOwned dispatches
+  finishAuthorizationCancellationOwned authorizations
   -- Streaming dispatches own their producer cancellation through
   -- requestStreamCancel. Retain ownership for any defensive orphan as well.
   for requestStream in requestStreams do
@@ -1633,6 +2563,10 @@ the peer may still have DATA in flight, retain the id in drain-only mode so
 those connection-flow-controlled bytes cannot affect dispatch. -/
 private def resetLocalStream (state : State) (streamId : Nat) (peerEnded : Bool := false) : State :=
   let wasOpen := hasOpenInboundStream state streamId
+  -- The original authorization owner retains its active marker until it has
+  -- observed cancellation and joined any child published concurrently with
+  -- this reset.  Removing the marker here could make drain accounting report
+  -- completion during the child-publication gap.
   let state := { state with streams := removeStream state.streams streamId }
   let state := removeInboundStreamState (removeOutboundStreamState state streamId) streamId
   if wasOpen && !peerEnded then drainResetInboundStreamBody state streamId else state
@@ -1662,9 +2596,15 @@ def resetStreamFlowControl (state : State) (frame : Frame) :
   let connectionUpdate ← WindowUpdate.frame 0 frame.payload.size
   let rst ← RstStream.frame frame.header.streamId ErrorCode.flowControlError
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
+  let cancelAuthorizations :=
+    activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
   let state := resetLocalStream state frame.header.streamId
     (peerEnded := FrameFlag.has frame.header.flags FrameFlag.endStream)
-  pure (state, { emitted := #[connectionUpdate, rst], cancelDispatches := cancelDispatches })
+  pure (state, {
+    emitted := #[connectionUpdate, rst],
+    cancelDispatches := cancelDispatches,
+    cancelAuthorizations := cancelAuthorizations
+  })
 
 /-- A stream receive-window violation consumes no lasting connection credit,
 produces no dispatch work, cancels only work attributable to the offending
@@ -1721,8 +2661,14 @@ private def resetPriorityFrameSize (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) := do
   let rst ← RstStream.frame frame.header.streamId ErrorCode.frameSizeError
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
+  let cancelAuthorizations :=
+    activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
   let state := resetLocalStream state frame.header.streamId
-  pure (state, { emitted := #[rst], cancelDispatches := cancelDispatches })
+  pure (state, {
+    emitted := #[rst],
+    cancelDispatches := cancelDispatches,
+    cancelAuthorizations := cancelAuthorizations
+  })
 
 /-- Classify the frame-local failures whose per-frame-type processors would
 otherwise escalate them, after the caller has completed all connection-scoped
@@ -1783,9 +2729,17 @@ private def processRstStreamShared (state : State) (frame : Frame) :
   discard <| RstStream.decode frame
   requireClientStreamId frame.header.streamId "RST_STREAM"
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
-  let state := { state with streams := removeStream state.streams frame.header.streamId }
+  let cancelAuthorizations :=
+    activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
+  let state := {
+    state with
+    streams := removeStream state.streams frame.header.streamId
+  }
   let state := removeInboundStreamState state frame.header.streamId
-  pure (removeOutboundStreamState state frame.header.streamId, { cancelDispatches := cancelDispatches })
+  pure (removeOutboundStreamState state frame.header.streamId, {
+    cancelDispatches := cancelDispatches,
+    cancelAuthorizations := cancelAuthorizations
+  })
 
 /-- HPACK is connection-wide, so even a field block that crossed a local reset
 must be decompressed before it is discarded. Request semantics are intentionally
@@ -1876,8 +2830,11 @@ private def processHeaders (registry : Registry) (state : State) (frame : Frame)
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
               | .error status => pure (.error status)
-              | .ok (state, some frames) => pure (.ok (state, frames))
-              | .ok (state, none) =>
+              | .ok (state, .rejected frames) => pure (.ok (state, frames))
+              | .ok (_, .pending _) =>
+                  pure (.error (Status.internal
+                    "managed header authorization reached synchronous frame processing"))
+              | .ok (state, .accepted) =>
                   if FrameFlag.has frame.header.flags FrameFlag.endStream then
                     finalizeStream registry state frame.header.streamId
                   else
@@ -1916,11 +2873,14 @@ private def processHeadersWith (registry : Registry) (state : State) (frame : Fr
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
               | .error status => pure (.error status)
-              | .ok (state, some frames) =>
+              | .ok (state, .rejected frames) =>
                   match ← emitFrameBatch emit frames with
                   | .error status => pure (.error status)
                   | .ok () => pure (.ok state)
-              | .ok (state, none) =>
+              | .ok (_, .pending _) =>
+                  pure (.error (Status.internal
+                    "managed header authorization reached synchronous frame processing"))
+              | .ok (state, .accepted) =>
                   if FrameFlag.has frame.header.flags FrameFlag.endStream then
                     finalizeStreamWith registry state frame.header.streamId emit
                   else
@@ -1941,8 +2901,11 @@ private def processContinuation (registry : Registry) (state : State) (frame : F
             | some headersFrame =>
                 match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
                 | .error status => pure (.error status)
-                | .ok (state, some frames) => pure (.ok (state, frames))
-                | .ok (state, none) =>
+                | .ok (state, .rejected frames) => pure (.ok (state, frames))
+                | .ok (_, .pending _) =>
+                    pure (.error (Status.internal
+                      "managed header authorization reached synchronous frame processing"))
+                | .ok (state, .accepted) =>
                     if FrameFlag.has headersFrame.header.flags FrameFlag.endStream then
                       finalizeStream registry state frame.header.streamId
                     else
@@ -1965,11 +2928,14 @@ private def processContinuationWith (registry : Registry) (state : State) (frame
             | some headersFrame =>
                 match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
                 | .error status => pure (.error status)
-                | .ok (state, some frames) =>
+                | .ok (state, .rejected frames) =>
                     match ← emitFrameBatch emit frames with
                     | .error status => pure (.error status)
                     | .ok () => pure (.ok state)
-                | .ok (state, none) =>
+                | .ok (_, .pending _) =>
+                    pure (.error (Status.internal
+                      "managed header authorization reached synchronous frame processing"))
+                | .ok (state, .accepted) =>
                     if FrameFlag.has headersFrame.header.flags FrameFlag.endStream then
                       finalizeStreamWith registry state frame.header.streamId emit
                     else
@@ -2200,13 +3166,15 @@ def prepareHeadersShared (state : State) (frame : Frame) :
             state.refusedInboundStreams
       }, none)
 
-private def processHeadersShared (registry : Registry) (state : State) (frame : Frame) :
+private def processHeadersShared (registry : Registry) (state : State) (frame : Frame)
+    (receivedAt : Option Nat := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   match prepareHeadersShared state frame with
   | .error status => pure (.error status)
   | .ok (state, some rst) => pure (.ok (state, { emitted := #[rst] }))
   | .ok (state, none) =>
       if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
+        let state := recordEndHeadersReceivedAt state frame.header.streamId receivedAt
         match ← earlyRequestRejectionForStream? registry state frame.header.streamId with
         | .error status => pure (.error status)
         | .ok (state, some result) => pure (.ok (state, result))
@@ -2225,13 +3193,15 @@ private def processHeadersShared (registry : Registry) (state : State) (frame : 
       else
         pure (.ok (state, {}))
 
-private def processContinuationShared (registry : Registry) (state : State) (frame : Frame) :
+private def processContinuationShared (registry : Registry) (state : State) (frame : Frame)
+    (receivedAt : Option Nat := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   match appendContinuationFrame state.streams frame with
   | .error status => pure (.error status)
   | .ok streams =>
     let state := { state with streams := streams }
     if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
+      let state := recordEndHeadersReceivedAt state frame.header.streamId receivedAt
       let headersFrame? := (findStream? streams frame.header.streamId).bind fun stream =>
         stream.frames[0]?
       match headersFrame? with
@@ -2379,10 +3349,16 @@ private def resetClosedStreamData (state : State) (frame : Frame) :
   let streamId := frame.header.streamId
   let rst ← RstStream.frame streamId ErrorCode.streamClosed
   let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
+  let cancelAuthorizations :=
+    activeAuthorizationsForStream state.activeAuthorizations streamId
   let state := removeOutboundStreamState state streamId
   let (state, updates) ← processResetInboundData
     (drainResetInboundStreamBody state streamId) frame
-  pure (state, { emitted := updates.push rst, cancelDispatches := cancelDispatches })
+  pure (state, {
+    emitted := updates.push rst,
+    cancelDispatches := cancelDispatches,
+    cancelAuthorizations := cancelAuthorizations
+  })
 
 /-- DATA for a unary request: the body is buffered on the stream and both
 windows are credited immediately, since the whole request is dispatched at
@@ -2477,7 +3453,8 @@ def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : F
   | .headers | .continuation =>
       throw (Status.internal "unreachable HTTP/2 header dispatch")
 
-private def processFrameShared (registry : Registry) (state : State) (frame : Frame) :
+private def processFrameShared (registry : Registry) (state : State) (frame : Frame)
+    (receivedAt : Option Nat := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   let validated : Except Status Unit := do
     requireInboundFrameSize state frame
@@ -2496,31 +3473,68 @@ private def processFrameShared (registry : Registry) (state : State) (frame : Fr
               | .error status => pure (.error status)
               | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
             else
-              processHeadersShared registry state frame
+              processHeadersShared registry state frame receivedAt
     | .continuation =>
         if containsStreamId state.resetInboundStreams frame.header.streamId then
           match processResetContinuation state frame with
           | .error status => pure (.error status)
           | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
         else
-          processContinuationShared registry state frame
+          processContinuationShared registry state frame receivedAt
     | _ => pure (processNonHeaderFrameShared registry state frame)
 
+private def finishSharedFrameResult (registry : Registry) (stateMutex : Std.Mutex State)
+    (emit : Array Frame -> IO Unit) (result : SharedFrameResult) :
+    Std.Async.Async (Except Status Unit) := do
+  -- Select and signal a stream error first, then publish its wire frame.  User
+  -- cleanup cannot suppress the peer-visible RST_STREAM; cleanup is still
+  -- joined even when emission reports a transport error.
+  signalAuthorizations result.cancelAuthorizations
+  signalDispatches result.cancelDispatches
+  let emitResult ← emitFrameBatch emit result.emitted
+  finishDispatchCancellationOwned result.cancelDispatches
+  -- Authorization retains a single original owner from prepare through
+  -- retire. A concurrent reset only signals that owner: stealing its join
+  -- handle here could let the original owner retire the active marker while
+  -- this task was still waiting on an uncooperative child.
+  match emitResult with
+  | .error status => pure (.error status)
+  | .ok () =>
+      for feed in result.requestFeeds do
+        match ← feedRequestStream feed with
+        | .ok () => pure ()
+        | .error status => return .error status
+      match result.requestStreaming with
+      | some dispatch =>
+          match ← spawnRequestStreamingDispatch registry stateMutex emit dispatch with
+          | .error status => return .error status
+          | .ok () => pure ()
+      | none => pure ()
+      match result.detached with
+      | none => pure (.ok ())
+      | some detached =>
+          spawnDetachedDispatch registry stateMutex emit detached
+          pure (.ok ())
+
 def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
-    (emit : Array Frame -> IO Unit) : Std.Async.Async (Except Status Unit) := do
+    (emit : Array Frame -> IO Unit) (receivedAt : Option Nat := none) :
+    Std.Async.Async (Except Status Unit) := do
   match ← stateMutex.atomically (do
     let state ← get
     let validated : Except Status Unit := do
       requireInboundFrameSize state frame
       requireClientSettingsFrame state frame
       requireHeaderBlockContinuation state frame
-    let step ← match validated with
-      | .error status => pure (.error status)
-      | .ok () =>
-        match containStreamError? state frame with
+    let step ←
+      if state.closing then
+        pure (.ok (state, {}))
+      else match validated with
         | .error status => pure (.error status)
-        | .ok (some result) => pure (.ok result)
-        | .ok none => processFrameShared registry state frame
+        | .ok () =>
+          match containStreamError? state frame with
+          | .error status => pure (.error status)
+          | .ok (some result) => pure (.ok result)
+          | .ok none => processFrameShared registry state frame receivedAt
     match step with
     | .error status => pure (Except.error status)
     | .ok (state, result) =>
@@ -2529,34 +3543,62 @@ def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
         -- cancellation and takes the same exactly-once callback path.
         for dispatch in result.cancelDispatches do
           dispatch.cancelled.set true
+        for authorization in result.cancelAuthorizations do
+          authorization.cancelled.set true
         set state
-        pure (Except.ok result)) with
+        let resetStream := frame.header.frameType == .rstStream
+          || result.emitted.any (fun emitted =>
+            emitted.header.frameType == .rstStream
+              && emitted.header.streamId == frame.header.streamId)
+        let timedBodyCompleted := frame.header.frameType == .data
+          && result.detached.any (fun detached => detached.request.deadline.isSome)
+        let completedHeaders :=
+          (frame.header.frameType == .headers || frame.header.frameType == .continuation)
+            && FrameFlag.has frame.header.flags FrameFlag.endHeaders
+        let deadlineUpdate? : Option (DeadlineScheduler × Option Nat) := do
+          let scheduler ← state.deadlineScheduler
+          if resetStream || timedBodyCompleted then
+            pure (scheduler, none)
+          else if completedHeaders then
+            let deadline ← pendingDeadlineForStream? state frame.header.streamId
+            pure (scheduler, some deadline)
+          else
+            none
+        pure (Except.ok (result, deadlineUpdate?))) with
   | .error status => pure (Except.error status)
-  | .ok result =>
-      -- Select and signal the stream error first, then publish its wire frame.
-      -- User cleanup cannot suppress the peer-visible RST_STREAM. Cleanup is
-      -- still joined below even when emission reports a transport error.
-      signalDispatches result.cancelDispatches
-      let emitResult ← emitFrameBatch emit result.emitted
-      finishDispatchCancellationOwned result.cancelDispatches
-      match emitResult with
-      | .error status => pure (.error status)
-      | .ok () =>
-          for feed in result.requestFeeds do
-            match ← feedRequestStream feed with
-            | .ok () => pure ()
-            | .error status => return .error status
-          match result.requestStreaming with
-          | some dispatch =>
-              match ← spawnRequestStreamingDispatch registry stateMutex emit dispatch with
-              | .error status => return .error status
-              | .ok () => pure ()
-          | none => pure ()
-          match result.detached with
-          | none => pure (.ok ())
-          | some detached =>
-              spawnDetachedDispatch registry stateMutex emit detached
-              pure (.ok ())
+  | .ok (result, deadlineUpdate?) =>
+      -- Publish timer ownership before emission, stream feeding, or user IO.
+      -- Untimed calls and unchanged body DATA avoid the scheduler mutex.
+      match deadlineUpdate? with
+      | none => pure ()
+      | some (scheduler, deadline?) =>
+          reconcilePendingBodyDeadline scheduler stateMutex emit
+            frame.header.streamId deadline?
+      match result.pendingAuthorization with
+      | none => finishSharedFrameResult registry stateMutex emit result
+      | some authorization =>
+          -- The deadline winner is committed and enqueued before joining a
+          -- cancelled callback.  Thus cooperative cancellation latency—or an
+          -- uncooperative callback—cannot postpone the peer-visible status.
+          let outcome ← try
+              let decision ← runPendingAuthorization registry authorization
+              match ← commitPendingAuthorization stateMutex authorization decision with
+              | .error status => pure (.error status)
+              | .ok resolved =>
+                  -- Authorization may have made an aggregate request eligible
+                  -- to wait for its body. Install that owner before any output
+                  -- or handler publication can block this frame task.
+                  reconcileCurrentPendingBodyDeadline stateMutex emit authorization.streamId
+                  finishSharedFrameResult registry stateMutex emit resolved
+            catch error =>
+              cancelDeadlineChildRef authorization.active.deadlineChild
+              pure (.error (Status.ofIOError error))
+          try
+            joinDeadlineChildRef authorization.active.deadlineChild
+          catch _ =>
+            pure ()
+          retirePendingAuthorization stateMutex authorization
+          pure outcome
 
 /-- Synchronous compatibility wrapper around the connection-owner variant. -/
 def processFrameSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
@@ -2585,10 +3627,11 @@ private def processFramesWith (registry : Registry) (frames : Array Frame) (i : 
   pure (.ok state)
 
 private def processFramesSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
-    (frames : Array Frame) (i : Nat) (emit : Array Frame -> IO Unit) :
+    (frames : Array Frame) (i : Nat) (emit : Array Frame -> IO Unit)
+    (receivedAt : Option Nat := none) :
     Std.Async.Async (Except Status Unit) := do
   for j in [i:frames.size] do
-    match ← processFrameSharedWithOwned registry stateMutex frames[j]! emit with
+    match ← processFrameSharedWithOwned registry stateMutex frames[j]! emit receivedAt with
     | .error status => return .error status
     | .ok () => pure ()
   pure (.ok ())
@@ -2624,6 +3667,10 @@ def processBytesWith (registry : Registry) (state : State) (chunk : ByteArray)
 def processBytesSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State)
     (chunk : ByteArray)
     (emit : Array Frame -> IO Unit) : Std.Async.Async (Except Status Unit) := do
+  -- All complete frames decoded from this receive chunk were already present
+  -- at this instant.  Carry it through sequential frame processing so a slow
+  -- earlier stream cannot extend a later stream's grpc-timeout.
+  let receivedAt ← IO.monoNanosNow
   match ← stateMutex.atomically (do
     let state ← get
     match consumePreface state chunk with
@@ -2639,7 +3686,7 @@ def processBytesSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
               set { state with decoder := { buffered := decoded.buffered } }
               pure (Except.ok decoded.frames)) with
   | .error status => pure (Except.error status)
-  | .ok frames => processFramesSharedWith registry stateMutex frames 0 emit
+  | .ok frames => processFramesSharedWith registry stateMutex frames 0 emit (some receivedAt)
 
 /-- Synchronous compatibility wrapper around the connection-owner variant. -/
 def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (chunk : ByteArray)
@@ -2650,6 +3697,14 @@ def encodeFrames (frames : Array Frame) : Except Status ByteArray :=
   frames.foldlM (init := ByteArray.empty) fun out frame => do
     let bytes ← Frame.encode frame
     pure (out.append bytes)
+
+def expirePendingDeadlinesEncodedSharedWith (stateMutex : Std.Mutex State)
+    (emit : ByteArray -> IO Unit) : IO (Except Status Unit) :=
+  expirePendingDeadlinesSharedWith stateMutex fun frames => do
+    match encodeFrames frames with
+    | .ok bytes =>
+        if bytes.isEmpty then pure () else emit bytes
+    | .error status => throw (IO.userError status.messageD)
 
 def processBytesEncodedWith (registry : Registry) (state : State) (chunk : ByteArray)
     (emit : ByteArray -> IO Unit) : IO (Except Status State) := do
@@ -3733,9 +4788,10 @@ theorem initialState_wellFormed (maxConcurrentStreams maxHeaderListSize : Option
         initialWindowSize).outboundStreamWindows = #[] from rfl] at hw
     simp at hw
   outboundTable := by
-    show Hpack.dynamicSize #[] ≤ _
-    rw [Hpack.dynamicSize_empty]
-    exact Nat.zero_le _
+    change Hpack.dynamicSize (Hpack.withoutDynamicTable {}).dynamic
+      ≤ (Hpack.withoutDynamicTable {}).maxSize
+    rw [Hpack.dynamicSize_withoutDynamicTable, Hpack.maxSize_withoutDynamicTable]
+    exact Nat.zero_le 0
   inboundTable := by
     show Hpack.dynamicSize #[] ≤ _
     rw [Hpack.dynamicSize_empty]
@@ -4125,8 +5181,9 @@ private theorem applyPeerSetting_wellFormed {state state' : State} {setting : Se
         outboundConnection := h.outboundConnection
         outboundStreams := h.outboundStreams
         outboundTable := by
-          rw [Hpack.maxSize_setMaxAllowedSize]
-          exact Hpack.dynamicSize_setMaxAllowedSize_le state.outboundHpack setting.value
+          rw [Hpack.maxSize_setMaxAllowedSizeWithoutDynamicTable]
+          exact Hpack.dynamicSize_setMaxAllowedSizeWithoutDynamicTable
+            state.outboundHpack setting.value
         inboundTable := h.inboundTable
       }
   next =>
@@ -4485,7 +5542,7 @@ private theorem detachStreamForDispatch_wellFormed {state state' : State} {strea
     next => cases heq
     next =>
       cases heq
-      refine h.ofSame (removeInboundStreamState_same _ _) ?_ rfl
+      refine h.ofSame ⟨rfl, Nat.le_refl _, fun _ hw => hw, rfl, rfl⟩ ?_ rfl
       intro s hs
       exact mem_removeStream hs
 

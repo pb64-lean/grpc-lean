@@ -21,6 +21,10 @@ structure UnaryRequestFrames where
   authorization already ran on the connection.  `none` means dispatch must
   look the method up and run the authorizer itself. -/
   authorizedEntry? : Option MethodEntry := none
+  /-- Absolute deadline captured when END_HEADERS was decoded.  Standalone
+  transport callers leave this as `none` and Registry dispatch derives it
+  from `grpc-timeout` at dispatch time. -/
+  deadline : Option Nat := none
 
 structure RequestHeadersFrames where
   streamId : Nat
@@ -347,11 +351,33 @@ private def emitFrames (emit : Array Frame -> IO Unit) (frames : Array Frame) :
     catch err =>
       pure (.error (Status.ofIOError err))
 
-private partial def emitMessageStreamDataFrames (streamId maxDataFrameSize : Nat)
+/-- Run response-stream cleanup after every terminal stream-status frame
+attempt.  A managed connection wraps `cancel` in an exactly-once callback
+retained by its outer dispatch owner, so awaiting it here cannot orphan
+arbitrary user IO.  In particular, a blocking callback may delay dispatch
+retirement, but never the trailers that precede it.  Standalone encoders
+receive the same best-effort cleanup, including when terminal-frame emission
+fails. -/
+private def finishStreamAfterTerminalFrames (stream : MessageStream α)
+    (streamStatus? : Option Status)
+    (finish : Std.Async.Async (Except Status β)) :
+    Std.Async.Async (Except Status β) := do
+  let result ← finish
+  match streamStatus? with
+  | some _ =>
+      try
+        discard <| stream.cancel.run
+      catch _ =>
+        pure ()
+  | none => pure ()
+  pure result
+
+private partial def emitMessageStreamDataFramesAsync (streamId maxDataFrameSize : Nat)
     (stream : MessageStream ByteArray) (emit : Array Frame -> IO Unit)
-    (gzip : Bool := false) :
-    IO (Except Status (Option Status)) := do
-  match ← stream.recv?.run with
+    (gzip : Bool := false) (deadline : Option Nat := none)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (Option Status)) := do
+  match ← Registry.recvWithDeadlineUntilAsync deadline stream runtime? with
   | .error status => pure (.ok (some status))
   | .ok none => pure (.ok none)
   | .ok (some message) =>
@@ -360,7 +386,9 @@ private partial def emitMessageStreamDataFrames (streamId maxDataFrameSize : Nat
       | .ok frames =>
           match ← emitFrames emit frames with
           | .error status => pure (.error status)
-          | .ok () => emitMessageStreamDataFrames streamId maxDataFrameSize stream emit gzip
+          | .ok () =>
+              emitMessageStreamDataFramesAsync
+                streamId maxDataFrameSize stream emit gzip deadline runtime?
 
 private def encodeTrailersOnlyFrames (state : Hpack.State) (streamId : Nat)
     (metadata : Metadata) (status : Status) (trailers : Metadata)
@@ -413,6 +441,49 @@ def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.Stat
                 some <$> encodeGrpcStatus
                   (Status.unimplemented s!"unknown gRPC method {method.path}")
 
+/-- Deadline-race only user-installed authorization IO.  The default
+registered-handler acceptor stays inline, while a cancelled custom callback is
+joined here before the header-processing owner proceeds. -/
+private def authorizeEntryUntil (registry : Registry) (entry : MethodEntry)
+    (metadata : Metadata) (deadline : Option Nat)
+    (runtime? : Option DeadlineRuntime := none) :
+    IO (Except Status (AuthorizationResult entry)) := do
+  if !registry.usesCustomRequestHeaderAuthorizer || deadline.isNone then
+    try
+      registry.authorizeRequestHeaders entry metadata |>.run
+    catch error =>
+      pure (.error (Status.ofIOError error))
+  else
+    let childOwned ←
+      IO.mkRef (none : Option (Std.Async.Async Unit × IO Unit))
+    let runtime : DeadlineRuntime := {
+      externalTimer := runtime?.any (fun runtime => runtime.externalTimer),
+      registerTask := fun childDeadline cancel expire join => do
+        let release ← match runtime? with
+          | none => pure (pure ())
+          | some runtime =>
+              runtime.registerTask childDeadline cancel expire join
+        childOwned.set (some (join, release))
+        pure do
+          release
+          childOwned.set none
+    }
+    let result ← try
+      Std.Async.Async.block <|
+        Registry.runWithDeadlineUntilAsync deadline
+          (registry.authorizeRequestHeaders entry metadata) (some runtime)
+    catch error =>
+      pure (.error (Status.ofIOError error))
+    match ← childOwned.modifyGet fun child? => (child?, none) with
+    | none => pure ()
+    | some (join, release) =>
+        try
+          Std.Async.Async.block join
+        catch _ =>
+          pure ()
+        release
+    pure result
+
 /--
 Validate and authorize a complete request header block.  This function is
 called as soon as END_HEADERS arrives, before the connection accepts DATA for
@@ -422,7 +493,8 @@ handler, which has the entry's exact shape by construction); it is retained
 in stream state and used for dispatch without rerunning the authorizer.
 -/
 def authorizeEarlyRequest (registry : Registry) (state : Hpack.State) (streamId : Nat)
-    (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :
+    (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
+    (deadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     IO (Except Status EarlyRequestDecision) := do
   match encodeEarlyRequestRejectionFrames?
       registry state streamId metadata maxDataFrameSize with
@@ -441,30 +513,30 @@ def authorizeEarlyRequest (registry : Registry) (state : Hpack.State) (streamId 
     | none =>
         pure (rejectWith (Status.unimplemented s!"unknown gRPC method {method.path}"))
     | some entry =>
-      let authorizationResult ← try
-        registry.authorizeRequestHeaders entry metadata |>.run
-      catch error =>
-        pure (.error (Status.ofIOError error))
+      let authorizationResult ← authorizeEntryUntil registry entry metadata deadline runtime?
       match authorizationResult with
       | .ok (.accept handler) => pure (.ok (.accept { entry with handler := handler }))
       | .ok (.reject status) => pure (rejectWith status)
       | .error status => pure (rejectWith status)
 
-def encodeServerStreamingStreamResponseFramesWith (state : Hpack.State) (streamId : Nat)
+private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
+    (state : Hpack.State) (streamId : Nat)
     (response : ServerStreamingStreamResponse)
     (emit : Array Frame -> IO Unit)
-    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
-    IO (Except Status Hpack.State) := do
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false)
+    (deadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status Hpack.State) := do
   if !response.status.isOk then
-    match ← response.messages.recv?.run with
+    match ← Registry.recvWithDeadlineUntilAsync deadline response.messages runtime? with
     | .error status =>
-        match encodeTrailersOnlyFrames state streamId response.metadata status response.trailers
-            maxDataFrameSize with
-        | .error status => pure (.error status)
-        | .ok encoded =>
-            match ← emitFrames emit encoded.1 with
-            | .error status => pure (.error status)
-            | .ok () => pure (.ok encoded.2)
+        finishStreamAfterTerminalFrames response.messages (some status) <| do
+          match encodeTrailersOnlyFrames state streamId response.metadata status response.trailers
+              maxDataFrameSize with
+          | .error status => pure (.error status)
+          | .ok encoded =>
+              match ← emitFrames emit encoded.1 with
+              | .error status => pure (.error status)
+              | .ok () => pure (.ok encoded.2)
     | .ok none =>
         match encodeTrailersOnlyFrames state streamId response.metadata response.status response.trailers
             maxDataFrameSize with
@@ -490,22 +562,23 @@ def encodeServerStreamingStreamResponseFramesWith (state : Hpack.State) (streamI
                         match ← emitFrames emit firstFrames with
                         | .error status => pure (.error status)
                         | .ok () =>
-                            match ← emitMessageStreamDataFrames
-                                streamId maxDataFrameSize response.messages emit gzip with
+                            match ← emitMessageStreamDataFramesAsync
+                                streamId maxDataFrameSize response.messages emit gzip deadline runtime? with
                             | .error status => pure (.error status)
                             | .ok streamStatus? =>
                                 let finalStatus := streamStatus?.getD response.status
-                                match Hpack.encodeHeaderBlock state
-                                    (Headers.trailers finalStatus response.trailers) with
-                                | .error status => pure (.error status)
-                                | .ok trailerBlock =>
-                                    match headerBlockFrames streamId trailerBlock.1 true
-                                        maxDataFrameSize with
-                                    | .error status => pure (.error status)
-                                    | .ok trailerFrames =>
-                                        match ← emitFrames emit trailerFrames with
-                                        | .error status => pure (.error status)
-                                        | .ok () => pure (.ok trailerBlock.2)
+                                finishStreamAfterTerminalFrames response.messages streamStatus? <| do
+                                  match Hpack.encodeHeaderBlock state
+                                      (Headers.trailers finalStatus response.trailers) with
+                                  | .error status => pure (.error status)
+                                  | .ok trailerBlock =>
+                                      match headerBlockFrames streamId trailerBlock.1 true
+                                          maxDataFrameSize with
+                                      | .error status => pure (.error status)
+                                      | .ok trailerFrames =>
+                                          match ← emitFrames emit trailerFrames with
+                                          | .error status => pure (.error status)
+                                          | .ok () => pure (.ok trailerBlock.2)
   else
     match Hpack.encodeHeaderBlock state (Metadata.append (responseHeadersFor gzip) response.metadata) with
     | .error status => pure (.error status)
@@ -517,20 +590,98 @@ def encodeServerStreamingStreamResponseFramesWith (state : Hpack.State) (streamI
             match ← emitFrames emit initialFrames with
             | .error status => pure (.error status)
             | .ok () =>
-                match ← emitMessageStreamDataFrames streamId maxDataFrameSize response.messages emit gzip with
+                match ← emitMessageStreamDataFramesAsync
+                    streamId maxDataFrameSize response.messages emit gzip deadline runtime? with
                 | .error status => pure (.error status)
                 | .ok streamStatus? =>
                     let finalStatus := streamStatus?.getD response.status
-                    match Hpack.encodeHeaderBlock state
-                        (Headers.trailers finalStatus response.trailers) with
-                    | .error status => pure (.error status)
-                    | .ok trailerBlock =>
-                        match headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize with
-                        | .error status => pure (.error status)
-                        | .ok trailerFrames =>
-                            match ← emitFrames emit trailerFrames with
-                            | .error status => pure (.error status)
-                            | .ok () => pure (.ok trailerBlock.2)
+                    finishStreamAfterTerminalFrames response.messages streamStatus? <| do
+                      match Hpack.encodeHeaderBlock state
+                          (Headers.trailers finalStatus response.trailers) with
+                      | .error status => pure (.error status)
+                      | .ok trailerBlock =>
+                          match headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize with
+                          | .error status => pure (.error status)
+                          | .ok trailerFrames =>
+                              match ← emitFrames emit trailerFrames with
+                              | .error status => pure (.error status)
+                              | .ok () => pure (.ok trailerBlock.2)
+
+/-- The managed transport already retains each deadline-controlled receive.
+For a timed standalone encoder, move that same ownership boundary out around
+the whole encode operation: the receive race may report expiry promptly, while
+this exact outer task keeps its child until terminal frames and stream cleanup
+have run.  Normal receives unregister before the next recursive receive, so a
+second registration is an invariant violation rather than an ownership
+overwrite. -/
+def encodeServerStreamingStreamResponseFramesWithAsync (state : Hpack.State) (streamId : Nat)
+    (response : ServerStreamingStreamResponse)
+    (emit : Array Frame -> IO Unit)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false)
+    (deadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status Hpack.State) := do
+  match runtime?, deadline with
+  | some runtime, _ =>
+      encodeServerStreamingStreamResponseFramesWithAsyncImpl state streamId response emit
+        maxDataFrameSize gzip deadline (some runtime)
+  | none, none =>
+      encodeServerStreamingStreamResponseFramesWithAsyncImpl state streamId response emit
+        maxDataFrameSize gzip none none
+  | none, some deadline =>
+      let childOwned ←
+        IO.mkRef (none : Option (Nat × Std.Async.Async Unit × IO Unit))
+      let nextChildId ← IO.mkRef 0
+      let localRuntime : DeadlineRuntime := {
+        externalTimer := false,
+        registerTask := fun _childDeadline _cancel _expire join => do
+          let id ← nextChildId.modifyGet fun next => (next, next + 1)
+          let release : IO Unit := childOwned.modify fun child? =>
+            match child? with
+            | some (registeredId, _, _) =>
+                if registeredId == id then none else child?
+            | none => none
+          let installed ← childOwned.modifyGet fun child? =>
+            match child? with
+            | none => (true, some (id, join, release))
+            | some _ => (false, child?)
+          if installed then
+            pure release
+          else
+            throw (IO.userError
+              "standalone streaming encoder registered overlapping deadline children")
+      }
+      let encoded : Except IO.Error (Except Status Hpack.State) ← try
+        pure (Except.ok (← encodeServerStreamingStreamResponseFramesWithAsyncImpl
+          state streamId response emit maxDataFrameSize gzip
+          (some deadline) (some localRuntime)))
+      catch error =>
+        -- An unexpected encoder failure still cannot orphan its exact receive.
+        -- Give the stream its normal cleanup signal before joining that child.
+        try
+          discard <| response.messages.cancel.run
+        catch _ =>
+          pure ()
+        pure (Except.error error)
+      match ← childOwned.get with
+      | none => pure ()
+      | some (_, join, release) =>
+          try
+            join
+          catch _ =>
+            pure ()
+          release
+      match encoded with
+      | Except.ok result => pure result
+      | Except.error error => throw error
+
+def encodeServerStreamingStreamResponseFramesWith (state : Hpack.State) (streamId : Nat)
+    (response : ServerStreamingStreamResponse)
+    (emit : Array Frame -> IO Unit)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    IO (Except Status Hpack.State) :=
+  Std.Async.Async.block <|
+    encodeServerStreamingStreamResponseFramesWithAsync
+      state streamId response emit maxDataFrameSize gzip
 
 def encodeServerStreamingStreamResponseFrames (state : Hpack.State) (streamId : Nat)
     (response : ServerStreamingStreamResponse)
@@ -543,12 +694,12 @@ def encodeServerStreamingStreamResponseFrames (state : Hpack.State) (streamId : 
   | .error status => pure (.error status)
   | .ok state => pure (.ok (← framesRef.get, state))
 
-def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.State)
+def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : Hpack.State)
     (request : UnaryRequestFrames) (emit : Array Frame -> IO Unit)
     (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
-    (onResponseStream : MessageStream ByteArray -> IO Unit := fun _ => pure ())
-    (enableGzip : Bool := true) :
-    IO (Except Status UnaryDispatchStateResult) := do
+    (onResponseStream : MessageStream ByteArray -> IO (MessageStream ByteArray) := pure)
+    (enableGzip : Bool := true) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryDispatchStateResult) := do
   let gzip := enableGzip && Headers.clientAcceptsGzip request.metadata
   let finish (outboundHpack : Hpack.State) : UnaryDispatchStateResult := {
     inboundHpack := request.hpack,
@@ -568,64 +719,77 @@ def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.
         match ← emitFrames emit encoded.1 with
         | .error status => pure (.error status)
         | .ok () => pure (.ok (finish encoded.2))
-  let encodeStreaming (response : ServerStreamingStreamResponse) :
-      IO (Except Status UnaryDispatchStateResult) := do
-    try
+  let encodeStreaming (response : ServerStreamingStreamResponse) (deadline : Option Nat) :
+      Std.Async.Async (Except Status UnaryDispatchStateResult) := do
+    let messages ← try
       onResponseStream response.messages
     catch err =>
       return .error (Status.ofIOError err)
-    match ← encodeServerStreamingStreamResponseFramesWith
-        outboundHpack request.streamId response emit maxDataFrameSize gzip with
+    let response := { response with messages := messages }
+    match ← encodeServerStreamingStreamResponseFramesWithAsync
+        outboundHpack request.streamId response emit maxDataFrameSize gzip deadline runtime? with
     | .error status => pure (.error status)
     | .ok outboundHpack => pure (.ok (finish outboundHpack))
   let emptyStreamingResponse (status : Status) : ServerStreamingStreamResponse := {
     messages := { recv? := pure none },
     status := status
   }
-  match Metadata.validate request.metadata with
-  | .error status =>
-      encodeUnary { status := status, data := ByteArray.empty }
-  | .ok () =>
-    match unsupportedContentType? request.metadata with
-    | some _ => encodeHttpStatus "415"
-    | none =>
+  let decompressBody : Except Status ByteArray := do
+    let usesGzip ← Headers.requestUsesGzip request.metadata
+    Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
+  let runEntry (entry : MethodEntry) :
+      Std.Async.Async (Except Status UnaryDispatchStateResult) := do
+    match decompressBody with
+    | .error status => encodeUnary { status := status, data := ByteArray.empty }
+    | .ok body =>
+      match entry.dispatchHandler with
+      | .unary handler =>
+          match (← registry.dispatchUnaryAsync
+              request.metadata body (some handler) request.deadline runtime?) with
+          | .ok response => encodeUnary response
+          | .error status =>
+              encodeUnary { status := status, data := ByteArray.empty }
+      | .serverStreaming handler =>
+          match (← registry.dispatchServerStreamingStreamAsync
+              request.metadata body (some handler) request.deadline runtime?) with
+          | .ok (response, deadline) => encodeStreaming response deadline
+          | .error status =>
+              -- The handler deadline race may still own a cancelled child in
+              -- `runtime?`.  This synthetic empty stream only renders the
+              -- already-selected terminal status; starting another race at
+              -- the expired instant would overwrite the original join handle.
+              encodeStreaming (emptyStreamingResponse status) none
+      | .clientStreaming handler =>
+          match (← registry.dispatchClientStreamingAsync
+              request.metadata body (some handler) request.deadline runtime?) with
+          | .ok response => encodeUnary response
+          | .error status =>
+              encodeUnary { status := status, data := ByteArray.empty }
+      | .bidirectionalStreaming handler =>
+          match (← registry.dispatchBidirectionalStreamingStreamAsync
+              request.metadata body (some handler) request.deadline runtime?) with
+          | .ok (response, deadline) => encodeStreaming response deadline
+          | .error status =>
+              encodeStreaming (emptyStreamingResponse status) none
+  -- A retained entry is a capability produced only after the managed
+  -- connection validated and authorized END_HEADERS.  Repeating the complete
+  -- validation here reparses grpc-timeout on every timed call and cannot
+  -- change the decision.  Standalone decoded requests carry `none` and retain
+  -- the original validation and HTTP 415 precedence below.
+  match request.authorizedEntry? with
+  | some entry => runEntry entry
+  | none =>
+    match Metadata.validate request.metadata with
+    | .error status =>
+        encodeUnary { status := status, data := ByteArray.empty }
+    | .ok () =>
+      match unsupportedContentType? request.metadata with
+      | some _ => encodeHttpStatus "415"
+      | none =>
         match Headers.validateUnaryRequestHeaders request.metadata with
         | .error status =>
             encodeUnary { status := status, data := ByteArray.empty }
         | .ok method =>
-          let decompressBody : Except Status ByteArray := do
-            let usesGzip ← Headers.requestUsesGzip request.metadata
-            Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
-          let runEntry (entry : MethodEntry) : IO (Except Status UnaryDispatchStateResult) := do
-            match decompressBody with
-            | .error status => encodeUnary { status := status, data := ByteArray.empty }
-            | .ok body =>
-              match entry.dispatchHandler with
-              | .unary handler =>
-                  match (← (registry.dispatchUnary
-                      request.metadata body (some handler)).run) with
-                  | .ok response => encodeUnary response
-                  | .error status =>
-                      encodeUnary { status := status, data := ByteArray.empty }
-              | .serverStreaming handler =>
-                  match (← (registry.dispatchServerStreamingStream
-                      request.metadata body (some handler)).run) with
-                  | .ok response => encodeStreaming response
-                  | .error status => encodeStreaming (emptyStreamingResponse status)
-              | .clientStreaming handler =>
-                  match (← (registry.dispatchClientStreaming
-                      request.metadata body (some handler)).run) with
-                  | .ok response => encodeUnary response
-                  | .error status =>
-                      encodeUnary { status := status, data := ByteArray.empty }
-              | .bidirectionalStreaming handler =>
-                  match (← (registry.dispatchBidirectionalStreamingStream
-                      request.metadata body (some handler)).run) with
-                  | .ok response => encodeStreaming response
-                  | .error status => encodeStreaming (emptyStreamingResponse status)
-          match request.authorizedEntry? with
-          | some entry => runEntry entry
-          | none =>
             match registry.findEntry? method with
             | none =>
                 match decompressBody with
@@ -637,12 +801,21 @@ def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.
                       data := ByteArray.empty
                     }
             | some entry =>
-              match ← (registry.authorizeRequestHeaders entry request.metadata).run with
+              match ← authorizeEntryUntil registry entry request.metadata request.deadline with
               | .error status =>
                   encodeUnary { status := status, data := ByteArray.empty }
               | .ok (.reject status) =>
                   encodeUnary { status := status, data := ByteArray.empty }
               | .ok (.accept handler) => runEntry { entry with handler := handler }
+
+def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.State)
+    (request : UnaryRequestFrames) (emit : Array Frame -> IO Unit)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
+    (onResponseStream : MessageStream ByteArray -> IO Unit := fun _ => pure ())
+    (enableGzip : Bool := true) : IO (Except Status UnaryDispatchStateResult) :=
+  Std.Async.Async.block <|
+    dispatchDecodedUnaryFramesWithAsync registry outboundHpack request emit
+      maxDataFrameSize (fun stream => do onResponseStream stream; pure stream) enableGzip
 
 def dispatchUnaryFramesWith (registry : Registry) (inboundHpack outboundHpack : Hpack.State)
     (frames : Array Frame) (emit : Array Frame -> IO Unit)

@@ -351,6 +351,24 @@ def setMaxAllowedSize (state : State) (maxSize : Nat) : State :=
   let pending := if maxSize != state.maxSize then some maxSize else state.pendingSizeUpdate
   { (resize state maxSize) with maxAllowedSize := maxSize, pendingSizeUpdate := pending }
 
+/-- Disable the encoder dynamic table while retaining the peer-advertised
+upper bound.  A pending size update of zero makes the choice explicit to the
+decoder.  With a zero-sized table every encoded field is independent of prior
+response blocks, which is the safe mode for concurrently completing HTTP/2
+streams without serializing their handlers. -/
+def withoutDynamicTable (state : State := {}) : State :=
+  {
+    state with
+    dynamic := #[],
+    maxSize := 0,
+    pendingSizeUpdate := if state.maxSize == 0 then state.pendingSizeUpdate else some 0
+  }
+
+/-- Record a peer's new decoder-table limit while keeping this encoder's
+chosen dynamic-table size at zero. -/
+def setMaxAllowedSizeWithoutDynamicTable (state : State) (maxAllowedSize : Nat) : State :=
+  { (withoutDynamicTable state) with maxAllowedSize := maxAllowedSize }
+
 def resizeChecked (state : State) (maxSize : Nat) : Except Status State := do
   if maxSize > state.maxAllowedSize then
     throw (Status.internal s!"HPACK dynamic table size update exceeds configured maximum {state.maxAllowedSize}")
@@ -880,6 +898,23 @@ theorem maxSize_setMaxAllowedSize (state : State) (maxSize : Nat) :
 theorem dynamicSize_setMaxAllowedSize_le (state : State) (maxSize : Nat) :
     dynamicSize (setMaxAllowedSize state maxSize).dynamic ≤ maxSize :=
   dynamicSize_resize_le state maxSize
+
+theorem maxSize_withoutDynamicTable (state : State) :
+    (withoutDynamicTable state).maxSize = 0 := by
+  rfl
+
+theorem dynamicSize_withoutDynamicTable (state : State) :
+    dynamicSize (withoutDynamicTable state).dynamic = 0 := by
+  simp [withoutDynamicTable, dynamicSize_empty]
+
+theorem maxSize_setMaxAllowedSizeWithoutDynamicTable (state : State) (maxAllowedSize : Nat) :
+    (setMaxAllowedSizeWithoutDynamicTable state maxAllowedSize).maxSize = 0 := by
+  rfl
+
+theorem dynamicSize_setMaxAllowedSizeWithoutDynamicTable
+    (state : State) (maxAllowedSize : Nat) :
+    dynamicSize (setMaxAllowedSizeWithoutDynamicTable state maxAllowedSize).dynamic ≤ 0 := by
+  simp [setMaxAllowedSizeWithoutDynamicTable, withoutDynamicTable, dynamicSize_empty]
 
 /-!
 #### Huffman table prefix-freeness

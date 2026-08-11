@@ -33,8 +33,8 @@ flowchart TB
 | Area | Status |
 | --- | --- |
 | RPC shapes | Unary, server-streaming, client-streaming, bidirectional — each in a batched (`Array`) and an incremental `MessageStream` variant, with raw-`ByteArray` and typed-codec registration (`registerUnary` … `registerBidirectionalStreamingStreamCodec`) |
-| Deadlines | Server-enforced from `grpc-timeout`: expiry cancels the handler task and returns `DEADLINE_EXCEEDED`. The absolute deadline reaches the handler as `request.deadline` (or `context.deadline` via the `register*CodecWithContext` variants for typed handlers), and `CallOptions.propagating` turns what is left of it into a downstream call's `grpc-timeout` — or `DEADLINE_EXCEEDED` when nothing is left. No default deadline: a request without `grpc-timeout` runs unbounded |
-| Early authorization | `Registry.withRequestHeaderAuthorizer` runs after header validation and **before any request body is accepted**; rejected streams get a trailers-only status while the body is drained without dispatch |
+| Deadlines | Server-enforced from `grpc-timeout`: the absolute instant is captured at END_HEADERS (so authorization and body time consume the budget), expiry cancels the handler/stream task and returns `DEADLINE_EXCEEDED`, and each managed connection multiplexes its active calls onto one independent libuv-backed scheduler without parking a worker. The same instant reaches the handler as `request.deadline` (or `context.deadline` via the `register*CodecWithContext` variants for typed handlers), and `CallOptions.propagating` turns what is left of it into a downstream call's `grpc-timeout` — or `DEADLINE_EXCEEDED` when nothing is left. No default deadline: a request without `grpc-timeout` takes the direct path and runs unbounded |
+| Early authorization | `Registry.withRequestHeaderAuthorizer` runs after header validation and **before any request body is accepted**; its IO is connection-owned, cancellable, deadline-bounded, and runs without the connection-state lock. Rejected streams get a trailers-only status while the body is drained without dispatch |
 | Message limits | Per-registry and per-client send/receive caps (`RESOURCE_EXHAUSTED`); 4 MiB default |
 | Compression | gzip both directions (see below) |
 | Metadata | ASCII + `-bin` base64 binary metadata, full validation (pseudo-header rules, forbidden connection headers, reserved response/trailer names) |
@@ -170,9 +170,11 @@ Implemented and tested:
   advertised 4 MiB initial stream window guarantees one maximum-size message
   always fits. Outbound buffering above 4 MiB fails the RPC with
   `RESOURCE_EXHAUSTED`.
-- HPACK with the full RFC 7541 static table, dynamic table with eviction and
-  size-update handling, Huffman encoding and decoding;
-  `authorization`/`proxy-authorization` are always emitted never-indexed.
+- HPACK with the full RFC 7541 static table, inbound dynamic-table eviction and
+  size-update handling, and Huffman encoding/decoding. Concurrent server
+  responses advertise a zero-sized encoder table, making each response header
+  block independent of stream completion order; `authorization` and
+  `proxy-authorization` are always emitted never-indexed.
 
 Unsupported or intentionally ignored:
 

@@ -995,6 +995,121 @@ def testDeadlineExceededDispatch : IO Unit := do
   expectEq chatStatus.code Code.deadlineExceeded
     "bidirectional-streaming handlers should respect grpc-timeout deadlines"
 
+/-- Timed async dispatch must suspend on its promise instead of occupying the
+worker that its handler needs.  A batch larger than the default worker pool
+therefore completes under one shared observation budget, far ahead of its wire
+deadline. -/
+def testConcurrentAsyncDeadlineDispatch : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let registry := Registry.empty.registerUnary method fun request => do
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let payload := bytes [1, 2, 3]
+  let body ← expectStatusOk (Message.encode { data := payload })
+  let metadata := requestHeaders.insert "grpc-timeout" "30S"
+  let callCount : Nat := 64
+  let mut tasks : Array (Task (Except IO.Error (Except Status UnaryResponse))) := #[]
+  for _ in [0:callCount] do
+    tasks := tasks.push (← Std.Async.Async.toIO (registry.dispatchUnaryAsync metadata body))
+
+  let allFinished : IO Bool := do
+    let mut finished := true
+    for task in tasks do
+      unless ← IO.hasFinished task do
+        finished := false
+    pure finished
+  try
+    waitUntil
+      s!"{callCount} immediate timed async dispatches did not complete without worker starvation"
+      observeTimeoutMs allFinished
+  catch error =>
+    for task in tasks do
+      IO.cancel task
+    throw error
+
+  for task in tasks do
+    let response ← expectStatusOk (← awaitIoTask task)
+    expectEq response.data payload
+      "concurrent timed async dispatch should preserve the unary response"
+
+/-- Scheduler shutdown is a terminal state transition: every registration
+already owned by the scheduler is failed exactly once, and no registration
+accepted after shutdown can be left waiting for a timer that no longer runs. -/
+def testDeadlineSchedulerShutdown : IO Unit := do
+  let scheduler ← Http2.Connection.DeadlineScheduler.new
+  let expiredCount ← IO.mkRef 0
+  let liveFailureCount ← IO.mkRef 0
+  let futureFailureCount ← IO.mkRef 0
+  let deadline := (← IO.monoNanosNow) + 60000000000
+  let expire : IO Unit := expiredCount.modify fun count => count + 1
+  let failLive : IO Unit := liveFailureCount.modify fun count => count + 1
+
+  let unregisterFirst ← scheduler.register deadline expire failLive
+  let unregisterSecond ← scheduler.register (deadline + 1) expire failLive
+  Std.Async.Async.block scheduler.shutdown
+
+  expectEq (← liveFailureCount.get) 2
+    "scheduler shutdown should fail every live registration exactly once"
+  expectEq (← expiredCount.get) 0
+    "scheduler shutdown must not report live registrations as expired"
+
+  -- Releases remain safe after shutdown has already removed their entries.
+  unregisterFirst
+  unregisterFirst
+  unregisterSecond
+  unregisterSecond
+  expectEq (← liveFailureCount.get) 2
+    "idempotent unregister should not repeat shutdown failure callbacks"
+
+  let failFuture : IO Unit := futureFailureCount.modify fun count => count + 1
+  let unregisterFuture ← scheduler.register (deadline + 2) expire failFuture
+  expectEq (← futureFailureCount.get) 1
+    "registration after shutdown should fail synchronously"
+  expectEq (← expiredCount.get) 0
+    "registration after shutdown must not invoke its expiry callback"
+  unregisterFuture
+  unregisterFuture
+  expectEq (← futureFailureCount.get) 1
+    "post-shutdown unregister should remain idempotent"
+
+/-- An absolute deadline supplied by the transport is authoritative.  If it
+has already elapsed, dispatch rejects the call before scheduling the handler. -/
+def testExpiredInjectedDeadlineSkipsHandler : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let invoked ← IO.mkRef false
+  let registry := Registry.empty.registerUnary method fun request => do
+    invoked.set true
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let body ← expectStatusOk (Message.encode { data := bytes [4, 5, 6] })
+  let result ← (registry.dispatchUnaryAsync
+    (requestHeaders.insert "grpc-timeout" "30S") body (headerDeadline := some 0)).block
+  let status ← expectStatusError result
+  expectEq status.code Code.deadlineExceeded
+    "an already-expired injected deadline should return DEADLINE_EXCEEDED"
+  expect (!(← invoked.get))
+    "an already-expired injected deadline must not invoke the handler"
+
+/-- Header decoding supplies one absolute instant.  Dispatch must hand that
+exact value to the handler rather than restarting the metadata duration. -/
+def testInjectedHeaderDeadlinePreserved : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let seenDeadline ← IO.mkRef (none : Option (Option Nat))
+  let registry := Registry.empty.registerUnary method fun request => do
+    seenDeadline.set (some request.deadline)
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let body ← expectStatusOk (Message.encode { data := bytes [7, 8, 9] })
+  let now ← IO.monoNanosNow
+  let injectedDeadline := now + 60000000000
+  -- Deliberately disagree with the one-hour metadata duration: equality with
+  -- this injected instant proves dispatch did not recompute the deadline.
+  let result ← (registry.dispatchUnaryAsync
+    (requestHeaders.insert "grpc-timeout" "1H") body
+    (headerDeadline := some injectedDeadline)).block
+  let response ← expectStatusOk result
+  expectEq response.data (bytes [7, 8, 9])
+    "a live injected deadline should allow an immediate handler to complete"
+  expectEq (← seenDeadline.get) (some (some injectedDeadline))
+    "the handler should see the exact header-time absolute deadline"
+
 def testHandlerExceptionDispatch : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
   let registry := Registry.empty.registerUnary method fun _request => do
@@ -1721,10 +1836,21 @@ def testStreamNativeServerStreamingHttp2Transport : IO Unit := do
 
 def testServerStreamingHttp2SendMessageSizeLimitTransport : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "LimitedStreamList" }
-  let registry := (Registry.empty.withMaxSendMessageSize 2).registerServerStreaming method fun request => do
+  let cancelCount ← IO.mkRef 0
+  let registry :=
+    (Registry.empty.withMaxSendMessageSize 2).registerServerStreamingStream method fun request => do
+    let sent ← IO.mkRef false
     pure {
       metadata := Metadata.empty.insert "handled-by" "stream-size-limit",
-      messages := #[request.data],
+      messages := {
+        recv? := do
+          if ← sent.get then
+            pure none
+          else
+            sent.set true
+            pure (some request.data),
+        cancel := cancelCount.modify fun count => count + 1
+      },
       status := Status.ok
     }
 
@@ -1773,6 +1899,8 @@ def testServerStreamingHttp2SendMessageSizeLimitTransport : IO Unit := do
     responseFrames.frames[1]!.payload)
   expectEq (Metadata.get? responseTrailers.headers "grpc-status") (some "8")
     "oversized streaming response should return RESOURCE_EXHAUSTED trailers"
+  expectEq (← cancelCount.get) 1
+    "oversized streaming response should cancel its remaining message stream"
 
 def testStreamingEncoderEmitsBeforeStreamEnd : IO Unit := do
   let producer ← runGrpcM (MessageStream.pipe (α := ByteArray) (capacity := some 1))
@@ -1822,6 +1950,149 @@ def testStreamingEncoderEmitsBeforeStreamEnd : IO Unit := do
     "streaming encoder should preserve initial metadata"
   expectEq (Metadata.get? responseTrailers.headers "grpc-status") (some "0")
     "streaming encoder should emit OK trailers after producer close"
+
+/-- A deadline must become observable on the wire before response-stream
+cleanup enters arbitrary user IO.  The encoder task remains the exact owner of
+that cleanup, so this test can hold `cancel` at a gate and observe both sides of
+the sequencing boundary without allowing detached work. -/
+def testStreamingDeadlineTrailersPrecedeBlockingCancel : IO Unit := do
+  let recvCancelled ← IO.mkRef false
+  let cancelStarted ← IO.mkRef false
+  let cancelCount ← IO.mkRef 0
+  let releaseCancel ← IO.mkRef false
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let response : ServerStreamingStreamResponse := {
+    messages := {
+      recv? := cancelledRecvLoop recvCancelled,
+      cancel := do
+        cancelCount.modify fun count => count + 1
+        cancelStarted.set true
+        while !(← releaseCancel.get) do
+          IO.sleep 1
+    },
+    status := Status.ok
+  }
+  let deadline := (← IO.monoNanosNow) + 25000000
+  let encodeTask ← IO.asTask do
+    Std.Async.Async.block <|
+      Http2.Transport.encodeServerStreamingStreamResponseFramesWithAsync
+        {} 1 response (fun frames => emittedRef.modify fun emitted => emitted.append frames)
+        (deadline := some deadline)
+
+  -- Record failures instead of throwing while the callback owns the gate: the
+  -- release below must run even when this invariant regresses.
+  let cancelObserved ← try
+    waitUntil "deadline did not enter response-stream cleanup" observeTimeoutMs
+      cancelStarted.get
+    pure true
+  catch _ =>
+    pure false
+  let emittedWhileCancelBlocked ← emittedRef.get
+  let trailersBeforeCancelReturned := emittedWhileCancelBlocked.any fun frame =>
+    frame.header.frameType == Http2.FrameType.headers
+      && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let cleanupStillOwned := !(← IO.hasFinished encodeTask)
+  releaseCancel.set true
+  let _finalState ← expectStatusOk (← awaitIoTask encodeTask)
+
+  expect cancelObserved
+    "deadline expiry should invoke response-stream cleanup"
+  expect trailersBeforeCancelReturned
+    "blocking response-stream cleanup must not delay terminal deadline trailers"
+  expect cleanupStillOwned
+    "the encoder owner should remain active until response-stream cleanup returns"
+  expectEq (← cancelCount.get) 1
+    "deadline cleanup should invoke the response-stream cancel callback exactly once"
+  let emitted ← emittedRef.get
+  expect (!emitted.any fun frame => frame.header.frameType == Http2.FrameType.data)
+    "a response stream that expires before its first item must emit no DATA"
+  let trailers ← decodeLastServerHeaderBlock emitted
+    "deadline-expired response stream should emit terminal trailers"
+  expectEq (Metadata.get? trailers.headers "grpc-status")
+    (some Code.deadlineExceeded.toHeaderValue)
+    "deadline-expired response stream should encode DEADLINE_EXCEEDED"
+
+/-- A standalone encoder has no managed connection to retain its current
+receive.  It must still publish deadline trailers and invoke stream cleanup
+before joining an uncooperative receive, while keeping that receive beneath the
+encoder task until it actually exits. -/
+def testStandaloneStreamingDeadlineRetainsUncooperativeReceive : IO Unit := do
+  let firstMessage := bytes [8, 13, 21]
+  let firstSent ← IO.mkRef false
+  let recvStarted ← IO.mkRef false
+  let recvFinished ← IO.mkRef false
+  let releaseRecv ← IO.mkRef false
+  let cancelStarted ← IO.mkRef false
+  let cancelWhileRecvLive ← IO.mkRef false
+  let cancelCount ← IO.mkRef 0
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let response : ServerStreamingStreamResponse := {
+    messages := {
+      recv? := do
+        if !(← firstSent.get) then
+          firstSent.set true
+          pure (some firstMessage)
+        else
+          recvStarted.set true
+          while !(← releaseRecv.get) do
+            IO.sleep 1
+          recvFinished.set true
+          pure none,
+      cancel := do
+        cancelCount.modify fun count => count + 1
+        let started ← recvStarted.get
+        let finished ← recvFinished.get
+        cancelWhileRecvLive.set (started && !finished)
+        cancelStarted.set true
+    },
+    status := Status.ok
+  }
+  let deadline := (← IO.monoNanosNow) + 100000000
+  let encodeTask ← IO.asTask do
+    Std.Async.Async.block <|
+      Http2.Transport.encodeServerStreamingStreamResponseFramesWithAsync
+        {} 1 response (fun frames => emittedRef.modify fun emitted => emitted.append frames)
+        (deadline := some deadline)
+
+  -- Always release the receive before asserting so a failed ordering invariant
+  -- cannot leave the standalone owner parked in this test process.
+  let cancelObserved ← try
+    waitUntil "standalone deadline did not invoke response-stream cleanup"
+      observeTimeoutMs cancelStarted.get
+    pure true
+  catch _ =>
+    pure false
+  let emittedWhileRecvBlocked ← emittedRef.get
+  let trailersBeforeRecvReleased := emittedWhileRecvBlocked.any fun frame =>
+    frame.header.frameType == Http2.FrameType.headers
+      && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let encoderStillOwnsRecv := !(← IO.hasFinished encodeTask)
+  releaseRecv.set true
+  let _finalState ← expectStatusOk (← awaitIoTask encodeTask)
+
+  expect cancelObserved
+    "standalone deadline should run stream cleanup before joining its receive"
+  expect trailersBeforeRecvReleased
+    "standalone deadline trailers must precede the uncooperative receive join"
+  expect encoderStillOwnsRecv
+    "standalone encoder must remain live while its retained receive is live"
+  expect (← cancelWhileRecvLive.get)
+    "stream cleanup should run before the retained receive finishes"
+  expect (← recvFinished.get)
+    "standalone encoder must join its retained receive before returning"
+  expectEq (← cancelCount.get) 1
+    "standalone deadline cleanup should invoke stream cancel exactly once"
+  let emitted ← emittedRef.get
+  let responseMessages ← expectStatusOk (Message.decodeAll (dataPayloads emitted))
+  expectEq responseMessages.size 1
+    "standalone timed stream should emit its one pre-deadline message"
+  expectEq responseMessages[0]!.data firstMessage
+    "standalone timed stream should preserve its pre-deadline message"
+  let trailers ← decodeLastServerHeaderBlock emitted
+    "standalone expired response stream should emit terminal trailers"
+  expectEq (Metadata.get? trailers.headers "grpc-status")
+    (some Code.deadlineExceeded.toHeaderValue)
+    "standalone expired response stream should encode DEADLINE_EXCEEDED"
 
 def testStreamingDispatchEmitsBeforeStreamEnd : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "StreamDispatch" }
@@ -4627,6 +4898,137 @@ def testHttp2ServeManagedLifecycle : IO Unit := do
   expectWriteSideClosed client "managed h2c server did not close its write side after wait"
   (client.shutdown).block
 
+/-- A managed connection owns the deadline from END_HEADERS onward.  A unary
+peer that never sends its body must still receive DEADLINE_EXCEEDED, after
+which the remote half can drain and the connection can serve another stream. -/
+def testHttp2H2CServerExpiresIncompleteUnaryBody : IO Unit := do
+  let method : MethodName := { service := "lean.example.proto.NoteService", method := "Echo" }
+  let handled ← IO.mkRef (none : Option ByteArray)
+  let registry := Registry.empty.registerUnary method fun request => do
+    handled.set (some request.data)
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let clientSettings ← expectStatusOk (Http2.Settings.frame #[])
+  let clientSettingsWire ← expectStatusOk (Http2.Frame.encode clientSettings)
+  let timedHeaders := (requestHeadersForPath "/lean.example.proto.NoteService/Echo")
+    |>.insert "grpc-timeout" "100m"
+  let timedBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+  let timedHeadersFrame : Http2.Frame := {
+    header := {
+      length := timedBlock.1.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.endHeaders,
+      streamId := 1
+    },
+    payload := timedBlock.1
+  }
+  let timedHeadersWire ← expectStatusOk (Http2.Frame.encode timedHeadersFrame)
+  (client.send (Http2.connectionPreface
+    |>.append clientSettingsWire
+    |>.append timedHeadersWire)).block
+
+  let hasDeadlineTrailers (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == 1
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let afterDeadline ← readHttp2FramesUntilWithTimeout client {} hasDeadlineTrailers
+    observeTimeoutMs "managed h2c server waited for a unary body after its deadline"
+  let stream1Frames := afterDeadline.frames.filter fun frame => frame.header.streamId == 1
+  expectEq stream1Frames.size 1
+    "an incomplete timed-out unary request should receive one trailers-only frame"
+  expectEq stream1Frames[0]!.header.frameType Http2.FrameType.headers
+    "an incomplete timed-out unary request should receive HEADERS"
+  expect (Http2.FrameFlag.has stream1Frames[0]!.header.flags Http2.FrameFlag.endHeaders)
+    "deadline trailers should complete their header block"
+  expect (Http2.FrameFlag.has stream1Frames[0]!.header.flags Http2.FrameFlag.endStream)
+    "deadline trailers should close the server response half"
+  expect (!afterDeadline.frames.any fun frame =>
+      frame.header.streamId == 1 && frame.header.frameType == Http2.FrameType.data)
+    "an incomplete timed-out unary request must not receive response DATA"
+  let deadlineTrailers ← decodeLastServerHeaderBlock afterDeadline.frames
+    "expected trailers-only response for incomplete timed-out unary request"
+  expectEq (Metadata.get? deadlineTrailers.headers "grpc-status")
+    (some Code.deadlineExceeded.toHeaderValue)
+    "an incomplete timed-out unary request should return DEADLINE_EXCEEDED"
+  expectEq (← handled.get) none
+    "an incomplete timed-out unary request must not invoke its handler"
+
+  -- End the expired request's remote half, then prove the same connection still
+  -- accepts and completes a fresh stream using the threaded client HPACK state.
+  let drainFrame : Http2.Frame := {
+    header := {
+      length := 0,
+      frameType := Http2.FrameType.data,
+      flags := Http2.FrameFlag.endStream,
+      streamId := 1
+    },
+    payload := ByteArray.empty
+  }
+  let normalBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock timedBlock.2
+    (requestHeadersForPath "/lean.example.proto.NoteService/Echo"))
+  let normalHeadersFrame : Http2.Frame := {
+    header := {
+      length := normalBlock.1.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.endHeaders,
+      streamId := 3
+    },
+    payload := normalBlock.1
+  }
+  let requestData := bytes [21, 34, 55]
+  let requestBody ← expectStatusOk (Message.encode { data := requestData })
+  let normalDataFrame : Http2.Frame := {
+    header := {
+      length := requestBody.size,
+      frameType := Http2.FrameType.data,
+      flags := Http2.FrameFlag.endStream,
+      streamId := 3
+    },
+    payload := requestBody
+  }
+  let drainWire ← expectStatusOk (Http2.Frame.encode drainFrame)
+  let normalHeadersWire ← expectStatusOk (Http2.Frame.encode normalHeadersFrame)
+  let normalDataWire ← expectStatusOk (Http2.Frame.encode normalDataFrame)
+  (client.send (drainWire.append normalHeadersWire |>.append normalDataWire)).block
+
+  let hasStream3Trailers (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == 3
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let afterRecovery ← readHttp2FramesUntilWithTimeout client afterDeadline hasStream3Trailers
+    observeTimeoutMs "managed h2c connection did not recover after expiring an incomplete unary body"
+  let stream3Data := afterRecovery.frames.filter fun frame =>
+    frame.header.streamId == 3 && frame.header.frameType == Http2.FrameType.data
+  let responseMessages ← expectStatusOk (Message.decodeAll (dataPayloads stream3Data))
+  expectEq responseMessages.size 1
+    "the recovered managed h2c request should return one message"
+  expectEq responseMessages[0]!.data requestData
+    "the recovered managed h2c request should echo its payload"
+  expectEq (← handled.get) (some requestData)
+    "only the post-deadline recovery request should invoke the handler"
+
+  Grpc.Server.shutdown server
+  let hasGoAway (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway
+  discard <| readHttp2FramesUntilWithTimeout client afterRecovery hasGoAway observeTimeoutMs
+    "managed h2c server did not begin graceful shutdown after deadline drain"
+  let waitTask ← IO.asTask (Grpc.Server.wait server)
+  match ← awaitTaskWithin waitTask observeTimeoutMs with
+  | some _ => pure ()
+  | none =>
+      IO.cancel waitTask
+      throw (IO.userError "managed h2c server did not drain after incomplete deadline recovery")
+  expectWriteSideClosed client
+    "managed h2c server did not close after draining the expired request"
+  (client.shutdown).block
+
 def testHttp2H2CServerReadsWhileStreamOpen : IO Unit := do
   let method : MethodName := { service := "lean.example.proto.NoteService", method := "OpenStream" }
   let producerRef ← IO.mkRef (none : Option (MessageStream.Producer ByteArray))
@@ -4908,6 +5310,94 @@ def testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream : IO Unit := do
   let allMessages ← expectStatusOk (Message.decodeAll (dataPayloads finalState.frames))
   expect (allMessages.any fun message => message.data == bytes [3, 4, 7])
     "h2c bidi stream should transform the final request message"
+
+  (client.shutdown).block
+  awaitIoTask serverTask
+
+/-- Completing a bidi response does not mean its terminal frames reached the
+wire: DATA and trailers may still sit behind the peer's stream window.  The
+dispatch must leave that outbound state owned by the connection until a later
+WINDOW_UPDATE flushes END_STREAM. -/
+def testHttp2H2CCompletedBidirectionalFlushesPendingTerminalOnWindowUpdate : IO Unit := do
+  let method : MethodName := {
+    service := "lean.example.proto.NoteService",
+    method := "FlowControlledChat"
+  }
+  let responseData := bytes [9, 8, 7, 6]
+  let registry := Registry.empty.registerBidirectionalStreamingStream method fun _request => do
+    let messages ← MessageStream.ofArray #[responseData]
+    pure {
+      metadata := Metadata.empty.insert "handled-by" "h2c-flow-bidi",
+      messages := messages,
+      status := Status.ok
+    }
+
+  let server ← Grpc.Server.bind { address := Grpc.Server.loopback 0 }
+  let serverTask ← Std.Async.Async.toIO (Grpc.Server.acceptOne server registry)
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let clientSettings ← expectStatusOk (Http2.Settings.frame #[
+    { id := Http2.SettingId.initialWindowSize, value := 0 }
+  ])
+  let clientSettingsWire ← expectStatusOk (Http2.Frame.encode clientSettings)
+  let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {}
+    (requestHeadersForPath "/lean.example.proto.NoteService/FlowControlledChat"))
+  let requestHeadersFrame : Http2.Frame := {
+    header := {
+      length := encodedHeaders.1.size,
+      frameType := Http2.FrameType.headers,
+      flags := Http2.FrameFlag.combine #[
+        Http2.FrameFlag.endHeaders,
+        Http2.FrameFlag.endStream
+      ],
+      streamId := 1
+    },
+    payload := encodedHeaders.1
+  }
+  let requestHeadersWire ← expectStatusOk (Http2.Frame.encode requestHeadersFrame)
+  (client.send (Http2.connectionPreface
+    |>.append clientSettingsWire
+    |>.append requestHeadersWire)).block
+
+  let hasInitialResponseHeaders (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == 1
+        && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let beforeWindow ← readHttp2FramesUntilWithTimeout client {} hasInitialResponseHeaders
+    observeTimeoutMs "completed h2c bidi response did not emit initial headers"
+  expect (!beforeWindow.frames.any fun frame =>
+      frame.header.streamId == 1 && frame.header.frameType == Http2.FrameType.data)
+    "zero peer stream window must keep completed bidi response DATA pending"
+  expect (!beforeWindow.frames.any fun frame =>
+      frame.header.streamId == 1
+        && frame.header.frameType == Http2.FrameType.headers
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream)
+    "trailers must remain ordered behind flow-control-blocked bidi DATA"
+
+  let responseWire ← expectStatusOk (Message.encode { data := responseData })
+  let streamUpdate ← expectStatusOk (Http2.WindowUpdate.frame 1 responseWire.size)
+  let streamUpdateWire ← expectStatusOk (Http2.Frame.encode streamUpdate)
+  (client.send streamUpdateWire).block
+  let hasTrailers (frames : Array Http2.Frame) : Bool :=
+    frames.any fun frame =>
+      frame.header.frameType == Http2.FrameType.headers
+        && frame.header.streamId == 1
+        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+  let afterWindow ← readHttp2FramesUntilWithTimeout client beforeWindow hasTrailers
+    observeTimeoutMs
+    "WINDOW_UPDATE did not flush a completed bidi response's pending terminal frames"
+  let messages ← expectStatusOk (Message.decodeAll (dataPayloads afterWindow.frames))
+  expectEq messages.size 1
+    "completed flow-controlled bidi response should emit exactly one message"
+  expectEq messages[0]!.data responseData
+    "completed flow-controlled bidi response should preserve its pending DATA"
+  let trailers ← decodeLastServerHeaderBlock afterWindow.frames
+    "completed flow-controlled bidi response should emit trailers"
+  expectEq (Metadata.get? trailers.headers "grpc-status") (some "0")
+    "completed flow-controlled bidi response should terminate with OK"
 
   (client.shutdown).block
   awaitIoTask serverTask
@@ -5489,6 +5979,10 @@ def main : IO Unit := do
   testStreamNativeDispatch
   testMessageStreamPipe
   testDeadlineExceededDispatch
+  testConcurrentAsyncDeadlineDispatch
+  testDeadlineSchedulerShutdown
+  testExpiredInjectedDeadlineSkipsHandler
+  testInjectedHeaderDeadlinePreserved
   testHandlerExceptionDispatch
   testResponseMetadataValidationDispatch
   testMessageSizeLimits
@@ -5501,6 +5995,8 @@ def main : IO Unit := do
   testStreamNativeServerStreamingHttp2Transport
   testServerStreamingHttp2SendMessageSizeLimitTransport
   testStreamingEncoderEmitsBeforeStreamEnd
+  testStreamingDeadlineTrailersPrecedeBlockingCancel
+  testStandaloneStreamingDeadlineRetainsUncooperativeReceive
   testStreamingDispatchEmitsBeforeStreamEnd
   testStreamingConnectionEmitsBeforeStreamEnd
   testServerStreamingHttp2StreamErrorTransport
@@ -5541,12 +6037,14 @@ def main : IO Unit := do
   testHttp2Connection
   testHttp2H2CServer
   testHttp2ServeManagedLifecycle
+  testHttp2H2CServerExpiresIncompleteUnaryBody
   testHttp2StreamErrorContainment
   testHttp2PriorityFrameSizeContainment
   testDeadlinePropagation
   testHttp2H2CServerReadsWhileStreamOpen
   testHttp2H2CServerFlushesActiveStreamOnWindowUpdate
   testHttp2H2CServerBidirectionalRespondsBeforeClientEndStream
+  testHttp2H2CCompletedBidirectionalFlushesPendingTerminalOnWindowUpdate
   testHttp2H2CServerCancelsStreamOnRst
   testHttp2H2CServerCancelsStreamOnDisconnect
   testHttp2H2CServerCancelsPipeStreamOnRst

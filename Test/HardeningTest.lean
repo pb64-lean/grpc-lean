@@ -216,6 +216,417 @@ partial def cancellableHandlerLoop : IO (Except Status UnaryResponse) := do
     IO.sleep 5
     cancellableHandlerLoop
 
+partial def observedCancellableHandlerLoop (sawCancellation : IO.Ref Bool) :
+    IO (Except Status UnaryResponse) := do
+  if ← IO.checkCanceled then
+    sawCancellation.set true
+    throw (IO.userError "handler cancelled")
+  else do
+    IO.sleep 5
+    observedCancellableHandlerLoop sawCancellation
+
+partial def awaitTaskFinished (task : Task α) (remainingMilliseconds : Nat) : IO Bool := do
+  if ← IO.hasFinished task then
+    pure true
+  else if remainingMilliseconds == 0 then
+    pure false
+  else
+    IO.sleep 1
+    awaitTaskFinished task (remainingMilliseconds - 1)
+
+partial def awaitFlag (flag : IO.Ref Bool) (remainingMilliseconds : Nat) : IO Bool := do
+  if ← flag.get then
+    pure true
+  else if remainingMilliseconds == 0 then
+    pure false
+  else
+    IO.sleep 1
+    awaitFlag flag (remainingMilliseconds - 1)
+
+/-- Detaching a complete request and publishing its gated handler are separate
+mutex transitions.  Once GOAWAY is active, the state between them must remain
+non-drained; otherwise the server can elect connection shutdown in the gap and
+cancel a request whose stream id it promised to finish. -/
+def testPendingDispatchPublicationPreventsFalseDrain : IO Unit := do
+  let handlerStarted ← IO.mkRef false
+  let registry := Registry.empty.registerUnary echoMethod fun request => do
+    handlerStarted.set true
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let headerBlock ← encodedRequestHeaderBlock
+  let headersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders 1 headerBlock
+  let dataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream 1
+    (grpcMessageBytes (repeatByte 3 7))
+  let stateMutex ← Std.Mutex.new ({
+    prefaceReceived := true,
+    clientSettingsReceived := true,
+    outboundGoAwayLastStreamId := some 1
+  } : Http2.Connection.State)
+  let emissionEntered ← IO.mkRef false
+  let releaseEmission ← IO.mkRef false
+  let emit (_frames : Array Http2.Frame) : IO Unit := do
+    unless ← emissionEntered.get do
+      emissionEntered.set true
+      while !(← releaseEmission.get) do
+        IO.sleep 1
+  let processing ← IO.asTask <|
+    Http2.Connection.processBytesSharedWith registry stateMutex
+      (headersWire.append dataWire) emit
+  try
+    unless ← awaitFlag emissionEntered 1000 do
+      throw (IO.userError "request did not reach the pre-publication emission gate")
+    let gapState ← stateMutex.atomically get
+    expect gapState.activeDispatches.isEmpty
+      "handler dispatch should still be unpublished while emission is gated"
+    expect (gapState.pendingDispatchPublications.contains 1)
+      "detached request should retain a pending-publication ownership token"
+    expect (Http2.Connection.isDrainedAfterOutboundGoAway
+      { gapState with pendingDispatchPublications := #[] })
+      "test fixture should otherwise be drained during the publication gap"
+    expect (!(Http2.Connection.isDrainedAfterOutboundGoAway gapState))
+      "pending dispatch publication must prevent graceful drain election"
+    releaseEmission.set true
+  catch error =>
+    releaseEmission.set true
+    IO.cancel processing
+    throw error
+  unless ← awaitTaskFinished processing 1000 do
+    IO.cancel processing
+    throw (IO.userError "request did not finish after releasing publication")
+  match processing.get with
+  | .error error => throw error
+  | .ok (.error status) => throw (IO.userError status.messageD)
+  | .ok (.ok ()) => pure ()
+  unless ← awaitFlag handlerStarted 1000 do
+    throw (IO.userError "published request handler did not start")
+  let state ← stateMutex.atomically get
+  expect state.pendingDispatchPublications.isEmpty
+    "successful publication should retire its ownership token"
+
+structure SocketFrameState where
+  decoder : Http2.Frame.DecodeState := {}
+  frames : Array Http2.Frame := #[]
+
+partial def readSocketFramesUntil (client : Std.Async.TCP.Socket.Client)
+    (state : SocketFrameState) (done : Array Http2.Frame -> Bool) : IO SocketFrameState := do
+  if done state.frames then
+    pure state
+  else
+    match ← (client.recv? 8192).block with
+    | none => pure state
+    | some chunk =>
+        let decoded ← expectStatusOk (Http2.Frame.decodeChunk state.decoder chunk)
+        readSocketFramesUntil client {
+          decoder := { buffered := decoded.buffered },
+          frames := state.frames.append decoded.frames
+        } done
+
+def readSocketFramesUntilWithin (client : Std.Async.TCP.Socket.Client)
+    (state : SocketFrameState) (done : Array Http2.Frame -> Bool)
+    (remainingMilliseconds : Nat) (message : String) : IO SocketFrameState := do
+  let task ← IO.asTask (readSocketFramesUntil client state done)
+  unless ← awaitTaskFinished task remainingMilliseconds do
+    IO.cancel task
+    throw (IO.userError message)
+  match ← IO.wait task with
+  | .error error => throw error
+  | .ok state => pure state
+
+structure DecodedServerHeaderBlock where
+  streamId : Nat
+  headers : Metadata
+
+/-- Decode server header blocks in wire order with one HPACK state, as a real
+client must.  Keeping the stream id lets tests inspect trailers independently
+after several calls reuse a connection. -/
+def decodeServerHeaderBlocks (frames : Array Http2.Frame) :
+    IO (Array DecodedServerHeaderBlock) := do
+  let mut hpack : Http2.Hpack.State := {}
+  let mut blocks := #[]
+  let mut payload := ByteArray.empty
+  let mut streamId? : Option Nat := none
+  for frame in frames do
+    match streamId? with
+    | some streamId =>
+        payload := payload.append frame.payload
+        if Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endHeaders then
+          let decoded ← expectStatusOk (Http2.Hpack.decodeHeaderBlock hpack payload)
+          hpack := decoded.state
+          blocks := blocks.push { streamId := streamId, headers := decoded.headers }
+          payload := ByteArray.empty
+          streamId? := none
+    | none =>
+        if frame.header.frameType == Http2.FrameType.headers then
+          if Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endHeaders then
+            let decoded ← expectStatusOk (Http2.Hpack.decodeHeaderBlock hpack frame.payload)
+            hpack := decoded.state
+            blocks := blocks.push {
+              streamId := frame.header.streamId,
+              headers := decoded.headers
+            }
+          else
+            payload := frame.payload
+            streamId? := some frame.header.streamId
+  expect streamId?.isNone "server left an incomplete HPACK response header block"
+  pure blocks
+
+def grpcStatusForStream? (blocks : Array DecodedServerHeaderBlock) (streamId : Nat) :
+    Option String :=
+  blocks.findSome? fun block =>
+    if block.streamId == streamId then Metadata.get? block.headers "grpc-status" else none
+
+def streamEnded (streamId : Nat) (frames : Array Http2.Frame) : Bool :=
+  frames.any fun frame =>
+    frame.header.streamId == streamId
+      && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+
+def responseBodyForStream (frames : Array Http2.Frame) (streamId : Nat) : ByteArray :=
+  frames.foldl (init := ByteArray.empty) fun body frame =>
+    if frame.header.streamId == streamId && frame.header.frameType == Http2.FrameType.data then
+      body.append frame.payload
+    else
+      body
+
+/-- A complete, authorized header block with an incomplete body must not rely
+on the socket event loop for deadline delivery.  In particular, arbitrary
+authorization IO on another stream may occupy that loop indefinitely. -/
+def testPendingBodyDeadlineIndependentOfBlockedAuthorization : IO Unit := do
+  let authorizationBlocked ← IO.mkRef false
+  let releaseAuthorization ← IO.mkRef false
+  let registry := (Registry.empty.registerUnary echoMethod fun request => do
+      pure { metadata := Metadata.empty, data := request.data, status := Status.ok })
+    |>.withRequestHeaderAuthorizer (fun entry metadata => do
+      if Metadata.get? metadata "authorization" == some "block" then
+        authorizationBlocked.set true
+        while !(← releaseAuthorization.get) do
+          IO.sleep 1
+      pure (.accept entry.handler))
+
+  let scheduler ← Http2.Connection.DeadlineScheduler.new
+  let stateMutex ← Std.Mutex.new ({
+    prefaceReceived := true,
+    clientSettingsReceived := true,
+    deadlineScheduler := some scheduler
+  } : Http2.Connection.State)
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let deadlineEmitted ← IO.mkRef false
+  let emit (frames : Array Http2.Frame) : IO Unit := do
+    if frames.any fun frame =>
+        frame.header.streamId == 1
+          && frame.header.frameType == Http2.FrameType.headers
+          && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream then
+      deadlineEmitted.set true
+    emittedRef.modify fun emitted => emitted.append frames
+
+  let timedHeaders := requestHeaders
+    |>.insert "authorization" "allow"
+    |>.insert "grpc-timeout" "250m"
+  let timedBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+  let timedWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    1 timedBlock.1
+  match ← Http2.Connection.processBytesSharedWith registry stateMutex timedWire emit with
+  | .error status =>
+      discard <| Http2.Connection.cancelActiveShared stateMutex
+      throw (IO.userError status.messageD)
+  | .ok () => pure ()
+  let pendingState ← stateMutex.atomically get
+  expect (Http2.Connection.nextPendingDeadline? pendingState).isSome
+    "timed request should be waiting for its incomplete body"
+
+  let blockedHeaders := requestHeaders.insert "authorization" "block"
+  let blockedBlock ← expectStatusOk
+    (Http2.Hpack.encodeHeaderBlock timedBlock.2 blockedHeaders)
+  let blockedWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    3 blockedBlock.1
+  let processing ← IO.asTask <|
+    Http2.Connection.processBytesSharedWith registry stateMutex blockedWire emit
+  try
+    unless ← awaitFlag authorizationBlocked 1000 do
+      throw (IO.userError "second stream did not enter its blocking authorizer")
+    unless ← awaitFlag deadlineEmitted 2000 do
+      throw (IO.userError
+        "pending-body deadline was delayed by another stream's blocking authorizer")
+    expect (!(← IO.hasFinished processing))
+      "deadline test requires the other stream's authorizer to remain blocked"
+    let blocks ← decodeServerHeaderBlocks (← emittedRef.get)
+    expectEq (grpcStatusForStream? blocks 1) (some "4")
+      "pending-body timer should emit DEADLINE_EXCEEDED"
+    releaseAuthorization.set true
+    unless ← awaitTaskFinished processing 1000 do
+      throw (IO.userError "blocked authorizer did not finish after release")
+    match processing.get with
+    | .error error => throw error
+    | .ok (.error status) => throw (IO.userError status.messageD)
+    | .ok (.ok ()) => pure ()
+  catch error =>
+    releaseAuthorization.set true
+    IO.cancel processing
+    discard <| Http2.Connection.cancelActiveShared stateMutex
+    throw error
+  discard <| Http2.Connection.cancelActiveShared stateMutex
+
+/-- The active-handler deadline path must terminate only the expired RPC, not
+its managed h2c connection.  The first complete request enters a sleeping
+handler and returns status 4; the same socket then completes an untimed call. -/
+def testManagedH2CDeadlineThenConnectionReuse : IO Unit := do
+  let slowPayload := ByteArray.mk #[1, 1, 2, 3, 5]
+  let fastPayload := ByteArray.mk #[8, 13, 21]
+  let slowStarted ← IO.mkRef false
+  let slowFinishedNaturally ← IO.mkRef false
+  let fastHandled ← IO.mkRef false
+  let registry := Registry.empty.registerUnary echoMethod fun request => do
+    if request.data == slowPayload then
+      slowStarted.set true
+      IO.sleep 2000
+      slowFinishedNaturally.set true
+    else if request.data == fastPayload then
+      fastHandled.set true
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let settings ← clientSettingsWire
+  let timedHeaders := requestHeaders.insert "grpc-timeout" "250m"
+  let timedBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+  let timedHeadersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    1 timedBlock.1
+  let timedDataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream
+    1 (grpcMessageBytes slowPayload)
+  (client.send (Http2.connectionPreface
+    |>.append settings
+    |>.append timedHeadersWire
+    |>.append timedDataWire)).block
+
+  let afterDeadline ← readSocketFramesUntilWithin client {} (streamEnded 1) 5000
+    "managed h2c handler did not return its deadline status"
+  expect (← slowStarted.get)
+    "timed managed h2c handler should start before its deadline"
+  expect (!(← slowFinishedNaturally.get))
+    "managed deadline response must arrive before the sleeping handler finishes naturally"
+  let deadlineBlocks ← decodeServerHeaderBlocks afterDeadline.frames
+  expectEq (grpcStatusForStream? deadlineBlocks 1) (some "4")
+    "sleeping managed h2c handler should return DEADLINE_EXCEEDED"
+  expect (!afterDeadline.frames.any fun frame =>
+      frame.header.streamId == 1 && frame.header.frameType == Http2.FrameType.data)
+    "expired unary handler must not emit its late response DATA"
+
+  let fastBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock timedBlock.2 requestHeaders)
+  let fastHeadersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    3 fastBlock.1
+  let fastDataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream
+    3 (grpcMessageBytes fastPayload)
+  (client.send (fastHeadersWire.append fastDataWire)).block
+
+  let afterReuse ← readSocketFramesUntilWithin client afterDeadline (streamEnded 3) 5000
+    "managed h2c connection did not serve a request after handler deadline"
+  let allBlocks ← decodeServerHeaderBlocks afterReuse.frames
+  expectEq (grpcStatusForStream? allBlocks 3) (some "0")
+    "post-deadline request on the same connection should succeed"
+  let responseBody := responseBodyForStream afterReuse.frames 3
+  let responseMessages ← expectStatusOk (Message.decodeAll responseBody)
+  expectEq responseMessages.size 1
+    "post-deadline request should return exactly one response message"
+  expectEq responseMessages[0]!.data fastPayload
+    "post-deadline request should echo its payload"
+  expect (← fastHandled.get)
+    "post-deadline request should invoke its handler"
+
+  Grpc.Server.shutdown server
+  Grpc.Server.wait server
+  (client.shutdown).block
+
+/-- Header authorization consumes the same absolute budget as body and handler
+work.  Expiring a custom authorizer must reject only that RPC, suppress its
+handler, and leave the managed h2c connection usable by an untimed call. -/
+def testManagedH2CAuthorizerDeadlineThenConnectionReuse : IO Unit := do
+  let slowPayload := ByteArray.mk #[34, 55, 89]
+  let fastPayload := ByteArray.mk #[144, 233]
+  let authorizerStarted ← IO.mkRef false
+  let authorizerFinishedNaturally ← IO.mkRef false
+  let fastAuthorized ← IO.mkRef false
+  let slowHandlerInvoked ← IO.mkRef false
+  let fastHandlerInvoked ← IO.mkRef false
+  let registry := (Registry.empty.registerUnary echoMethod fun request => do
+      if request.data == slowPayload then
+        slowHandlerInvoked.set true
+      else if request.data == fastPayload then
+        fastHandlerInvoked.set true
+      pure { metadata := Metadata.empty, data := request.data, status := Status.ok })
+    |>.withRequestHeaderAuthorizer (fun entry metadata => do
+      match Metadata.get? metadata "authorization" with
+      | some "slow-deadline" =>
+          authorizerStarted.set true
+          IO.sleep 2000
+          authorizerFinishedNaturally.set true
+          pure (.accept entry.handler)
+      | _ =>
+          fastAuthorized.set true
+          pure (.accept entry.handler))
+
+  let server ← Grpc.Server.serve registry { address := Grpc.Server.loopback 0 }
+  let client ← Std.Async.TCP.Socket.Client.mk
+  (client.connect server.localAddress).block
+  client.noDelay
+
+  let settings ← clientSettingsWire
+  let timedHeaders := requestHeaders
+    |>.insert "authorization" "slow-deadline"
+    |>.insert "grpc-timeout" "250m"
+  let timedBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+  let timedHeadersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    1 timedBlock.1
+  let timedDataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream
+    1 (grpcMessageBytes slowPayload)
+  (client.send (Http2.connectionPreface
+    |>.append settings
+    |>.append timedHeadersWire
+    |>.append timedDataWire)).block
+
+  let afterDeadline ← readSocketFramesUntilWithin client {} (streamEnded 1) 5000
+    "managed h2c authorizer did not return its deadline status"
+  expect (← authorizerStarted.get)
+    "custom authorizer should start before its request deadline"
+  expect (!(← authorizerFinishedNaturally.get))
+    "authorizer deadline response must arrive before the slow callback finishes naturally"
+  expect (!(← slowHandlerInvoked.get))
+    "an expired custom authorizer must not invoke the RPC handler"
+  let deadlineBlocks ← decodeServerHeaderBlocks afterDeadline.frames
+  expectEq (grpcStatusForStream? deadlineBlocks 1) (some "4")
+    "expired custom authorizer should return DEADLINE_EXCEEDED"
+  expect (!afterDeadline.frames.any fun frame =>
+      frame.header.streamId == 1 && frame.header.frameType == Http2.FrameType.data)
+    "expired custom authorizer must not emit response DATA"
+
+  let fastHeaders := requestHeaders.insert "authorization" "allow"
+  let fastBlock ← expectStatusOk (Http2.Hpack.encodeHeaderBlock timedBlock.2 fastHeaders)
+  let fastHeadersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+    3 fastBlock.1
+  let fastDataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream
+    3 (grpcMessageBytes fastPayload)
+  (client.send (fastHeadersWire.append fastDataWire)).block
+
+  let afterReuse ← readSocketFramesUntilWithin client afterDeadline (streamEnded 3) 5000
+    "managed h2c connection did not recover after authorizer deadline"
+  let allBlocks ← decodeServerHeaderBlocks afterReuse.frames
+  expectEq (grpcStatusForStream? allBlocks 3) (some "0")
+    "untimed request after authorizer deadline should succeed"
+  let responseMessages ← expectStatusOk
+    (Message.decodeAll (responseBodyForStream afterReuse.frames 3))
+  expectEq responseMessages.size 1
+    "post-authorizer-deadline request should return one response message"
+  expectEq responseMessages[0]!.data fastPayload
+    "post-authorizer-deadline request should echo its payload"
+  expect (← fastAuthorized.get)
+    "custom authorizer should promptly allow the untimed recovery request"
+  expect (← fastHandlerInvoked.get)
+    "untimed recovery request should invoke its handler"
+
+  Grpc.Server.shutdown server
+  Grpc.Server.wait server
+  (client.shutdown).block
+
 /-- A peer RST is already the terminal stream signal. It cancels the in-flight
 dispatch and removes stream state without echoing a second RST_STREAM after the
 cancelled handler unwinds. -/
@@ -244,6 +655,46 @@ def testPeerRstCancelsDispatchWithoutEchoReset : IO Unit := do
   let sawRst ← awaitFrame emittedRef Http2.FrameType.rstStream 200
   expect (!sawRst) "peer RST should not provoke a second server RST_STREAM"
 
+/-- A deadline wraps the user handler in a child task.  Peer cancellation must
+reach that exact child rather than merely marking its suspended dispatch owner:
+the polling handler observes cancellation, the dispatch retires without waiting
+for its long deadline, and the peer's terminal RST is not echoed. -/
+def testPeerRstCancelsDeadlineHandlerWithoutEchoReset : IO Unit := do
+  let sawCancellation ← IO.mkRef false
+  let registry := Registry.empty.registerUnary echoMethod fun _ =>
+    ExceptT.mk (observedCancellableHandlerLoop sawCancellation)
+  let timedHeaders := requestHeaders.insert "grpc-timeout" "1H"
+  let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+  let headersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders 1 encodedHeaders.1
+  let body := grpcMessageBytes (repeatByte 3 5)
+  let dataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream 1 body
+  let (stateMutex, emittedRef) ← sharedConnection
+  let emit (frames : Array Http2.Frame) : IO Unit :=
+    emittedRef.modify fun out => out.append frames
+  let wire := ((← clientSettingsWire).append headersWire).append dataWire
+  match ← Http2.Connection.processBytesSharedWith registry stateMutex wire emit with
+  | .error status => throw (IO.userError status.messageD)
+  | .ok () => pure ()
+  let rstFrame ← expectStatusOk (Http2.RstStream.frame 1 Http2.ErrorCode.cancel)
+  let rstWire ← expectStatusOk (Http2.Frame.encode rstFrame)
+  let rstTask ← IO.asTask
+    (Http2.Connection.processBytesSharedWith registry stateMutex rstWire emit)
+  unless ← awaitTaskFinished rstTask 1000 do
+    IO.cancel rstTask
+    throw (IO.userError "peer RST did not promptly retire a deadline-wrapped handler")
+  match ← IO.wait rstTask with
+  | .error error => throw error
+  | .ok (.error status) => throw (IO.userError status.messageD)
+  | .ok (.ok ()) => pure ()
+  expect (← sawCancellation.get)
+    "deadline-wrapped handler did not observe peer cancellation"
+  let state ← stateMutex.atomically get
+  expect state.activeDispatches.isEmpty
+    "peer RST should promptly remove the deadline-wrapped dispatch"
+  let sawRst ← awaitFrame emittedRef Http2.FrameType.rstStream 200
+  expect (!sawRst)
+    "peer RST should not provoke a second RST_STREAM from a deadline-wrapped dispatch"
+
 def main : IO Unit := do
   testPaddedDataFrame
   IO.println "padded DATA ok"
@@ -257,6 +708,16 @@ def main : IO Unit := do
   IO.println "keepalive PING ack ok"
   testHandlerCrashReturnsStatus
   IO.println "handler crash returns status ok"
+  testPendingDispatchPublicationPreventsFalseDrain
+  IO.println "pending dispatch publication blocks false graceful drain"
+  testPendingBodyDeadlineIndependentOfBlockedAuthorization
+  IO.println "pending-body deadline is independent of blocked cross-stream authorization"
   testPeerRstCancelsDispatchWithoutEchoReset
   IO.println "peer RST cancels dispatch without an echo reset"
+  testPeerRstCancelsDeadlineHandlerWithoutEchoReset
+  IO.println "peer RST cancels a deadline-wrapped handler without an echo reset"
+  testManagedH2CDeadlineThenConnectionReuse
+  IO.println "managed h2c handler deadline preserves connection reuse"
+  testManagedH2CAuthorizerDeadlineThenConnectionReuse
+  IO.println "managed h2c authorizer deadline preserves connection reuse"
   IO.println "all hardening assertions passed"

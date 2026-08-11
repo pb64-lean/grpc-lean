@@ -404,6 +404,24 @@ inductive Deadline.Remaining where
 
 namespace Deadline
 
+/-- Convert a validated `grpc-timeout` duration into an absolute instant,
+anchored at `startedAt?` when the transport recorded END_HEADERS or at the
+current monotonic time for standalone callers. -/
+def fromTimeoutAt? (timeout? : Option Timeout) (startedAt? : Option Nat) :
+    IO (Option Nat) := do
+  match timeout? with
+  | none => pure none
+  | some timeout =>
+      let startedAt ← match startedAt? with
+        | some startedAt => pure startedAt
+        | none => IO.monoNanosNow
+      pure (some (startedAt + timeout.toNanoseconds))
+
+/-- Convert a validated `grpc-timeout` duration into an absolute instant on
+`IO.monoNanosNow`'s monotonic clock. -/
+def fromTimeout? (timeout? : Option Timeout) : IO (Option Nat) :=
+  fromTimeoutAt? timeout? none
+
 /-- Time left before `deadline?` (an absolute `IO.monoNanosNow` reading, as
 carried by `UnaryRequest.deadline` and friends), rendered as a `grpc-timeout`
 duration for a downstream call.
