@@ -1,0 +1,49 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_runtime_headers")
+load(":defs.bzl", "lean_generated_c_file")
+
+# Resolve headers from the consumer-selected Lean toolchain. The grpc-lean
+# module's own toolchain repository is development-only and is intentionally
+# not visible when grpc-lean is consumed as a Bzlmod dependency.
+lean_runtime_headers(
+    name = "lean_runtime_headers",
+)
+
+# C FFI shim: single-syscall POSIX descriptor adapters behind `Grpc.Posix`.
+cc_library(
+    name = "posix_ffi",
+    srcs = ["grpc_posix.c"],
+    hdrs = ["grpc_posix.h"],
+    # `-pedantic`/`-Wstrict-prototypes` are omitted: the pinned Lean runtime
+    # header is a plain (non-system) include here and does not satisfy them.
+    copts = [
+        "-std=c17",
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+        "-Wmissing-prototypes",
+    ],
+    deps = [":lean_runtime_headers"],
+)
+
+# Compile Lean's generated extern declarations in the same translation unit as
+# the handwritten header. Any ABI disagreement is a compiler error.
+lean_generated_c_file(
+    name = "posix_generated_c",
+    dep = "//:grpc_lean",
+    module_suffix = "/Grpc/Posix.c",
+)
+
+cc_library(
+    name = "posix_extern_abi_compile",
+    srcs = [":posix_generated_c"],
+    additional_compiler_inputs = ["grpc_posix.h"],
+    copts = [
+        "-include",
+        "$(location grpc_posix.h)",
+        "-Werror",
+        "-Wno-unused-variable",
+    ],
+    deps = [":lean_runtime_headers"],
+)

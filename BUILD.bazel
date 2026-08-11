@@ -50,8 +50,12 @@ lean_library(
         "Grpc/ChannelLease.lean",
         "Grpc/ChannelOwner.lean",
         "Grpc/Client.lean",
+        "Grpc/Dns.lean",
         "Grpc/Endpoint.lean",
         "Grpc/ManagedChannel/Config.lean",
+        "Grpc/NameResolver.lean",
+        "Grpc/Posix.lean",
+        "Grpc/TrustAnchors.lean",
         "Grpc/Framing.lean",
         "Grpc/Http2.lean",
         "Grpc/Http2/Connection.lean",
@@ -68,9 +72,11 @@ lean_library(
     ],
     deps = [
         "//Zlib:zlib",
+        "//native:posix_ffi",
         ":grpc_cancellation_token",
         ":grpc_tls",
         "@grpc_lean_protobuf//:protobuf",
+        "@tls13_lean//TLS13:tls13",
     ],
 )
 
@@ -432,4 +438,27 @@ lean_test(
     name = "channel_owner_test",
     srcs = ["Test/ChannelOwnerTest.lean"],
     deps = [":grpc_lean"],
+)
+
+# Real certificate material for trust-boundary tests, distinct from the
+# TLS server identity fixtures under Test/Fixtures/Tls.
+lean_library(
+    name = "test_certificate_fixtures",
+    testonly = True,
+    srcs = ["Test/CertificateFixtures.lean"],
+)
+
+lean_test(
+    name = "name_resolver_test",
+    srcs = ["Test/NameResolverTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "trust_anchors_test",
+    srcs = ["Test/TrustAnchorsTest.lean"],
+    deps = [
+        ":grpc_lean",
+        ":test_certificate_fixtures",
+    ],
 )
