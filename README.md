@@ -9,8 +9,10 @@ reflection services. The Bazel module is named **`rules_lean_grpc`**.
 
 The protocol stack — HTTP/2 framing, HPACK, flow control, gRPC message
 framing, metadata, deadlines, cancellation — is implemented in Lean. The only
-C in this repository is a small zlib shim for gzip message compression; TLS
-cryptography is HACL\* via `tls13-lean`'s C shim.
+C in this repository is a small zlib shim for gzip message compression plus a
+single-syscall POSIX descriptor shim for trust-anchor reads (its extern ABI is
+compile-checked against the generated Lean declarations); TLS cryptography is
+HACL\* via `tls13-lean`'s C shim.
 
 ```mermaid
 flowchart TB
@@ -134,6 +136,53 @@ when the peer keeps its write side open; that reader marks calls failed and
 retires the transport. As on the server, the available TCP primitive is bounded
 write-side `shutdown`, not hard `uv_close`: a losing shutdown promise may remain
 suspended without a worker until the OS settles it.
+
+## Managed channel
+
+`Grpc.ManagedChannel` is a lazily connecting shared channel above
+`Grpc.Client`. `ManagedChannel.create config` performs no network effects;
+the first RPC starts one single-flight initialization task that loads and
+pins system trust anchors (`Grpc.TrustAnchors`), resolves the endpoint
+(`Grpc.NameResolver` over the `Grpc.Dns` getaddrinfo boundary), and walks the
+resolved addresses in order through TCP or TLS connection attempts that
+require an exact `h2` ALPN result. Plaintext (`http://`) endpoints must be
+syntactically loopback and must resolve only to loopback addresses.
+
+One connection generation is shared by every caller: each RPC holds an outer
+channel lease and an inner connection lease (both instances of the certified
+`Grpc.ChannelLease` kernel via `Grpc.ChannelOwner`), so close waits for the
+exact active call set. Opening failures are classified as typed dispositions:
+clean transport failures and clean local setup failures admit a fresh
+generation on a later call, while endpoint policy, trust-anchor policy,
+supervisor invariants, and cleanup uncertainty are terminal and drain the
+channel. After an RPC settles with a transport-ambiguous status code
+(`rpcCodeRequiresGenerationRetirement`), its generation is retired and the
+next call reconnects — the settled RPC is never replayed. `close` runs
+exactly once with a joined result; `closeWithin` observes that one close
+generation under a monotonic budget without ever abandoning or duplicating
+transport cleanup custody.
+
+Per-call `CallCredentials` supply refined `CredentialEntry` metadata whose
+values are visible-ASCII-checked, redacted by every ordinary rendering, and
+provably installed on the wire options
+(`Grpc.UnaryCall.optionsFor_singleton_get?` exports the authorization-presence
+fact). Each unary invocation owns a local monotonic deadline: the
+`grpc-timeout` header is sent for peer-side enforcement but never trusted
+locally, and an expired call is cancelled and joined before the deadline error
+returns. The certified kernels behind this layer — the channel-lease state
+machine, the supervisor snapshot invariant, clean-close inventory, and the
+`Grpc.ChannelInitialization` ownership model — are enumerated as principal
+theorems in `//:grpc_assurance`.
+
+Deliberately not claimed: connection establishment is not locally cancellable
+— the resolver and connector do not expose cancellable DNS/TCP/TLS
+initialization, so a cancelled or expired caller stops waiting while the
+staged initializer remains owned for a later call or the close owner
+(`Grpc.ManagedChannel`'s header documents this precisely).
+`Grpc.ChannelInitialization` is the pure ownership kernel a future cancellable
+connector must satisfy before that gap closes. On Darwin, trust-anchor reads
+use Lean's finalizer-backed file handles rather than the Linux
+descriptor-custody path with its consuming close.
 
 ## Codegen
 
@@ -389,10 +438,13 @@ Verified scope:
   HEADERS/CONTINUATION steps (header decoding, authorization, dispatch
   spawning), and everything above the codecs.
 - **C in the trusted computing base**: the zlib shim
-  (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) — and nothing
-  else first-party, which is what `//:grpc_assurance` confirms by allowing
-  `@[extern]` in `Zlib.Gzip` and nowhere else under `Grpc.*`/`Zlib.*` — and,
-  via `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
+  (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound) and the POSIX
+  descriptor shim (`native/grpc_posix.c`, one syscall per function, whose
+  extern ABI is compiled against the generated Lean declarations by
+  `//native:posix_extern_abi_compile`) — and nothing else first-party, which
+  is what `//:grpc_assurance` confirms by allowing `@[extern]` in `Zlib.Gzip`
+  and `Grpc.Posix` and nowhere else under `Grpc.*`/`Zlib.*` — and, via
+  `tls13-lean`, the HACL\* shim. The HACL\* cryptographic primitives
   themselves carry externally machine-verified correctness proofs; the shim
   and `@[extern]` bindings do not.
 - **External dependencies**: zlib (Bazel module), the vendored
