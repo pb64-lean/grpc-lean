@@ -47,8 +47,11 @@ lean_library(
         "Grpc/Bytes.lean",
         "Grpc/CallCredentials.lean",
         "Grpc/Cancellation.lean",
+        "Grpc/ChannelLease.lean",
+        "Grpc/ChannelOwner.lean",
         "Grpc/Client.lean",
         "Grpc/Endpoint.lean",
+        "Grpc/ManagedChannel/Config.lean",
         "Grpc/Framing.lean",
         "Grpc/Http2.lean",
         "Grpc/Http2/Connection.lean",
@@ -410,5 +413,23 @@ lean_test(
 lean_test(
     name = "hpack_test",
     srcs = ["Test/HpackTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "endpoint_test",
+    srcs = ["Test/EndpointTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "channel_lease_test",
+    srcs = ["Test/ChannelLeaseTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "channel_owner_test",
+    srcs = ["Test/ChannelOwnerTest.lean"],
     deps = [":grpc_lean"],
 )

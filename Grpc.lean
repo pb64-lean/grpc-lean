@@ -2,9 +2,12 @@ module
 
 public import Grpc.CallCredentials
 public import Grpc.Cancellation
+public import Grpc.ChannelLease
+public import Grpc.ChannelOwner
 public import Grpc.Client
 public import Grpc.Endpoint
 public import Grpc.Framing
+public import Grpc.ManagedChannel.Config
 public import Grpc.Http2
 public import Grpc.Metadata
 public import Grpc.Protocol
