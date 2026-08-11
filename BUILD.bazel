@@ -47,6 +47,7 @@ lean_library(
         "Grpc/Bytes.lean",
         "Grpc/CallCredentials.lean",
         "Grpc/Cancellation.lean",
+        "Grpc/ChannelInitialization.lean",
         "Grpc/ChannelLease.lean",
         "Grpc/ChannelOwner.lean",
         "Grpc/Client.lean",
@@ -453,6 +454,12 @@ lean_library(
 lean_test(
     name = "unary_call_test",
     srcs = ["Test/UnaryCallTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "channel_initialization_test",
+    srcs = ["Test/ChannelInitializationTest.lean"],
     deps = [":grpc_lean"],
 )
 

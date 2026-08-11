@@ -2,6 +2,7 @@ module
 
 public import Grpc.CallCredentials
 public import Grpc.Cancellation
+public import Grpc.ChannelInitialization
 public import Grpc.ChannelLease
 public import Grpc.ChannelOwner
 public import Grpc.Client
