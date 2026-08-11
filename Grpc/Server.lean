@@ -233,6 +233,17 @@ def registerChecked (registry : Registry) (entry : MethodEntry) :
   | some _ => .error { name := entry.name }
   | none => .ok (registry.register entry)
 
+/-- Transform every registered entry, keeping the installed request-header
+authorizer and its custom flag intact.  This is the server-interceptor idiom:
+after all services are registered, rewrite each entry wholesale, for example
+wrapping every handler with cross-cutting authorization.  Mapping keeps
+registration order and entry count, so first-match-wins lookup resolves the
+same position as before.  `Registry.WellFormed` (name uniqueness) is
+preserved when `f` preserves each entry's `name`
+(`Registry.mapEntries_wellFormed`). -/
+def mapEntries (registry : Registry) (f : MethodEntry -> MethodEntry) : Registry :=
+  { registry with entries := registry.entries.map f }
+
 def registerUnary (registry : Registry) (name : MethodName) (handler : UnaryHandler) : Registry :=
   registry.register { name := name, shape := .unary, handler := handler }
 
@@ -1126,6 +1137,20 @@ theorem registerChecked_wellFormed {registry registry' : Registry} {entry : Meth
   have := hnone existing hmem
   simp only [beq_iff_eq] at this
   exact hname ▸ this
+
+private theorem mapEntries_names {registry : Registry} {f : MethodEntry -> MethodEntry}
+    (hf : ∀ entry, (f entry).name = entry.name) :
+    (registry.mapEntries f).names = registry.names := by
+  simp only [names, mapEntries, Array.toList_map, List.map_map, Function.comp_def]
+  exact List.map_congr_left fun entry _ => hf entry
+
+/-- Mapping entries with a name-preserving `f` preserves well-formedness. -/
+theorem mapEntries_wellFormed {registry : Registry} {f : MethodEntry -> MethodEntry}
+    (hf : ∀ entry, (f entry).name = entry.name) (hwf : registry.WellFormed) :
+    (registry.mapEntries f).WellFormed := by
+  unfold WellFormed at hwf ⊢
+  rw [mapEntries_names hf]
+  exact hwf
 
 /-- After successful checked registration, looking up the new name finds the
 new entry. -/
