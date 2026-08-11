@@ -1,6 +1,9 @@
 module
 
+public import Grpc.CallCredentials
+public import Grpc.Cancellation
 public import Grpc.Client
+public import Grpc.Endpoint
 public import Grpc.Framing
 public import Grpc.Http2
 public import Grpc.Metadata

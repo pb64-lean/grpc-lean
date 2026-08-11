@@ -45,7 +45,10 @@ lean_library(
     srcs = [
         "Grpc.lean",
         "Grpc/Bytes.lean",
+        "Grpc/CallCredentials.lean",
+        "Grpc/Cancellation.lean",
         "Grpc/Client.lean",
+        "Grpc/Endpoint.lean",
         "Grpc/Framing.lean",
         "Grpc/Http2.lean",
         "Grpc/Http2/Connection.lean",
