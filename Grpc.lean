@@ -8,17 +8,18 @@ public import Grpc.Client
 public import Grpc.Dns
 public import Grpc.Endpoint
 public import Grpc.Framing
+public import Grpc.Http2
 public import Grpc.ManagedChannel.Config
+public import Grpc.Metadata
 public import Grpc.NameResolver
 public import Grpc.Posix
-public import Grpc.TrustAnchors
-public import Grpc.Http2
-public import Grpc.Metadata
 public import Grpc.Protocol
 public import Grpc.Server
 public import Grpc.Services.Health
 public import Grpc.Services.Reflection
 public import Grpc.Status
+public import Grpc.TrustAnchors
+public import Grpc.UnaryCall
 
 public section
 

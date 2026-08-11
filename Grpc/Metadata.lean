@@ -21,7 +21,7 @@ namespace Header
 def normalizeName (name : String) : String :=
   name.toLower
 
-def of (name value : String) : Header :=
+@[expose] def of (name value : String) : Header :=
   { name := normalizeName name, value := value }
 
 def isBinary (header : Header) : Bool :=
@@ -39,12 +39,12 @@ def insert (metadata : Metadata) (name value : String) : Metadata :=
 def singleton (name value : String) : Metadata :=
   empty.insert name value
 
-def getAll (metadata : Metadata) (name : String) : Array String :=
+@[expose] def getAll (metadata : Metadata) (name : String) : Array String :=
   let key := Header.normalizeName name
   metadata.filterMap fun header =>
     if header.name == key then some header.value else none
 
-def get? (metadata : Metadata) (name : String) : Option String :=
+@[expose] def get? (metadata : Metadata) (name : String) : Option String :=
   (getAll metadata name)[0]?
 
 def contains (metadata : Metadata) (name value : String) : Bool :=

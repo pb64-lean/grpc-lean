@@ -52,10 +52,6 @@ lean_library(
         "Grpc/Client.lean",
         "Grpc/Dns.lean",
         "Grpc/Endpoint.lean",
-        "Grpc/ManagedChannel/Config.lean",
-        "Grpc/NameResolver.lean",
-        "Grpc/Posix.lean",
-        "Grpc/TrustAnchors.lean",
         "Grpc/Framing.lean",
         "Grpc/Http2.lean",
         "Grpc/Http2/Connection.lean",
@@ -63,12 +59,17 @@ lean_library(
         "Grpc/Http2/Grpc.lean",
         "Grpc/Http2/Hpack.lean",
         "Grpc/Http2/Server.lean",
+        "Grpc/ManagedChannel/Config.lean",
         "Grpc/Metadata.lean",
+        "Grpc/NameResolver.lean",
+        "Grpc/Posix.lean",
         "Grpc/Protocol.lean",
         "Grpc/Server.lean",
         "Grpc/Services/Health.lean",
         "Grpc/Services/Reflection.lean",
         "Grpc/Status.lean",
+        "Grpc/TrustAnchors.lean",
+        "Grpc/UnaryCall.lean",
     ],
     deps = [
         "//Zlib:zlib",
@@ -446,6 +447,12 @@ lean_library(
     name = "test_certificate_fixtures",
     testonly = True,
     srcs = ["Test/CertificateFixtures.lean"],
+)
+
+lean_test(
+    name = "unary_call_test",
+    srcs = ["Test/UnaryCallTest.lean"],
+    deps = [":grpc_lean"],
 )
 
 lean_test(
