@@ -9,6 +9,7 @@ public import Grpc.Dns
 public import Grpc.Endpoint
 public import Grpc.Framing
 public import Grpc.Http2
+public import Grpc.ManagedChannel
 public import Grpc.ManagedChannel.Config
 public import Grpc.Metadata
 public import Grpc.NameResolver

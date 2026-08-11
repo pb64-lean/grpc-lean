@@ -26,7 +26,13 @@ inductive Phase where
   | accepting
   | draining
   | closed
-deriving BEq, DecidableEq, Repr
+deriving DecidableEq, Repr
+
+instance : BEq Phase where
+  beq left right := decide (left = right)
+
+instance : LawfulBEq Phase where
+  eq_of_beq := of_decide_eq_true
 
 structure Lease where
   private mk ::
@@ -149,7 +155,13 @@ inductive BeginCloseDecision where
   | claimed
   | joined
   | completed
-deriving BEq, DecidableEq, Repr
+deriving DecidableEq, Repr
+
+instance : BEq BeginCloseDecision where
+  beq left right := decide (left = right)
+
+instance : LawfulBEq BeginCloseDecision where
+  eq_of_beq := of_decide_eq_true
 
 structure BeginCloseResult where
   state : State

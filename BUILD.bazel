@@ -59,6 +59,7 @@ lean_library(
         "Grpc/Http2/Grpc.lean",
         "Grpc/Http2/Hpack.lean",
         "Grpc/Http2/Server.lean",
+        "Grpc/ManagedChannel.lean",
         "Grpc/ManagedChannel/Config.lean",
         "Grpc/Metadata.lean",
         "Grpc/NameResolver.lean",
@@ -453,6 +454,15 @@ lean_test(
     name = "unary_call_test",
     srcs = ["Test/UnaryCallTest.lean"],
     deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "managed_channel_test",
+    srcs = ["Test/ManagedChannelTest.lean"],
+    deps = [
+        ":grpc_lean",
+        ":test_certificate_fixtures",
+    ],
 )
 
 lean_test(
