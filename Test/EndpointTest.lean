@@ -103,6 +103,35 @@ private def testCredentialRedaction : IO Unit := do
   if (reprStr configuration).contains "production-api-key" then
     fail "channel configuration rendering exposed the credential value"
 
+private def testBearerTokens : IO Unit := do
+  match CredentialEntry.bearer? "production.api-key~2_A+b/c" with
+  | none => fail "legal token68 bearer token was rejected"
+  | some entry =>
+      if entry.name != "authorization" then
+        fail "bearer entry did not use the authorization key"
+      if entry.exposeValue != "Bearer production.api-key~2_A+b/c" then
+        fail "bearer entry did not compose the exact Bearer value"
+  match CredentialEntry.bearer? "dGVzdA==" with
+  | none => fail "token68 trailing padding was rejected"
+  | some entry =>
+      if entry.exposeValue != "Bearer dGVzdA==" then
+        fail "padded bearer entry did not compose the exact Bearer value"
+  for malformed in ["", " ", "  ", "left right", "trailing ", " leading",
+      "=", "==", "=x", "a=b", "key\twith-tab", "kéy"] do
+    if (CredentialEntry.bearer? malformed).isSome then
+      fail s!"malformed bearer token {malformed.quote} crossed the credential boundary"
+    if (CallCredentials.bearer? malformed).isSome then
+      fail s!"malformed bearer token {malformed.quote} produced call credentials"
+  match CallCredentials.bearer? "fixed-token" with
+  | none => fail "legal bearer call credentials were rejected"
+  | some credentials =>
+      if toString credentials != "[REDACTED]" ||
+          reprStr credentials != "[REDACTED]" then
+        fail "bearer call credentials leaked through ordinary rendering"
+      let fetched ← credentials.fresh
+      if fetched.map (·.exposeValue) != #["Bearer fixed-token"] then
+        fail "bearer call credentials did not supply the composed entry"
+
 private def testDeadlines : IO Unit := do
   if RpcDeadline.default.seconds != 10 ||
       RpcDeadline.default.grpcTimeoutValue != "10S" then
@@ -132,5 +161,6 @@ end EndpointTest
 def main : IO Unit := do
   EndpointTest.testEndpoints
   EndpointTest.testCredentialRedaction
+  EndpointTest.testBearerTokens
   EndpointTest.testDeadlines
   IO.println "channel configuration tests passed"

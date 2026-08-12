@@ -70,10 +70,32 @@ theorem authorization_name (value : String)
     (authorization value h).name = "authorization" := by
   simp [authorization]
 
-/-- `authorization: Bearer <token>`, when the composed value is legal. -/
+/--
+RFC 6750 `token68` shape for bearer tokens:
+`1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`.
+An empty body fails, and after the first `=` only further `=` may follow.
+-/
+def isBearerToken68 (token : String) : Bool :=
+  let isBodyChar := fun (character : Char) =>
+    character.isAlpha || character.isDigit ||
+      character == '-' || character == '.' || character == '_' ||
+      character == '~' || character == '+' || character == '/'
+  let characters := token.toList
+  let body := characters.takeWhile isBodyChar
+  !body.isEmpty && (characters.drop body.length).all (· == '=')
+
+/--
+`authorization: Bearer <token>` for an RFC 6750 `token68`-shaped token.
+Malformed tokens — empty, whitespace-bearing, or containing any character
+outside the `token68` alphabet — fail closed with `none` here instead of
+composing a header the peer will reject remotely.
+-/
 def bearer? (token : String) : Option CredentialEntry :=
-  if h : isVisibleAsciiMetadataValue ("Bearer " ++ token) = true then
-    some (authorization ("Bearer " ++ token) h)
+  if isBearerToken68 token then
+    if h : isVisibleAsciiMetadataValue ("Bearer " ++ token) = true then
+      some (authorization ("Bearer " ++ token) h)
+    else
+      none
   else
     none
 
@@ -113,7 +135,10 @@ def ofEntries (entries : Array CredentialEntry) : CallCredentials :=
 def ofProvider (provider : IO (Array CredentialEntry)) : CallCredentials :=
   .mk provider
 
-/-- Fixed bearer-token credentials for every call, when the token is legal. -/
+/--
+Fixed bearer-token credentials for every call, when the token is a legal
+RFC 6750 `token68`; malformed tokens fail closed with `none`.
+-/
 def bearer? (token : String) : Option CallCredentials :=
   (CredentialEntry.bearer? token).map fun entry => ofEntries #[entry]
 
