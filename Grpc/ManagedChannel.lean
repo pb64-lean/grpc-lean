@@ -21,9 +21,9 @@ credential metadata can exist. HTTPS always uses a validated trust bundle, hostn
 verification, SNI, and an exact `h2` ALPN result.
 
 All injectable hooks return resources or bounded local failures. RPC failures
-retain the exact peer `Grpc.Status` for parity-sensitive service adapters,
-while generic `ToString`/`Repr` rendering omits its description and never
-includes hostnames, paths, metadata, or credentials.
+retain the exact peer `Grpc.Status` for service adapters that must observe
+the precise peer outcome, while generic `ToString`/`Repr` rendering omits its
+description and never includes hostnames, paths, metadata, or credentials.
 
 Connection establishment itself is intentionally not described as locally
 bounded: the resolver and client connector do not expose cancellable
@@ -1080,7 +1080,7 @@ private def grpcConfiguration (attempt : ConnectAttempt) : Grpc.Client.Config :=
   maxReceiveMessageSize := attempt.maxReceiveMessageBytes
 }
 
-/-- Run grpc-lean's cooperative close to completion at the IO-owned channel boundary. -/
+/-- Run `Grpc.Client`'s cooperative close to completion at the IO-owned channel boundary. -/
 private def closeGrpcConnection (connection : Grpc.Client.Connection) : IO Unit :=
   Async.block (Grpc.Client.close connection)
 
@@ -1104,7 +1104,7 @@ def Connector.production : Connector Grpc.Client.Connection := {
           return .failed
       pure (.connected receipt)
     catch _ =>
-      -- grpc-lean owns and shuts down pre-Connection sockets/sessions before
+      -- `Grpc.Client` owns and shuts down pre-`Connection` sockets/sessions before
       -- throwing. Every resource it returns is explicitly closed by this
       -- adapter before fallback or rejection.
       pure .failed
@@ -3424,13 +3424,13 @@ private def connectedWithCancellation
         pure (.ok generation)
 
 /-!
-grpc-lean records a dead connection using the status that caused its reader or
+`Grpc.Client` records a dead connection using the status that caused its reader or
 writer to fail. Native `IO.Error` conversion can produce `CANCELLED`,
 `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, or `UNKNOWN`; EOF/GOAWAY can produce
 `UNAVAILABLE`; and HTTP/2/TLS protocol failure can produce `INTERNAL`.
 
 Those codes can also be stream- or application-level outcomes. The current
-grpc-lean call boundary deliberately exposes only `Grpc.Status`, not its
+`Grpc.Client` call boundary deliberately exposes only `Grpc.Status`, not its
 provenance, so all six are conservatively transport-ambiguous: retire the
 generation after the exact call settles, but never replay that call.
 -/

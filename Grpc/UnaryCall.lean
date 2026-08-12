@@ -181,10 +181,13 @@ private def cardinalityStatus (count : String) : Grpc.Status :=
   Grpc.Status.internal s!"expected exactly one response message, got {count}"
 
 /--
-Exact status installed by the pinned grpc-lean `Call.cancel` linearization when
-the call was still active.  A different status observed after `cancel` was
-already terminal peer/transport evidence and must not be rewritten as local
-deadline or owner-cancellation provenance.
+Exact status installed by the `Grpc.Client.Call.cancel` linearization when
+the call was still active.  This byte-equality sentinel is intra-repo
+lockstep coupling: it must match the status `Grpc.Client` installs
+byte-for-byte, so an edit to either definition must change the other.  A
+different status observed after `cancel` was already terminal peer/transport
+evidence and must not be rewritten as local deadline or owner-cancellation
+provenance.
 -/
 private def locallyCancelledStatus : Grpc.Status :=
   Grpc.Status.cancelled "call cancelled locally"
@@ -356,9 +359,10 @@ private def decodeOwnedResult
 
 /--
 Classify the exact owner result after this adapter requested local
-cancellation.  grpc-lean installs only `locallyCancelledStatus`; every other
-terminal result predates (or won) that cancellation linearization and retains
-its original provenance.
+cancellation.  `Grpc.Client.Call.cancel` installs only
+`locallyCancelledStatus` — intra-repo lockstep coupling on that exact byte
+string; every other terminal result predates (or won) that cancellation
+linearization and retains its original provenance.
 -/
 private def resultAfterLocalCancellation
     (localResult : Error)

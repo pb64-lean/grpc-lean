@@ -203,7 +203,7 @@ private def testStatusAndCardinality : IO Unit := do
 private def testStatusDetailsTrailers : IO Unit := do
   let denied := Grpc.Status.error .invalidArgument "invalid request"
 
-  -- `insertBinary` exercises grpc-lean's normal unpadded `-bin` encoding.
+  -- `insertBinary` exercises the metadata layer's normal unpadded `-bin` encoding.
   let unpaddedDetails := "unpadded-rich-status".toUTF8
   let unpaddedTrailers := Grpc.Metadata.empty.insertBinary
     "grpc-status-details-bin" unpaddedDetails
@@ -519,7 +519,7 @@ private def testDeadlineWinnerPreservesCompletedOwner : IO Unit := do
     "completed response was returned before exact finish"
 
   -- A completed peer cancellation remains exact RPC evidence. The byte-equal
-  -- grpc-lean local-cancel sentinel is intentionally covered only where this
+  -- `Grpc.Client` local-cancel sentinel is intentionally covered only where this
   -- adapter really issued cancel: without a lower-level cancel disposition,
   -- those two sources cannot be distinguished after the fact.
   let peerStatus := Grpc.Status.cancelled "peer completed cancellation"
@@ -676,7 +676,7 @@ private def testPostCancelPreservesPeerStatusDetails : IO Unit := do
   let details := "peer-cancel-status-details".toUTF8
   let trailers := Grpc.Metadata.empty.insertBinary
     "grpc-status-details-bin" details
-  -- Deliberately use grpc-lean's byte-equal local-cancel sentinel.  The rich
+  -- Deliberately use `Grpc.Client`'s byte-equal local-cancel sentinel.  The rich
   -- trailer is terminal peer evidence and must prevent local reclassification.
   let call : PostCancelCall := {
     events
