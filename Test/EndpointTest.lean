@@ -11,12 +11,12 @@ private def fail (message : String) : IO α :=
 private def endpointCases : List (String × String × Bool × UInt16) := [
   ("api.example.test", "api.example.test", false, 80),
   ("api.example.test:", "api.example.test", false, 80),
-  ("api.example.test:7233", "api.example.test:7233", false, 7233),
+  ("api.example.test:50051", "api.example.test:50051", false, 50051),
   ("http://api.example.test", "api.example.test", false, 80),
   ("http://api.example.test/", "api.example.test", false, 80),
   ("https://API.EXAMPLE.TEST", "api.example.test", true, 443),
   ("https://api.example.test:8443/", "api.example.test:8443", true, 8443),
-  ("http://127.0.0.1:7233", "127.0.0.1:7233", false, 7233),
+  ("http://127.0.0.1:50051", "127.0.0.1:50051", false, 50051),
   ("https://[::1]:7443", "[::1]:7443", true, 7443)
 ]
 

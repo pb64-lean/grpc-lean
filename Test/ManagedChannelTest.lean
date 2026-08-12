@@ -281,7 +281,7 @@ private instance : Inhabited ConnectAttempt where
   }
 
 private def testOrderedPlaintextFallback : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.2", "::1"]
   let attempts ← IO.mkRef (#[] : Array ConnectAttempt)
   let closes ← IO.mkRef (#[] : Array Nat)
@@ -315,7 +315,7 @@ private def testOrderedPlaintextFallback : IO Unit := do
       seen[1]!.address.numericHost == "::1")
     "plaintext address order changed"
   for attempt in seen do
-    expect (attempt.authority == "localhost:7233")
+    expect (attempt.authority == "localhost:50051")
       "plaintext attempt lost endpoint authority"
     expect (attempt.scheme == "http")
       "plaintext attempt lost endpoint scheme"
@@ -335,7 +335,7 @@ private def testOrderedPlaintextFallback : IO Unit := do
     "selected plaintext connection was not closed exactly once"
 
 private def testRegistrationReceiptsAreOneShotAndSealed : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closes ← IO.mkRef (#[] : Array Nat)
   let allowLate ← IO.Promise.new
@@ -417,7 +417,7 @@ private def testRegistrationReceiptsAreOneShotAndSealed : IO Unit := do
     "stale receipt mismatch erased or duplicated a registered resource"
 
 private def testPlaintextPolicyAndAddressBound : IO Unit := do
-  let remote ← apiConfiguration "http://api.example.test:7233"
+  let remote ← apiConfiguration "http://api.example.test:50051"
   let resolveCalls ← IO.mkRef 0
   let remoteDependencies : ManagedChannel.Dependencies Nat := {
     resolve := fun _ => do
@@ -432,7 +432,7 @@ private def testPlaintextPolicyAndAddressBound : IO Unit := do
   expect ((← resolveCalls.get) == 0)
     "syntactically remote plaintext endpoint reached DNS"
 
-  let loopbackConfiguration ← apiConfiguration "http://localhost:7233"
+  let loopbackConfiguration ← apiConfiguration "http://localhost:50051"
   let mixed ←
     addresses loopbackConfiguration #["127.0.0.1", "203.0.113.9"]
   let mixedDependencies : ManagedChannel.Dependencies Nat := {
@@ -463,7 +463,7 @@ private def testPlaintextPolicyAndAddressBound : IO Unit := do
 
 private def testSanitizedSetupAndResourceFailures : IO Unit := do
   let secret := "credential=must-not-escape"
-  let loopbackConfiguration ← apiConfiguration "http://localhost:7233"
+  let loopbackConfiguration ← apiConfiguration "http://localhost:50051"
   let dnsDependencies : ManagedChannel.Dependencies Nat := {
     resolve := fun _ =>
       throw (IO.userError s!"DNS failure containing {secret}")
@@ -762,7 +762,7 @@ private def testHttpsPolicyAndAlpnFallback : IO Unit := do
     "HTTPS IPv6-literal connection was not closed"
 
 private def testCallLeaseAndCloseLifecycle : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let dependencies : ManagedChannel.Dependencies Nat := {
@@ -857,7 +857,7 @@ private def testCallLeaseAndCloseLifecycle : IO Unit := do
   | _ => fail "closed channel admitted a new call"
 
 private def testTransportCloseFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let secret := "transport-close-secret"
   let closeCount ← IO.mkRef 0
@@ -891,7 +891,7 @@ private def testTransportCloseFailure : IO Unit := do
     "ambiguous transport close was retried"
 
 private def testCallCleanupUncertaintyPoisonsChannel : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let dependencies : ManagedChannel.Dependencies Nat := {
@@ -925,7 +925,7 @@ private def testCallCleanupUncertaintyPoisonsChannel : IO Unit := do
   | _ => fail "close did not join cleanup-uncertainty containment"
 
 private def testLazySharedSingleFlightAndReconnect : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let resolveCount ← IO.mkRef 0
   let connectCount ← IO.mkRef 0
@@ -1043,7 +1043,7 @@ cache reconnects to H. This is the transport-level fact that makes a namespace
 probe and its following mutation/evidence inseparable.
 -/
 private def testSharedGenerationScopePinsAcrossReconnect : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let nextResource ← IO.mkRef 100
@@ -1118,7 +1118,7 @@ private def testSharedGenerationScopePinsAcrossReconnect : IO Unit := do
     "final close did not close H exactly once"
 
 private def testEscapedGenerationScopeIsRevoked : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closes ← IO.mkRef (#[] : Array Nat)
   let escaped ← IO.mkRef
@@ -1160,7 +1160,7 @@ private def testEscapedGenerationScopeIsRevoked : IO Unit := do
     "final close did not own the escaped generation exactly once"
 
 private def testGenerationScopeDrainsAdmittedInvocation : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let entered ← IO.Promise.new
   let allowCompletion ← IO.Promise.new
@@ -1214,7 +1214,7 @@ private def testGenerationScopeDrainsAdmittedInvocation : IO Unit := do
     "generation-drain final close did not close exactly once"
 
 private def testGenerationScopePreservesDetachedRetirement : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let nextResource ← IO.mkRef 501
   let entered ← IO.Promise.new
@@ -1283,7 +1283,7 @@ private def testGenerationScopePreservesDetachedRetirement : IO Unit := do
     "final close did not close the replacement generation exactly once"
 
 private def testGenerationRetirementMergesBySeverity : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let rpcEntered ← IO.Promise.new
   let cleanupEntered ← IO.Promise.new
@@ -1361,7 +1361,7 @@ private def testGenerationRetirementMergesBySeverity : IO Unit := do
   | .error error => fail s!"retirement severity final close failed: {error}"
 
 private def testLocalCallCompletionDoesNotRetireGeneration : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   for isDeadline in [true, false] do
     let connectCount ← IO.mkRef 0
@@ -1449,7 +1449,7 @@ private def testSharedRpcRetirementClassification : IO Unit := do
   expect (allGrpcCodes.length == 17)
     "gRPC status classification fixture is not exhaustive"
 
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   for code in allGrpcCodes do
     let connectCount ← IO.mkRef 0
@@ -1522,7 +1522,7 @@ private def testSharedRpcRetirementClassification : IO Unit := do
       s!"status {repr code} changed exact generation close ownership"
 
 private def testSharedRpcRetirementCloseFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -1592,7 +1592,7 @@ private def testSharedRpcRetirementCloseFailure : IO Unit := do
     "terminal retirement failure erased its exact channel owner"
 
 private def testSharedInitializationCleanupUncertainty : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -1670,7 +1670,7 @@ private def testSharedInitializationCleanupUncertainty : IO Unit := do
     "cleanup-uncertain shared owner reconnected"
 
 private def testCancelledSoleWaiterTerminalHandoffSelfDrives : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -1748,7 +1748,7 @@ private def testCancelledSoleWaiterTerminalHandoffSelfDrives : IO Unit := do
     "observing sole-waiter completion retried allocation or cleanup"
 
 private def testTerminalHandoffDoesNotJoinExistingInlineCloser : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -1828,7 +1828,7 @@ private def testTerminalHandoffDoesNotJoinExistingInlineCloser : IO Unit := do
 
 private def testExternalInlineCloserRetainsTransferredInitializer :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -1967,7 +1967,7 @@ private def testExternalInlineCloserRetainsTransferredInitializer :
 
 private def testSharedCleanupFailureIsConsumedOnceAcrossTwoWaiters :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -2044,7 +2044,7 @@ private def testSharedCleanupFailureIsConsumedOnceAcrossTwoWaiters :
     "two-waiter settlement retried ambiguous initialization cleanup"
 
 private def testMismatchedCleanupFailureIsQuarantined : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let quarantinedCloseCount ← IO.mkRef 0
   let failureDependencies : ManagedChannel.Dependencies Nat := {
@@ -2192,7 +2192,7 @@ private def makeCleanupFailure
       fail s!"{detail}: unexpectedly opened a channel"
 
 private def testOwnedCleanupCustodyTransfersToSharedSupervisor : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let sharedDependencies : ManagedChannel.Dependencies Nat := {
     resolve := fun _ => fail "direct custody transfer resolved an endpoint"
@@ -2288,7 +2288,7 @@ private def testOwnedCleanupCustodyTransfersToSharedSupervisor : IO Unit := do
     "quarantined observation replayed the ambiguous raw connector close"
 
 private def testDirectCloseRacesSharedCustodyTransfer : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let rawCloseCount ← IO.mkRef 0
   let failure ← makeCleanupFailure configuration destinations
@@ -2376,7 +2376,7 @@ private def testDirectCloseRacesSharedCustodyTransfer : IO Unit := do
     "direct-close/transfer race replayed the raw connector close"
 
 private def testCopiedCleanupDiagnosticIsSupervisorInert : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let failedCloseCount ← IO.mkRef 0
   let owned ← makeCleanupFailure configuration destinations
@@ -2463,7 +2463,7 @@ private def testCopiedCleanupDiagnosticIsSupervisorInert : IO Unit := do
 
 private def testSameOwnedCleanupFailureAcrossGenerationsTransfersOnce :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let failedCloseCount ← IO.mkRef 0
   let failure ← makeCleanupFailure configuration destinations
@@ -2572,7 +2572,7 @@ private def testSameOwnedCleanupFailureAcrossGenerationsTransfersOnce :
 
 private def testDistinctOwnedCleanupFailuresAtSameGenerationAreBothRetained :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let firstCloseCount ← IO.mkRef 0
   let secondCloseCount ← IO.mkRef 0
@@ -2667,7 +2667,7 @@ private def testDistinctOwnedCleanupFailuresAtSameGenerationAreBothRetained :
     "distinct owner settlement retried or discarded a cleanup effect"
 
 private def testStaleOwnerFreeWaiterUsesAuthoritativeFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let cleanupCount ← IO.mkRef 0
@@ -2761,7 +2761,7 @@ private def testStaleOwnerFreeWaiterUsesAuthoritativeFailure : IO Unit := do
     "authoritative stale-waiter close retried ambiguous cleanup"
 
 private def testSharedPreOpenFailureIsOwnerFreeAndRetryable : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let initializationAttempts ← IO.mkRef 0
   let dependencies : ManagedChannel.Dependencies Nat := {
     resolve := fun _ => fail "pre-open failure unexpectedly resolved"
@@ -2806,7 +2806,7 @@ private def testSharedPreOpenFailureIsOwnerFreeAndRetryable : IO Unit := do
     "owner-free pre-open close changed the clean inventory"
 
 private def testInitializationTaskAllocationFailureIsRetryable : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let allocationAttempts ← IO.mkRef 0
   let initializationBodies ← IO.mkRef 0
@@ -2882,7 +2882,7 @@ private def testInitializationTaskAllocationFailureIsRetryable : IO Unit := do
     "initializer allocation recovery did not close its generation once"
 
 private def testInitializationWaitsForSupervisorPublication : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let publicationEntered ← IO.Promise.new
   let allowPublication ← IO.Promise.new
@@ -2978,7 +2978,7 @@ private def testInitializationWaitsForSupervisorPublication : IO Unit := do
     "publication-gated initializer retained cleanup custody"
 
 private def testOwnerAdoptionFailureRollsBackStructurally : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let adoptionAttempts ← IO.mkRef 0
   let connectCount ← IO.mkRef 0
@@ -3110,7 +3110,7 @@ private def testOwnerAdoptionFailureRollsBackStructurally : IO Unit := do
     "ambiguous adoption rollback retried an effect"
 
 private def testInitializationDebtPoisonsAdmissionAtomically : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -3172,7 +3172,7 @@ private def testInitializationDebtPoisonsAdmissionAtomically : IO Unit := do
     "atomic cleanup-debt containment retried the ambiguous close"
 
 private def testCleanOpeningFailurePreservesUnavailableAndRetry : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let resolveCount ← IO.mkRef 0
   let connectCount ← IO.mkRef 0
@@ -3231,7 +3231,7 @@ private def testCleanOpeningFailurePreservesUnavailableAndRetry : IO Unit := do
     "clean opening retry did not close its exact generation"
 
 private def testTerminalPolicyFailureClosesSharedOwner : IO Unit := do
-  let configuration ← apiConfiguration "http://api.example.test:7233"
+  let configuration ← apiConfiguration "http://api.example.test:50051"
   let initializationAttempts ← IO.mkRef 0
   let resolveCount ← IO.mkRef 0
   let actionCount ← IO.mkRef 0
@@ -3387,7 +3387,7 @@ private def testTrustPreparationIsTerminalAndPinned : IO Unit := do
     "cached trust close retained network custody"
 
 private def testConnectorInvariantPoisonsSharedClose : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
   let initializationAttempts ← IO.mkRef 0
@@ -3495,7 +3495,7 @@ private def invariantCleanupDependencies
 }
 
 private def testConnectorInvariantCleanupPreservesBothCauses : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
 
@@ -3579,7 +3579,7 @@ private def testConnectorInvariantCleanupPreservesBothCauses : IO Unit := do
     "composite shared settlement retried cleanup or reached the action"
 
 private def testCloseOwnsCancelledCompositeOpenFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
   let connectCount ← IO.mkRef 0
@@ -3664,7 +3664,7 @@ private def testCloseOwnsCancelledCompositeOpenFailure : IO Unit := do
     "close-owned composite retried rollback or reached the action"
 
 private def testInvocationDeadlineStartsBeforeInitialization : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectEntered ← IO.Promise.new
   let allowConnect ← IO.Promise.new
@@ -3720,7 +3720,7 @@ private def testInvocationDeadlineStartsBeforeInitialization : IO Unit := do
     "deadline-staged initializer left cleanup debt after close"
 
 private def testInvocationOwnerCancellationPrecedesDeadline : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectEntered ← IO.Promise.new
   let allowConnect ← IO.Promise.new
@@ -3772,7 +3772,7 @@ private def testInvocationOwnerCancellationPrecedesDeadline : IO Unit := do
     "owner-cancelled initializer did not close its exact resource"
 
 private def testGenerationSetupUsesFirstInvocationBudget : IO Unit := do
-  let base ← apiConfiguration "http://localhost:7233"
+  let base ← apiConfiguration "http://localhost:50051"
   let some deadline := Grpc.RpcDeadline.ofSeconds? 1
     | fail "generation setup deadline fixture was rejected"
   let configuration := { base with deadline }
@@ -3817,7 +3817,7 @@ private def testGenerationSetupUsesFirstInvocationBudget : IO Unit := do
     "generation setup deadline did not close its exact staged resource"
 
 private def testGenerationScopeOutlivesConsumedFirstBudget : IO Unit := do
-  let base ← apiConfiguration "http://localhost:7233"
+  let base ← apiConfiguration "http://localhost:50051"
   let some deadline := Grpc.RpcDeadline.ofSeconds? 1
     | fail "generation lifetime deadline fixture was rejected"
   let configuration := { base with deadline }
@@ -3856,7 +3856,7 @@ private def testGenerationScopeOutlivesConsumedFirstBudget : IO Unit := do
     "long generation scope changed exact connection ownership"
 
 private def testGenerationFirstPolicyTransfersWithoutRestart : IO Unit := do
-  let base ← apiConfiguration "http://localhost:7233"
+  let base ← apiConfiguration "http://localhost:50051"
   let some setupDeadline := Grpc.RpcDeadline.ofSeconds? 3
     | fail "generation transfer setup deadline fixture was rejected"
   let some firstDeadline := Grpc.RpcDeadline.ofSeconds? 1
@@ -3902,7 +3902,7 @@ private def testGenerationFirstPolicyTransfersWithoutRestart : IO Unit := do
     "generation policy transfer changed exact connection ownership"
 
 private def testExplicitGenerationPolicyGovernsSetup : IO Unit := do
-  let base ← apiConfiguration "http://localhost:7233"
+  let base ← apiConfiguration "http://localhost:50051"
   let some defaultDeadline :=
       Grpc.RpcDeadline.ofSeconds? 1
     | fail "explicit generation default deadline fixture was rejected"
@@ -3955,7 +3955,7 @@ private def testExplicitGenerationPolicyGovernsSetup : IO Unit := do
     "explicit generation policy changed exact resource ownership"
 
 private def testExplicitGenerationPolicyCancelsSetup : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let some firstDeadline :=
       Grpc.RpcDeadline.ofSeconds? 70
     | fail "explicit cancellation deadline fixture was rejected"
@@ -4010,7 +4010,7 @@ private def testExplicitGenerationPolicyCancelsSetup : IO Unit := do
     "explicit generation cancellation lost its staged resource"
 
 private def testExplicitGenerationPolicyMismatchIsSticky : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let some declaredDeadline :=
       Grpc.RpcDeadline.ofSeconds? 3
     | fail "declared generation deadline fixture was rejected"
@@ -4075,7 +4075,7 @@ private def testExplicitGenerationPolicyMismatchIsSticky : IO Unit := do
   | .error error => fail s!"generation mismatch final close failed: {error}"
 
 private def testFirstBudgetSelectionAndAdmissionAreAtomic : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let some declaredDeadline :=
       Grpc.RpcDeadline.ofSeconds? 3
     | fail "atomic admission deadline fixture was rejected"
@@ -4145,7 +4145,7 @@ private def testFirstBudgetSelectionAndAdmissionAreAtomic : IO Unit := do
   | .error error => fail s!"atomic admission final close failed: {error}"
 
 private def testGenerationAdmissionQueueConsumesDeadline : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let some firstDeadline :=
       Grpc.RpcDeadline.ofSeconds? 3
     | fail "queued admission first deadline fixture was rejected"
@@ -4215,7 +4215,7 @@ private def testGenerationAdmissionQueueConsumesDeadline : IO Unit := do
     "queued admission deadline changed exact resource ownership"
 
 private def testRejectedGenerationScopeSettlesBudget : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let shared ← ManagedChannel.createWith
     { resolve := fun _ => fail "closed generation scope resolved"
       loadTrust := fail "closed generation scope loaded trust anchors"
@@ -4241,7 +4241,7 @@ private def testRejectedGenerationScopeSettlesBudget : IO Unit := do
     "rejected generation scope entered its callback"
 
 private def testInvocationGateRejectsPostDeadlineStart : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let actionEntered ← IO.Promise.new
   let allowClaim ← IO.Promise.new
@@ -4286,7 +4286,7 @@ private def testInvocationGateRejectsPostDeadlineStart : IO Unit := do
     "invocation gate test changed exact connection ownership"
 
 private def testSetupIsDeductedFromCallBudget : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectEntered ← IO.Promise.new
   let allowConnect ← IO.Promise.new
@@ -4334,7 +4334,7 @@ private def testSetupIsDeductedFromCallBudget : IO Unit := do
     "remaining budget test changed exact connection ownership"
 
 private def testDeadlineOverridesLateActionEvidence : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let nextResource ← IO.mkRef 997
   let closes ← IO.mkRef (#[] : Array Nat)
@@ -4427,7 +4427,7 @@ private def testDeadlineOverridesLateActionEvidence : IO Unit := do
     "late owner-evidence test changed exact connection ownership"
 
 private def testBoundedCloseRetainsBlockedInitialization : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeTaskAttempts ← IO.mkRef 0
   let connectCount ← IO.mkRef 0
@@ -4486,7 +4486,7 @@ private def testBoundedCloseRetainsBlockedInitialization : IO Unit := do
     "bounded initializer joined close retained cleanup custody"
 
 private def testBoundedCloseRetainsBlockedEstablishedGeneration : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeTaskAttempts ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -4558,7 +4558,7 @@ private def testBoundedCloseRetainsBlockedEstablishedGeneration : IO Unit := do
     "bounded established close did not discharge exact custody"
 
 private def testCloseSettlementRepeatedWakeup : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   for index in [0:8] do
     let resource := 1_400 + index
@@ -4615,7 +4615,7 @@ private def testCloseSettlementRepeatedWakeup : IO Unit := do
       "settlement wakeup retained cleanup custody"
 
 private def testBoundedClosePreservesLaterFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let closeEntered ← IO.Promise.new
@@ -4668,7 +4668,7 @@ private def testBoundedClosePreservesLaterFailure : IO Unit := do
     "terminal boundary observation repeated transport cleanup"
 
 private def testBoundedCloseDriverFailureRetainsCustody : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeTaskAttempts ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -4733,7 +4733,7 @@ private def testBoundedCloseDriverFailureRetainsCustody : IO Unit := do
     "joining fallback left unpublished close custody"
 
 private def testJoiningCloseRetakesRacingBoundedFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeTaskAttempts ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -4802,7 +4802,7 @@ private def testJoiningCloseRetakesRacingBoundedFailure : IO Unit := do
     "repeated terminal request started another close generation"
 
 private def testBoundedWaitObservesRacingDriverFailure : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let closeTaskAttempts ← IO.mkRef 0
   let allocationEntered ← IO.Promise.new
   let allowAllocationFailure ← IO.Promise.new
@@ -4847,7 +4847,7 @@ private def testBoundedWaitObservesRacingDriverFailure : IO Unit := do
     "joining close did not retake bounded waiter custody exactly once"
 
 private def testCloseObservationResamplesRetakenCustody : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let closeTaskAttempts ← IO.mkRef 0
   let firstAllocationEntered ← IO.Promise.new
   let allowFirstFailure ← IO.Promise.new
@@ -4924,7 +4924,7 @@ private def testCloseObservationResamplesRetakenCustody : IO Unit := do
     "custody resample retained cleanup custody"
 
 private def testCloseCompletionWinsObservationBoundary : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let publicationEntered ← IO.Promise.new
   let allowPublication ← IO.Promise.new
   let observationEntered ← IO.Promise.new
@@ -4967,7 +4967,7 @@ private def testCloseCompletionWinsObservationBoundary : IO Unit := do
     "close boundary race did not retain terminal phase"
 
 private def testSharedExplicitCloseTaskFailureFallsBackInline : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -5035,7 +5035,7 @@ private def testSharedExplicitCloseTaskFailureFallsBackInline : IO Unit := do
     "repeated close started a second claimed-close owner"
 
 private def testCloseTaskHandlePrecedesCleanup : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let publicationEntered ← IO.Promise.new
@@ -5090,7 +5090,7 @@ private def testCloseTaskHandlePrecedesCleanup : IO Unit := do
     "close-task gating test changed exact cleanup count"
 
 private def testSharedCloseCompletionPublicationFailureSettles : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let publicationAttempts ← IO.mkRef 0
@@ -5141,7 +5141,7 @@ private def testSharedCloseCompletionPublicationFailureSettles : IO Unit := do
     "supervisor state erased the exact detached close-task owner"
 
 private def testSharedCloseTaskPublicationFailureJoinsLocalOwner : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let closeCount ← IO.mkRef 0
   let publicationAttempts ← IO.mkRef 0
@@ -5199,7 +5199,7 @@ private def testSharedCloseTaskPublicationFailureJoinsLocalOwner : IO Unit := do
     "repeated close restarted the promise-owned task"
 
 private def testSharedCloseJoinsInitialization : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -5255,7 +5255,7 @@ private def testSharedCloseJoinsInitialization : IO Unit := do
     "successful shared close retained cleanup debt"
 
 private def testCallerOwnedInitializationTaskFailureIsSticky : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let taskBodyCount ← IO.mkRef 0
   let openCount ← IO.mkRef 0
   let resolveCount ← IO.mkRef 0
@@ -5322,7 +5322,7 @@ private def testCallerOwnedInitializationTaskFailureIsSticky : IO Unit := do
 
 private def testCancellationSelectedTaskFailureOutranksCancellation :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let taskBodyCount ← IO.mkRef 0
   let openCount ← IO.mkRef 0
   let resolveCount ← IO.mkRef 0
@@ -5397,7 +5397,7 @@ private def testCancellationSelectedTaskFailureOutranksCancellation :
     "repeated cancellation-selected close retried an effect"
 
 private def testCloseOwnedInitializationTaskFailureIsSticky : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let taskBodyCount ← IO.mkRef 0
   let openCount ← IO.mkRef 0
   let resolveCount ← IO.mkRef 0
@@ -5475,7 +5475,7 @@ private def testCloseOwnedInitializationTaskFailureIsSticky : IO Unit := do
 
 private def testCancellationSelectedRetryableFailureStaysOwnerCancelled :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let initializationAttempts ← IO.mkRef 0
   let resolveCount ← IO.mkRef 0
@@ -5559,7 +5559,7 @@ private def testCancellationSelectedRetryableFailureStaysOwnerCancelled :
 
 private def testCancellationSelectedInvariantOutranksOwnerCancellation :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
   let connectCount ← IO.mkRef 0
@@ -5675,7 +5675,7 @@ private def runAdmittedLateCancellation
   expectFailure admittedResult
 
 private def testAdmittedIdleClaimCannotRestartDuringDrain : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let claimEntered ← IO.Promise.new
   let allowClaim ← IO.Promise.new
   let resolveCount ← IO.mkRef 0
@@ -5714,7 +5714,7 @@ private def testAdmittedIdleClaimCannotRestartDuringDrain : IO Unit := do
 
 private def testAdmittedCancellationPreservesPublishedTerminalPolicy :
     IO Unit := do
-  let configuration ← apiConfiguration "http://api.example.test:7233"
+  let configuration ← apiConfiguration "http://api.example.test:50051"
   let failureEntered ← IO.Promise.new
   let allowFailure ← IO.Promise.new
   let claimEntered ← IO.Promise.new
@@ -5750,7 +5750,7 @@ private def testAdmittedCancellationPreservesPublishedTerminalPolicy :
   | .error error => fail s!"terminal-policy race close failed: {error}"
 
 private def testAdmittedCancellationPreservesPublishedInvariant : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
   let failureEntered ← IO.Promise.new
@@ -5805,7 +5805,7 @@ private def testAdmittedCancellationPreservesPublishedInvariant : IO Unit := do
 
 private def testAdmittedCancellationPreservesPublishedCleanupUncertainty :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let failureEntered ← IO.Promise.new
   let allowFailure ← IO.Promise.new
@@ -5853,7 +5853,7 @@ private def testAdmittedCancellationPreservesPublishedCleanupUncertainty :
   | result => fail s!"published cleanup close returned {repr result}"
 
 private def testCloseOwnsCancelledCleanupFailureSettlement : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let closeCount ← IO.mkRef 0
@@ -5925,7 +5925,7 @@ private def testCloseOwnsCancelledCleanupFailureSettlement : IO Unit := do
     "repeated close retried ambiguous initialization cleanup"
 
 private def testCloseOwnsCancelledInvariantSettlement : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ←
     addresses configuration #["127.0.0.1", "127.0.0.2"]
   let connectCount ← IO.mkRef 0
@@ -6017,7 +6017,7 @@ private def testCloseOwnsCancelledInvariantSettlement : IO Unit := do
 
 private def testSharedInitializationCancellationSettlesOnLaterCall :
     IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let cancelledActionCalls ← IO.mkRef 0
@@ -6087,7 +6087,7 @@ private def testSharedInitializationCancellationSettlesOnLaterCall :
     "recovered staged resource lost cleanup ownership"
 
 private def testSharedInitializationCancellationPrunesWaiters : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let actionCalls ← IO.mkRef 0
@@ -6148,7 +6148,7 @@ private def testSharedInitializationCancellationPrunesWaiters : IO Unit := do
     "waiter-pruning initializer resource was not closed exactly once"
 
 private def testSharedInitializationCancellationSettlesOnClose : IO Unit := do
-  let configuration ← apiConfiguration "http://localhost:7233"
+  let configuration ← apiConfiguration "http://localhost:50051"
   let destinations ← addresses configuration #["127.0.0.1"]
   let connectCount ← IO.mkRef 0
   let actionCalls ← IO.mkRef 0

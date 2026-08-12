@@ -28,7 +28,7 @@ private def testLiteralBypassesLookup : IO Unit := do
   let lookup : Grpc.NameResolver.Lookup := fun host port => do
     calls.modify (·.push (host, port))
     pure (.error (.resolver (IO.userError "literal reached DNS")))
-  let ipv4 ← endpoint "http://127.0.0.1:7233"
+  let ipv4 ← endpoint "http://127.0.0.1:50051"
   let ipv6 ← endpoint "https://[::1]"
   let .ok ipv4Addresses ← Grpc.NameResolver.resolveWith lookup ipv4
     | fail "IPv4 literal resolution failed"
@@ -36,11 +36,11 @@ private def testLiteralBypassesLookup : IO Unit := do
     | fail "IPv6 literal resolution failed"
   expect (ipv4Addresses.size == 1) "IPv4 literal produced multiple addresses"
   expect (ipv6Addresses.size == 1) "IPv6 literal produced multiple addresses"
-  expectAddress ipv4Addresses[0]! .ipv4 "127.0.0.1" 7233
+  expectAddress ipv4Addresses[0]! .ipv4 "127.0.0.1" 50051
   expectAddress ipv6Addresses[0]! .ipv6 "::1" 443
   match ipv4Addresses[0]!.socketAddress with
   | .v4 socket =>
-      expect (toString socket == "127.0.0.1:7233")
+      expect (toString socket == "127.0.0.1:50051")
         "IPv4 socket conversion changed"
   | .v6 _ => fail "IPv4 destination became an IPv6 socket"
   match ipv6Addresses[0]!.socketAddress with
@@ -195,12 +195,12 @@ private def testNativeValidationAndLocalhost : IO Unit := do
           (Std.Net.IPv4Addr.ofString address).isSome ||
           (Std.Net.IPv6Addr.ofString address).isSome)
           s!"localhost DNS returned a non-numeric address: {address}"
-  let localhost ← endpoint "http://localhost:7233"
+  let localhost ← endpoint "http://localhost:50051"
   match ← Grpc.NameResolver.resolve localhost with
   | .error error => fail s!"localhost endpoint resolution failed: {error}"
   | .ok addresses =>
       expect (!addresses.isEmpty) "localhost endpoint resolved to no addresses"
-      expect (addresses.all (·.port == 7233))
+      expect (addresses.all (·.port == 50051))
         "localhost endpoint lost its effective port"
 
 def run : IO Unit := do
