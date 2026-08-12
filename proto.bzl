@@ -84,6 +84,8 @@ def _lean_proto_generate_impl(ctx):
         args.add("--proto_path=" + path)
     args.add("--plugin=protoc-gen-lean4=" + ctx.executable._protoc_gen_lean4.path)
     args.add("--lean4_opt=lean4_prefix=" + module_prefix)
+    if ctx.attr.reflection_descriptors_only:
+        args.add("--lean4_opt=reflection_descriptors_only=true")
     if dep_module_entries:
         args.add("--lean4_opt=dep_modules=" + ";".join(dep_module_entries))
     args.add_all([src.path for src in proto_sources])
@@ -145,6 +147,10 @@ _lean_proto_generate = rule(
         "module_prefix": attr.string(
             doc = "Lean module prefix for generated modules. Defaults to PascalCase(name).",
         ),
+        "reflection_descriptors_only": attr.bool(
+            default = False,
+            doc = "Emit only embedded gRPC reflection descriptors.",
+        ),
         "deps": attr.label_list(
             doc = "Codegen targets of other lean_proto_library targets whose protos this target imports.",
             providers = [_LeanProtoLibraryGenInfo],
@@ -204,6 +210,7 @@ def lean_proto_library(
         # Resolve the default here so it derives from the user-facing target
         # name, not the internal "<name>_gen" codegen target.
         module_prefix = module_prefix or _default_module_prefix(name),
+        reflection_descriptors_only = False,
         deps = [_gen_label(d) for d in (proto_deps or [])],
         visibility = visibility,
     )
@@ -222,6 +229,55 @@ def lean_proto_library(
     ]
     if proto_deps:
         lean_deps = lean_deps + proto_deps
+    if deps:
+        lean_deps = lean_deps + deps
+
+    lean_library(
+        name = name,
+        srcs = [":" + srcs_name],
+        strip_module_prefix = native.package_name(),
+        deps = lean_deps,
+        visibility = visibility,
+        **kwargs
+    )
+
+def lean_proto_descriptor_library(
+        name,
+        proto,
+        module_prefix = None,
+        deps = None,
+        visibility = None,
+        **kwargs):
+    """Generates embedded reflection descriptors without types or services.
+
+    The generated modules import only the reflection descriptor data model,
+    allowing a gRPC runtime to compile descriptors for services it implements
+    itself without depending cyclically on the full runtime library.
+    """
+    gen_name = name + "_gen"
+    _lean_proto_generate(
+        name = gen_name,
+        proto = proto,
+        module_prefix = module_prefix or _default_module_prefix(name),
+        reflection_descriptors_only = True,
+        # Descriptor-only output embeds the ProtoInfo transitive closure and
+        # therefore never imports another generated protobuf target.
+        deps = [],
+        visibility = visibility,
+    )
+
+    srcs_name = name + "_srcs"
+    native.filegroup(
+        name = srcs_name,
+        srcs = [":" + gen_name],
+        output_group = "lean_srcs",
+        visibility = ["//visibility:private"],
+    )
+
+    lean_deps = [
+        "@grpc_lean_protobuf//:protobuf",
+        "@rules_lean_grpc//:grpc_reflection_descriptor",
+    ]
     if deps:
         lean_deps = lean_deps + deps
 

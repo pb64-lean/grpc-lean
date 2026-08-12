@@ -602,6 +602,30 @@ def testReflectionService : IO Unit := do
           "reflection list_services should include the v1alpha reflection service"
     | _ => throw (IO.userError "reflection list_services returned the wrong response kind")
 
+  let stableRegistry := Services.Reflection.registerV1With {
+    serviceNames := #[Services.Reflection.v1alphaServiceName]
+  } <| Registry.empty.registerUnary echoMethod fun request => do
+    pure { data := request.data }
+  let stableResponse ← dispatchReflection stableRegistry Services.Reflection.v1ServiceName {
+    kind := some (.listServices "")
+  }
+  match stableResponse.kind with
+  | some (.listServicesResponse services) =>
+      let names := services.service.map (fun service => service.name)
+      expect (names.contains "lean.example.proto.NoteService")
+        "stable reflection list_services omitted an application service"
+      expect (names.contains Services.Reflection.v1ServiceName)
+        "stable reflection list_services omitted v1"
+      expect (!names.contains Services.Reflection.v1alphaServiceName)
+        "stable reflection advertised configured v1alpha"
+  | _ => throw (IO.userError "stable reflection list_services returned the wrong response kind")
+  let alphaBody ← reflectionBody { kind := some (.listServices "") }
+  let alphaResult ← (stableRegistry.dispatchBidirectionalStreaming
+    (requestHeadersForPath Services.Reflection.v1alphaMethodName.path) alphaBody).run
+  let alphaStatus ← expectStatusError alphaResult
+  expectEq alphaStatus.code Code.unimplemented
+    "stable reflection unexpectedly registered the v1alpha route"
+
   let rootDescriptor := bytes [1, 2, 3]
   let dependencyDescriptor := bytes [4, 5, 6]
   let registry := Services.Reflection.registerWith {

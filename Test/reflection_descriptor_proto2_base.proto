@@ -1,0 +1,12 @@
+syntax = "proto2";
+
+package test.reflection;
+
+message Extendee {
+  enum State {
+    UNKNOWN = 0;
+    READY = 1;
+  }
+
+  extensions 100 to max;
+}

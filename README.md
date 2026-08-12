@@ -41,7 +41,7 @@ flowchart TB
 | Compression | gzip both directions (see below) |
 | Metadata | ASCII + `-bin` base64 binary metadata, full validation (pseudo-header rules, forbidden connection headers, reserved response/trailer names) |
 | Health | `grpc.health.v1.Health` `Check` + `Watch`, per-service status, terminal shutdown |
-| Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `ListServices` is derived from the registry automatically. `lean_proto_library` codegen embeds each file's serialized `FileDescriptorProto` (source info stripped) as `fileDescriptors`, so `registerWith { files := Generated.fileDescriptors }` answers `FileByFilename`, `FileContainingSymbol`, `FileContainingExtension` and `AllExtensionNumbersOfType` — each response carries the transitive import closure, which is what schema-less clients need to resolve imported messages. Files you do not pass in `Reflection.Config` still answer `NOT_FOUND` |
+| Reflection | `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`; `registerV1With` registers stable v1 only. `ListServices` is derived from the registry automatically. Generated services expose transitive `fileDescriptors`; combine multiple roots with checked `mergeDescriptorSets`, then pass the result to `registerWith` or `registerV1With`. The opt-in `//:grpc_standard_service_descriptors` target and `Grpc.Services.StandardDescriptors` module provide the Health and stable-v1 Reflection schemas. Filename, symbol, extension, and extension-number queries return closed descriptor sets; unknown files answer `NOT_FOUND` |
 | Keepalive | Opt-in server PING keepalive with ack timeout (plaintext managed path) |
 | Graceful shutdown | `shutdown` sends GOAWAY(NO_ERROR), refuses streams beyond the GOAWAY boundary with `REFUSED_STREAM`, and `wait` drains with a timeout — over both h2c and TLS |
 | Connection lifecycle | Every managed plaintext/TLS teardown records one `CloseCause`, with the last 64 readable from `Grpc.Server.closedConnections`. Once HTTP/2 is established and the peer is still readable, teardown makes a best-effort GOAWAY carrying that cause (sealed through TLS); a peer that already closed, or a connection still in TLS handshake, cannot receive one. After shutdown, exact connection owners are observed with a finite bound but never cancelled out from under nested work: timeout leaves the owner and connection registered and returns an ownership error. `acceptFailure?`/`checkAccepting` expose the accept loop while it runs |
@@ -459,7 +459,8 @@ Verified scope:
   and `@[extern]` bindings do not.
 - **External dependencies**: zlib (Bazel module), the vendored
   [Lean-zh/protobuf](https://github.com/Lean-zh/protobuf) runtime/plugin
-  (Apache-2.0, `third_party/Lean-zh/`), and the Lean compiler/runtime.
+  (Apache-2.0, `third_party/Lean-zh/`), grpc-proto's standard Health and
+  Reflection schemas (Apache-2.0), and the Lean compiler/runtime.
 
 ## License
 

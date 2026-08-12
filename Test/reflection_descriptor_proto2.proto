@@ -1,0 +1,9 @@
+syntax = "proto2";
+
+package test.reflection;
+
+import "Test/reflection_descriptor_proto2_base.proto";
+
+extend Extendee {
+  optional string note = 100;
+}

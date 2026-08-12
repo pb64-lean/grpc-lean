@@ -9,7 +9,7 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library", "lean_test")
 load("@rules_proto//proto:defs.bzl", "proto_library")
-load("//:defs.bzl", "lean_proto_library")
+load("//:defs.bzl", "lean_proto_descriptor_library", "lean_proto_library")
 
 # The self-signed TLS test identity, so example/interop targets in other
 # packages can depend on the same fixture the in-repo TLS tests use.
@@ -33,6 +33,46 @@ lean_test(
         ":recursive_struct_lean",
         "@grpc_lean_protobuf//:protobuf",
     ],
+)
+
+proto_library(
+    name = "reflection_descriptor_proto2_proto",
+    srcs = [
+        "Test/reflection_descriptor_proto2.proto",
+        "Test/reflection_descriptor_proto2_base.proto",
+    ],
+)
+
+lean_proto_descriptor_library(
+    name = "reflection_descriptor_proto2",
+    proto = ":reflection_descriptor_proto2_proto",
+    module_prefix = "ReflectionProto2",
+)
+
+lean_library(
+    name = "grpc_reflection_descriptor",
+    srcs = ["Grpc/Services/Reflection/Descriptor.lean"],
+)
+
+lean_proto_descriptor_library(
+    name = "grpc_health_descriptor_generated",
+    proto = "@grpc-proto//:health_proto",
+    module_prefix = "GrpcStandardProto",
+)
+
+lean_library(
+    name = "grpc_standard_service_descriptors",
+    srcs = ["Grpc/Services/StandardDescriptors.lean"],
+    deps = [
+        ":grpc_health_descriptor_generated",
+        ":grpc_reflection_v1_descriptor_generated",
+    ],
+)
+
+lean_proto_descriptor_library(
+    name = "grpc_reflection_v1_descriptor_generated",
+    proto = "@grpc-proto//:reflection_proto",
+    module_prefix = "GrpcStandardProto",
 )
 
 proto_library(
@@ -109,6 +149,7 @@ lean_library(
         "//Zlib:zlib",
         "//native:posix_ffi",
         ":grpc_cancellation_token",
+        ":grpc_reflection_descriptor",
         ":grpc_tls",
         "@grpc_lean_protobuf//:protobuf",
         "@tls13_lean//TLS13:tls13",
@@ -521,6 +562,16 @@ lean_test(
     name = "grpc_runtime_test",
     srcs = ["Test/GrpcRuntimeTest.lean"],
     deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "reflection_descriptor_test",
+    srcs = ["Test/ReflectionDescriptorTest.lean"],
+    deps = [
+        ":grpc_lean",
+        ":grpc_standard_service_descriptors",
+        ":reflection_descriptor_proto2",
+    ],
 )
 
 lean_test(

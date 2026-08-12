@@ -1,6 +1,7 @@
 module
 
 public import Grpc.Server
+public import Grpc.Services.Reflection.Descriptor
 public import Protobuf.Encoding
 
 public section
@@ -332,21 +333,6 @@ def encode (response : Response) : Except ProtoError ByteArray := do
 
 end Response
 
-structure ExtensionDescriptor where
-  containingType : String
-  extensionNumber : Int32
-  deriving Inhabited, Repr, DecidableEq
-
-structure FileDescriptor where
-  name : String
-  package : String := ""
-  symbols : Array String := #[]
-  dependencies : Array String := #[]
-  fileDescriptorProto : ByteArray
-  extensions : Array ExtensionDescriptor := #[]
-  extensionNumbers : Array (String × Array Int32) := #[]
-  deriving Inhabited
-
 structure Config where
   serviceNames : Array String := #[]
   files : Array FileDescriptor := #[]
@@ -373,6 +359,10 @@ private def configServiceNames (config : Config) (registry : Registry) : Array S
     uniqueStrings (names ++ reflectionServiceNames)
   else
     names
+
+private def v1ConfigServiceNames (config : Config) (registry : Registry) : Array String :=
+  uniqueStrings (registryServiceNames registry ++ config.serviceNames ++ #[v1ServiceName])
+    |>.filter (fun name => name != v1alphaServiceName)
 
 private def findFileByName? (config : Config) (name : String) : Option FileDescriptor :=
   config.files.find? (fun file => file.name == name)
@@ -507,6 +497,18 @@ def registerWith (config : Config) (registry : Registry) : Registry :=
     |>.registerBidirectionalStreamingStreamCodec v1MethodName Request.decode Response.encode (service config)
     |>.registerBidirectionalStreamingStreamCodec v1alphaMethodName Request.decode Response.encode
       (service config)
+
+/--
+Register only the stable `grpc.reflection.v1.ServerReflection` route. Service
+listing is derived from the registry plus the configured names and includes v1.
+It filters v1alpha from the advertised service set and never registers that
+legacy route. An alpha route already present in the input registry is not
+removed, but it is not listed by the newly registered v1 service.
+-/
+def registerV1With (config : Config) (registry : Registry) : Registry :=
+  let config := { config with serviceNames := v1ConfigServiceNames config registry }
+  registry.registerBidirectionalStreamingStreamCodec v1MethodName
+    Request.decode Response.encode (service config)
 
 def register (registry : Registry) : Registry :=
   registerWith {} registry
