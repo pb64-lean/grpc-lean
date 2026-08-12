@@ -470,8 +470,10 @@ private def waitConnectionTasks (server : Server) : IO Unit := do
   | some tasksMutex => tasksMutex.atomically do set (#[] : Array ConnectionTask)
 
 /-- Extra bound after the graceful drain deadline for the exact connection
-owners to run their one cleanup path. -/
-private def ownerCleanupTimeoutMs : Nat := 1000
+owners to run their one cleanup path.  TLS teardown can consume two separate
+200 ms transport bounds (retiring an in-flight handshake send, then shutting
+down the socket), so leave enough scheduling margin for loaded CI workers. -/
+private def ownerCleanupTimeoutMs : Nat := 3000
 
 private def waitTaskFinishedWithin (task : Task α) (timeoutMs : Nat) : IO Bool := do
   for _ in [0:timeoutMs] do
