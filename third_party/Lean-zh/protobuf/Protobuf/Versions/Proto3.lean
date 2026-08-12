@@ -39,8 +39,12 @@ def compile_enum (e : EnumDescriptorProto) : M DeclOutput := do
   let decl ← `(enum $typeId $enum_options_stx { $[$vIds = $vNumsQ;]* })
   if !! e.options&.deprecated then
     commitM `(attribute [deprecated "protobuf: deprecated enum"] $typeId)
-  for v in e.value, fieldNameId in vIds do
+  for v in e.value, fieldName in vNames do
     if !! v.options&.deprecated then
+      -- Enum values elaborate to constructors of the generated inductive, so
+      -- the attribute names `<enum>.<value>`; the bare value identifier the
+      -- `enum` notation takes does not resolve on its own.
+      let fieldNameId := mkIdent (typeName.str fieldName)
       commitM `(attribute [deprecated "protobuf: deprecated field"] $fieldNameId)
   return { decl, extra := (← extras.get) }
 

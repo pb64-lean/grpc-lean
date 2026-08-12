@@ -35,6 +35,38 @@ lean_test(
     ],
 )
 
+proto_library(
+    name = "schema_edges_proto",
+    srcs = ["Test/schema_edges.proto"],
+)
+
+lean_proto_library(
+    name = "schema_edges_lean",
+    proto = ":schema_edges_proto",
+    module_prefix = "SchemaEdgesProto",
+)
+
+proto_library(
+    name = "schema_edges_peer_proto",
+    srcs = ["Test/schema_edges_peer.proto"],
+)
+
+lean_proto_library(
+    name = "schema_edges_peer_lean",
+    proto = ":schema_edges_peer_proto",
+    module_prefix = "SchemaEdgesPeerProto",
+)
+
+lean_test(
+    name = "schema_edges_test",
+    srcs = ["Test/SchemaEdgesTest.lean"],
+    deps = [
+        ":schema_edges_lean",
+        ":schema_edges_peer_lean",
+        "@grpc_lean_protobuf//:protobuf",
+    ],
+)
+
 lean_library(
     name = "grpc_cancellation_token",
     srcs = ["Grpc/CancellationToken.lean"],

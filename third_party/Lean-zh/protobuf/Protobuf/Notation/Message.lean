@@ -1498,8 +1498,16 @@ private def construct_member_getters (name : Ident) (push_name : String → Iden
               | some ($ctorId:ident v) => v
               | _ => default)
             let getterD ← `(def $getterDId:ident (m : $name) := $getterId m)
-            let hasGetter ← `(def $hasId:ident (m : $name) : Bool :=
-              ($(x.field_proj) m).any (fun c => c matches $ctorId:ident _))
+            -- A single-member oneof makes the member test vacuous: any
+            -- present state holds this member. It also makes the `matches`
+            -- fallback below a redundant alternative, which Lean rejects, so
+            -- this is not merely a simplification.
+            let hasGetter ←
+              if iv.ctors.length == 1 then
+                `(def $hasId:ident (m : $name) : Bool := ($(x.field_proj) m).isSome)
+              else
+                `(def $hasId:ident (m : $name) : Bool :=
+                  ($(x.field_proj) m).any (fun c => c matches $ctorId:ident _))
             out := out.push getter
             out := out.push getterD
             out := out.push hasGetter
@@ -1540,7 +1548,13 @@ public def elabMessageDecCore (mutEnums mutOneofs messages : NameSet) : Syntax �
     «Unknown.Fields» : Std.HashMap Nat (Array Encoding.ProtoVal) := {})
   let push_name (component : String) := mkIdentFrom name (name.getId.str component)
   let (default', default) ← construct_default name push_name mdata
-  let inhInst ← `(instance : Inhabited $name := ⟨$default'⟩)
+  -- Auto-generated instance names use only the type's final component and can
+  -- collide inside recursive blocks or when same-named scoped messages from
+  -- different modules are imported together. Qualify the helper by the full
+  -- type name; `?` cannot occur in a protobuf identifier, so schema
+  -- declarations cannot steal this name.
+  let inhabitedId := push_name "instInhabited?"
+  let inhInst ← `(instance $inhabitedId:ident : Inhabited $name := ⟨$default'⟩)
   let (toMessage', toMessage, toMessageWithOptions', toMessageWithOptions) ← construct_toMessage name push_name mdata
   let (_, builder) ← construct_builder name push_name toMessage'
   let (fromMessage', fromMessage, fromMessageWithOptions', fromMessageWithOptions) ← construct_fromMessage name push_name mdata

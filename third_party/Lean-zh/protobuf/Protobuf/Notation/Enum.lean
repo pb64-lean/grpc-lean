@@ -100,7 +100,12 @@ public def elabEnumDecCore : Syntax → CommandElabM ProtobufDeclBlock := fun st
   let nullVariant? := dots.zip n |>.find? fun (_, y) => y.getNat == 0
   let nullVariant? ← nullVariant?.mapM (fun x => `($x.fst))
   let nullVariant ← nullVariant?.getDM `(.$unknownIdent 0)
-  let inhabited ← `(instance : Inhabited $name where default := $nullVariant)
+  -- Auto-generated instance names use only the type's final component and can
+  -- collide when modules defining same-named scoped enums are imported
+  -- together. Qualify the helper by the full type name; `?` cannot occur in a
+  -- protobuf identifier, so schema declarations cannot steal this name.
+  let inhabitedId := push_name "instInhabited?"
+  let inhabited ← `(instance $inhabitedId:ident : Inhabited $name where default := $nullVariant)
   let default_valueId := push_name "Default.Value"
   let default_value ← `(partial def $default_valueId : $name := $nullVariant)
   let (_, builder) ← construct_builder name push_name toInt32Id

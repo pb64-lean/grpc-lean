@@ -163,6 +163,18 @@ def extendDec.pprint : TSyntax ``extendDec → String
       s!"extend {extract_id x} \{{body}}"
   | _ => panic! "extendDec"
 
+/-- Deprecated schema elements are marked with an ordinary Lean `attribute`
+command rather than proto notation, so the notation printers above do not cover
+them. The marked name goes through `extract_id` for the same reason every other
+name here does: a schema name that happens to be a Lean keyword must come back
+out quoted. `none` for any other attribute, which the version compilers do not
+emit. -/
+def deprecatedAttr.pprint : Command → Option String
+  | `(attribute [deprecated $text:str] $x:ident) =>
+      let text := text.raw[0].isIdOrAtom?.getD (panic! "str")
+      some s!"attribute [deprecated {text}] {extract_id x}"
+  | _ => none
+
 def proto_decl.pprint : TSyntax ``proto_decl → String := fun s =>
   match s.raw[0].getKind with
   | ``enumDec => enumDec.pprint <| TSyntax.mk s.raw[0]

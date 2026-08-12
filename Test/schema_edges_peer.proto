@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package test.peer;
+
+// These short names intentionally match declarations in schema_edges.proto.
+// Importing both generated Lean modules catches unqualified helper-name
+// collisions that compiling either module alone cannot reveal.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_READY = 1;
+}
+
+message Capabilities {
+  string name = 1;
+}

@@ -471,6 +471,10 @@ def generate_code (request : CodeGeneratorRequest) : ExceptT String IO CodeGener
       | ``messageDec => pure <| PrettyPrinter.messageDec.pprint <| TSyntax.mk x.raw
       | ``proto_mutual_stx => pure <| PrettyPrinter.proto_mutual_stx.pprint <| TSyntax.mk x.raw
       | ``extendDec => pure <| PrettyPrinter.extendDec.pprint <| TSyntax.mk x.raw
+      | ``Lean.Parser.Command.attribute =>
+          match PrettyPrinter.deprecatedAttr.pprint <| TSyntax.mk x.raw with
+          | some cmd => pure cmd
+          | none => throw s!"{decl_name%}: unsupported generated attribute command"
       | kind => throw s!"{decl_name%}: unknown generated syntax kind {kind}"
     pure (String.intercalate "\n\n" cmds.toList)
 

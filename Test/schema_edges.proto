@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package test.edges;
+
+// Schema shapes that large third-party APIs use and that the other protos in
+// this repository do not cover: the four elements protoc can mark deprecated,
+// a oneof with a single member, scoped types with the same short name, and
+// protobuf identifiers that could collide with generated helper names.
+
+// A deprecated enum and a deprecated message are kept unreferenced so that the
+// generated definitions do not themselves use deprecated declarations.
+enum RetiredMode {
+  option deprecated = true;
+  RETIRED_MODE_UNSPECIFIED = 0;
+}
+
+message Retired {
+  option deprecated = true;
+  string reason = 1;
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_RETIRED = 1 [deprecated = true];
+  MODE_CURRENT = 2;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_READY = 1;
+}
+
+message Capabilities {
+  string name = 1;
+}
+
+message Envelope {
+  string id = 1;
+  string legacy_id = 2 [deprecated = true];
+  Mode mode = 3;
+
+  // A single member: merging two present states is already covered by this
+  // member's own case, so nothing else may match a present right-hand state.
+  oneof payload {
+    string text = 4;
+  }
+}
+
+// `Left.Item` and `Right.Item` share a short name, and the four messages form
+// one dependency cycle, so they land in a single generated mutual block.
+message Left {
+  enum State {
+    LEFT_STATE_UNSPECIFIED = 0;
+    LEFT_STATE_READY = 1;
+  }
+
+  message Item {
+    Right right = 1;
+  }
+  Item item = 1;
+}
+
+message Right {
+  enum State {
+    RIGHT_STATE_UNSPECIFIED = 0;
+    RIGHT_STATE_READY = 1;
+  }
+
+  message Item {
+    Left left = 1;
+  }
+  Item item = 1;
+}
+
+// `instInhabited` is a legal protobuf identifier. Generated helper names must
+// not steal it from fields, enum values, or nested declarations.
+message InstanceNameCollision {
+  string instInhabited = 1;
+}
+
+enum InstanceValueCollision {
+  instInhabited = 0;
+}
+
+message NestedTypeCollision {
+  message instInhabited {
+    string value = 1;
+  }
+
+  instInhabited value = 1;
+}
