@@ -163,10 +163,12 @@ generation under a monotonic budget without ever abandoning or duplicating
 transport cleanup custody.
 
 Per-call `CallCredentials` supply refined `CredentialEntry` metadata whose
-values are visible-ASCII-checked, redacted by every ordinary rendering, and
-provably installed on the wire options
-(`Grpc.UnaryCall.optionsFor_singleton_get?` exports the authorization-presence
-fact). Each unary invocation owns a local monotonic deadline: the
+values are visible-ASCII-checked and redacted by every ordinary rendering.
+The options builder in `Grpc.UnaryCall` is deliberately module-private — no
+publicly renderable `CallOptions` value carrying secret material is offered —
+and its timeout, metadata, and header-installation theorems are certified
+in-module against that private builder. Each unary invocation owns a local
+monotonic deadline: the
 `grpc-timeout` header is sent for peer-side enforcement but never trusted
 locally, and an expired call is cancelled and joined before the deadline error
 returns. The certified kernels behind this layer — the channel-lease state

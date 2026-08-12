@@ -28,12 +28,11 @@ namespace Grpc.UnaryCall
 open Std.Async
 
 /--
-Construct call metadata from refined credential entries.  The produced
-`CallOptions` value renders headers ordinarily, so callers hold it only at the
-call boundary; the theorems below let downstream code reason about header
-presence without ever rendering a value.
+Construct call metadata from refined credential entries.  Keeping this
+definition module-private avoids creating a publicly renderable `CallOptions`
+value containing secret material.
 -/
-@[expose] def optionsFor
+private def optionsFor
     (entries : Array CredentialEntry)
     (timeout : String) :
     Grpc.Client.CallOptions := {
@@ -42,13 +41,13 @@ presence without ever rendering a value.
   timeout := some timeout
 }
 
-theorem optionsFor_timeout
+private theorem optionsFor_timeout
     (entries : Array CredentialEntry) (timeout : String) :
     (optionsFor entries timeout).timeout = some timeout := by
   rfl
 
 /-- Exactly the refined credential entries become call metadata headers. -/
-theorem optionsFor_metadata
+private theorem optionsFor_metadata
     (entries : Array CredentialEntry) (timeout : String) :
     (optionsFor entries timeout).metadata =
       entries.map (fun entry =>
@@ -57,11 +56,10 @@ theorem optionsFor_metadata
 
 /--
 A single refined entry is visible in the built call metadata under its own
-name with its exact plaintext value.  This is the exported header-presence
-fact: a caller can prove its credential entry was installed without unfolding
-this module's internals.
+name with its exact plaintext value.  This in-module certification of header
+installation holds without ever rendering a `CallOptions` value.
 -/
-theorem optionsFor_singleton_get?
+private theorem optionsFor_singleton_get?
     (entry : CredentialEntry) (timeout : String) :
     ((optionsFor #[entry] timeout).metadata.get? entry.name) =
       some entry.exposeValue := by

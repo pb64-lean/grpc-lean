@@ -215,7 +215,6 @@ lean_assurance_test(
         "Grpc.CredentialEntry.visible_ascii",
         "Grpc.CredentialEntry.lowercase_name",
         "Grpc.CredentialEntry.authorization_name",
-        "Grpc.UnaryCall.optionsFor_singleton_get?",
         # Channel-initialization ownership kernel for a future cancellable
         # connector.
         "Grpc.ChannelInitialization.State.at_most_one_initialization",
@@ -308,7 +307,6 @@ lean_assurance_test(
         "Grpc.CredentialEntry.visible_ascii": "∀ (entry : Grpc.CredentialEntry), Grpc.isVisibleAsciiMetadataValue entry.exposeValue = true",
         "Grpc.CredentialEntry.lowercase_name": "∀ (entry : Grpc.CredentialEntry), Grpc.isMetadataKeyName entry.name = true",
         "Grpc.CredentialEntry.authorization_name": "∀ (value : String) (h : Grpc.isVisibleAsciiMetadataValue value = true), (Grpc.CredentialEntry.authorization value h).name = \"authorization\"",
-        "Grpc.UnaryCall.optionsFor_singleton_get?": "∀ (entry : Grpc.CredentialEntry) (timeout : String), Grpc.Metadata.get? (Grpc.UnaryCall.optionsFor #[entry] timeout).metadata entry.name = some entry.exposeValue",
         "Grpc.ChannelInitialization.State.at_most_one_initialization": "∀ (state : Grpc.ChannelInitialization.State) (left right : Grpc.ChannelInitialization.Pending), state.pending = some left → state.pending = some right → left = right",
         "Grpc.ChannelInitialization.State.ownership_partitions_are_disjoint": "∀ (state : Grpc.ChannelInitialization.State), state.ownedSockets.Nodup",
         "Grpc.ChannelInitialization.State.retained_sockets_are_unique": "∀ (state : Grpc.ChannelInitialization.State), state.retained.Nodup",
