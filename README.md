@@ -141,12 +141,15 @@ suspended without a worker until the OS settles it.
 
 `Grpc.ManagedChannel` is a lazily connecting shared channel above
 `Grpc.Client`. `ManagedChannel.create config` performs no network effects;
-the first RPC starts one single-flight initialization task that loads and
-pins system trust anchors (`Grpc.TrustAnchors`), resolves the endpoint
-(`Grpc.NameResolver` over the `Grpc.Dns` getaddrinfo boundary), and walks the
-resolved addresses in order through TCP or TLS connection attempts that
-require an exact `h2` ALPN result. Plaintext (`http://`) endpoints must be
-syntactically loopback and must resolve only to loopback addresses.
+the first RPC starts one single-flight initialization task. For `https://`
+endpoints that task first loads and pins system trust anchors
+(`Grpc.TrustAnchors`); plaintext (`http://`) endpoints load no trust
+material and must be syntactically loopback. It then resolves the endpoint
+(`Grpc.NameResolver` over the `Grpc.Dns` getaddrinfo boundary) — plaintext
+endpoints must also resolve only to loopback addresses — and walks the
+resolved addresses in order through connection attempts: TLS attempts
+require an exact `h2` ALPN result, while plaintext attempts speak
+prior-knowledge h2c with no ALPN step.
 
 One connection generation is shared by every caller: each RPC holds an outer
 channel lease and an inner connection lease (both instances of the certified
@@ -354,7 +357,12 @@ control, live h2c loopback servers), plus dedicated HPACK, hardening
 streaming (including an 80-connection stress case), connection-lifecycle
 (cause-carrying GOAWAY before teardown, over both h2c and a real TLS 1.3
 session), server-ownership, health, zlib, TLS
-handshake, gRPC-over-TLS, REST-over-TLS, and generated-code tests, and the two
+handshake, gRPC-over-TLS, REST-over-TLS, and generated-code tests, the eight
+channel-layer suites (endpoint/deadline configuration, channel-lease kernel,
+channel owner, unary call ownership, channel-initialization kernel,
+managed-channel lifecycle, name resolution, and trust anchors; the
+managed-channel and trust-anchor suites share the real
+`test_certificate_fixtures` certificate library), and the two
 `lean_assurance_test` audits below. `examples/grpc_service/` (a standalone module demonstrating a
 PostgreSQL-backed service and in-process proof checking of client-supplied
 Lean terms) and the vendored `third_party` modules are excluded from `//...`
