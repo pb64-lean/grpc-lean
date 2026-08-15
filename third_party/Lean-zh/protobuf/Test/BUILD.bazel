@@ -15,6 +15,17 @@ lean_test(
 )
 
 lean_test(
+    name = "direct_encode_test",
+    srcs = [
+        "DirectEncodeBazel.lean",
+        "ImportedGeneratedChild.lean",
+        "LegacyChild.lean",
+    ],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
+)
+
+lean_test(
     name = "varint_test",
     srcs = ["VarintBazel.lean"],
     strip_module_prefix = "",
@@ -27,6 +38,14 @@ lean_binary(
     tags = ["manual"],
     strip_module_prefix = "",
     deps = ["//Protobuf/Encoding"],
+)
+
+lean_binary(
+    name = "direct_encode_benchmark",
+    srcs = ["Bench/DirectEncode.lean"],
+    tags = ["manual"],
+    strip_module_prefix = "",
+    deps = ["//:protobuf"],
 )
 
 lean_test(
