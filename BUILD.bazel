@@ -450,6 +450,7 @@ lean_assurance_test(
     expected_implemented_by = {
         "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
+        "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
     },
     expected_extern_declarations = {
         "Zlib.Gzip.compress": "all:standard:grpc_zlib_gzip_compress",
@@ -650,6 +651,12 @@ lean_test(
     deps = [":grpc_lean"],
 )
 
+lean_test(
+    name = "timeout_test",
+    srcs = ["Test/TimeoutTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_binary(
     name = "hpack_benchmark",
     srcs = ["Benchmark/HpackBenchmark.lean"],
@@ -660,6 +667,13 @@ lean_binary(
 lean_binary(
     name = "authorization_benchmark",
     srcs = ["Benchmark/AuthorizationBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "timeout_benchmark",
+    srcs = ["Benchmark/TimeoutBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )

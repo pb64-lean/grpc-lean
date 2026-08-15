@@ -91,7 +91,10 @@ private def parseDigits (chars : List Char) (value : Nat) : Option Nat :=
       | some digit => parseDigits rest (value * 10 + digit)
       | none => none
 
-def parse? (raw : String) : Option Timeout :=
+/-! The list parser is the proof-facing specification.  Executable request
+handling uses the byte-indexed implementation below, and the focused timeout
+test keeps both definitions differential-tested. -/
+def parseReference? (raw : String) : Option Timeout :=
   match raw.toList.reverse with
   | [] => none
   | unitChar :: reversedDigits =>
@@ -103,6 +106,45 @@ def parse? (raw : String) : Option Timeout :=
         | some unit, some value =>
             if value == 0 then none else some { value := value, unit := unit }
         | _, _ => none
+
+private def parseByteIndexedDigits (raw : String) (stop : Nat)
+    (hstop : stop < raw.utf8ByteSize) (i value : Nat) : Option Nat :=
+  if hi : i < stop then
+    let byte := raw.getUTF8Byte ⟨i⟩ (by
+      simp only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos]
+      exact Nat.lt_trans hi hstop)
+    if 48 ≤ byte && byte ≤ 57 then
+      parseByteIndexedDigits raw stop hstop (i + 1)
+        (value * 10 + (byte - 48).toNat)
+    else
+      none
+  else
+    some value
+termination_by stop - i
+
+/-- Allocation-reduced `grpc-timeout` parser.  Valid timeout values are ASCII,
+so their character count equals their cached UTF-8 byte count.  Indexing those
+bytes avoids materializing and reversing character lists. -/
+def parseByteIndexed? (raw : String) : Option Timeout :=
+  if hsize : 2 ≤ raw.utf8ByteSize ∧ raw.utf8ByteSize ≤ 9 then
+    let stop := raw.utf8ByteSize - 1
+    have hstop : stop < raw.utf8ByteSize := by omega
+    let unitByte := raw.getUTF8Byte ⟨stop⟩ (by
+      simpa only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos] using hstop)
+    match TimeoutUnit.ofChar? (Char.ofNat unitByte.toNat),
+        parseByteIndexedDigits raw stop hstop 0 0 with
+    | some unit, some value =>
+        if value == 0 then none else some { value := value, unit := unit }
+    | _, _ => none
+  else
+    none
+
+/-- Parse the decimal digits and unit in a `grpc-timeout` header.  The logical
+definition remains the list specification used by the codec proofs; generated
+code uses the differential-tested byte-indexed implementation. -/
+@[implemented_by parseByteIndexed?]
+def parse? (raw : String) : Option Timeout :=
+  parseReference? raw
 
 def toNanoseconds (timeout : Timeout) : Nat :=
   timeout.value * timeout.unit.nanoseconds
@@ -234,7 +276,7 @@ limit parses back to exactly the same timeout. -/
 theorem parse?_render (timeout : Timeout) (hpos : timeout.value ≠ 0)
     (hle : timeout.value ≤ 99999999) :
     parse? timeout.render = some timeout := by
-  unfold parse? render
+  unfold parse? parseReference? render
   rw [String.toList_ofList, List.reverse_append]
   simp only [List.reverse_cons, List.reverse_nil, List.nil_append, List.singleton_append,
     List.reverse_reverse]
