@@ -1513,11 +1513,168 @@ private def construct_member_getters (name : Ident) (push_name : String → Iden
             out := out.push hasGetter
   return out
 
-private def construct_encode (name : Ident) (push_name : String → Ident) (toMessageWithOptions : Ident) :
+/-- PB-02's bounded direct-encoding subset. Every message still gets the
+`encodeDirect` API, but schemas outside this subset use the generic validated
+fallback. Keeping this predicate structural avoids message-name-specific
+codecs while allowing the Widget/ListWidgetsResponse shape to bypass the
+intermediate `Message`/`Record`/nested `ByteArray` graph. -/
+private def directTypedFieldSupported (x : ProtoFieldMData) : Bool :=
+  if x.map_info?.isSome || x.oneof_type?.isSome then
+    false
+  else
+    match x.mod with
+    | .default =>
+        match x.internal_type? with
+        | some .string | some .uint32 | some .uint64 => true
+        | _ => false
+    | .repeated =>
+        x.internal_type?.isNone && x.enum_type?.isNone &&
+          !x.options.wired_as_group?.isEqSome true
+    | .optional | .required => false
+
+/-- Build one generated `Put` state transformer rather than a runtime array of
+per-field plans. Each known-field action threads the same output buffer, then
+the generic unknown-field plan writes last. -/
+private partial def constructDirectPutBody (putTerms : List Term)
+    (out unknownPlan : Ident) : CommandElabM Term := do
+  match putTerms with
+  | [] => `(($unknownPlan:ident).put $out:ident)
+  | putTerm :: rest =>
+      let nextOut ← mkIdent <$> mkFreshUserName `out
+      let tail ← constructDirectPutBody rest nextOut unknownPlan
+      `(let (_, $nextOut:ident) := ($putTerm:term) $out:ident
+        $tail:term)
+
+private def construct_direct_plan (name : Ident) (push_name : String → Ident)
+    (fields : Array ProtoFieldMData) (toMessageWithOptions : Ident)
+    (mutMessages : NameSet) :
+    CommandElabM (Array Command) := do
+  let directPlanWithOptionsId := push_name "directPlanWithOptions"
+  let directPlanId := push_name "directPlan"
+  let encodeDirectWithOptionsId := push_name "encodeDirectWithOptions"
+  let encodeDirectId := push_name "encodeDirect"
+  let options ← mkIdent <$> mkFreshUserName `options
+  let val ← mkIdent <$> mkFreshUserName `val
+  let plan ← mkIdent <$> mkFreshUserName `plan
+  let msg ← mkIdent <$> mkFreshUserName `msg
+
+  let directPlanWithOptions ←
+    if fields.all directTypedFieldSupported then
+      let mut childSetups : Array (Ident × Term × Ident) := #[]
+      let mut sizeTerms : Array Term := #[]
+      let mut putTerms : Array Term := #[]
+      for x in fields do
+        match x.mod, x.internal_type? with
+        | .default, some internalType =>
+            let value ← `($(x.field_proj):ident $val:ident)
+            let (fieldSize, fieldPut) ←
+              match internalType with
+              | .string =>
+                  pure (← `(Protobuf.Encoding.Direct.stringFieldSize $(x.field_num):num $value:term),
+                    ← `(Protobuf.Encoding.Direct.putStringField $(x.field_num):num $value:term))
+              | .uint32 =>
+                  pure (← `(Protobuf.Encoding.Direct.varintFieldSize $(x.field_num):num ($value:term).toNat),
+                    ← `(Protobuf.Encoding.Direct.putVarintField $(x.field_num):num ($value:term).toNat))
+              | .uint64 =>
+                  pure (← `(Protobuf.Encoding.Direct.varintFieldSize $(x.field_num):num ($value:term).toNat),
+                    ← `(Protobuf.Encoding.Direct.putVarintField $(x.field_num):num ($value:term).toNat))
+              | _ => unreachable!
+            sizeTerms := sizeTerms.push
+              (← `(if $(x.test_unset):term $value:term then 0 else $fieldSize:term))
+            putTerms := putTerms.push
+              (← `(if $(x.test_unset):term $value:term then
+                (pure () : Binary.Put)
+              else
+                $fieldPut:term))
+        | .repeated, none =>
+            let childPlans ← mkIdent <$> mkFreshUserName `childPlans
+            let childDirectPlanWithOptionsId :=
+              mkIdentFrom x.proto_type (x.proto_type.getId.str "directPlanWithOptions")
+            let childHasDirectPlan : Bool ←
+              if mutMessages.contains x.proto_type.getId then
+                pure true
+              else
+                try
+                  let resolved ← resolveGlobalConst childDirectPlanWithOptionsId
+                  pure !resolved.isEmpty
+                catch _ =>
+                  pure false
+            let childPlanner ←
+              if childHasDirectPlan then
+                `($childDirectPlanWithOptionsId:ident)
+              else
+                let childToMessageWithOptions :=
+                  mkIdentFrom x.proto_type (x.proto_type.getId.str "toMessageWithOptions")
+                let childOptions ← mkIdent <$> mkFreshUserName `options
+                let childValue ← mkIdent <$> mkFreshUserName `value
+                `(fun $childOptions:ident $childValue:ident =>
+                  $childToMessageWithOptions:ident $childOptions:ident $childValue:ident >>=
+                    Protobuf.Encoding.Direct.Plan.ofMessage)
+            childSetups := childSetups.push
+              (childPlans, childPlanner, x.field_proj)
+            sizeTerms := sizeTerms.push
+              (← `(($childPlans:ident).foldl (init := 0) fun total child =>
+                total + Protobuf.Encoding.Direct.messageFieldSize $(x.field_num):num child))
+            putTerms := putTerms.push
+              (← `(($childPlans:ident).forM fun child =>
+                Protobuf.Encoding.Direct.putMessageField $(x.field_num):num child))
+        | _, _ => unreachable!
+      let knownSize ← sizeTerms.foldlM (init := ← `(0)) fun total fieldSize =>
+        `($total:term + $fieldSize:term)
+      let unknownPlan ← mkIdent <$> mkFreshUserName `unknownPlan
+      let unknownProj := push_name "Unknown.Fields"
+      let out ← mkIdent <$> mkFreshUserName `out
+      let putBody ← constructDirectPutBody putTerms.toList out unknownPlan
+      let mut body ← `(Protobuf.Encoding.Direct.Plan.ofUnknownFields
+        $options:ident ($unknownProj:ident $val:ident) >>= fun $unknownPlan:ident =>
+          pure
+            { size := $knownSize:term + ($unknownPlan:ident).size
+            , put := fun $out:ident => $putBody:term
+            })
+      for (childPlans, childPlanner, fieldProj) in childSetups.reverse do
+        body ← `(Array.mapM
+            ($childPlanner:term $options:ident)
+            ($fieldProj:ident $val:ident) >>= fun $childPlans:ident =>
+          $body:term)
+      `(partial def $directPlanWithOptionsId:ident :
+          Protobuf.Encoding.EncodeOptions → $name →
+            Except Protobuf.Encoding.ProtoError Protobuf.Encoding.Direct.Plan :=
+        fun $options:ident $val:ident => $body:term)
+    else
+      `(partial def $directPlanWithOptionsId:ident :
+          Protobuf.Encoding.EncodeOptions → $name →
+            Except Protobuf.Encoding.ProtoError Protobuf.Encoding.Direct.Plan :=
+        fun $options:ident $val:ident => do
+          let $msg:ident := (← $toMessageWithOptions:ident $options:ident $val:ident)
+          Protobuf.Encoding.Direct.Plan.ofMessage $msg:ident)
+
+  let directPlan ← `(partial def $directPlanId:ident : $name →
+      Except Protobuf.Encoding.ProtoError Protobuf.Encoding.Direct.Plan :=
+    $directPlanWithOptionsId:ident Protobuf.Encoding.EncodeOptions.default)
+  let encodeDirectWithOptions ← `(partial def $encodeDirectWithOptionsId:ident :
+      Protobuf.Encoding.EncodeOptions → $name →
+        Except Protobuf.Encoding.ProtoError ByteArray :=
+    fun $options:ident $val:ident => do
+      let $plan:ident := (← $directPlanWithOptionsId:ident $options:ident $val:ident)
+      return Protobuf.Encoding.Direct.Plan.run $plan:ident)
+  let encodeDirect ← `(partial def $encodeDirectId:ident : $name →
+      Except Protobuf.Encoding.ProtoError ByteArray :=
+    $encodeDirectWithOptionsId:ident Protobuf.Encoding.EncodeOptions.default)
+  return #[directPlanWithOptions, directPlan, encodeDirectWithOptions, encodeDirect]
+
+private def construct_encode (name : Ident) (push_name : String → Ident)
+    (toMessageWithOptions : Ident) (directPlanWithOptions? : Option Ident) :
     CommandElabM (Ident × Command × Ident × Command) := do
   let encodeWithOptionsId := push_name "encodeWithOptions"
-  let sWithOptions ← `(partial def $encodeWithOptionsId:ident : Encoding.EncodeOptions → $name → Except Encoding.ProtoError ByteArray := fun options x => do
-    return Binary.Put.run (Binary.put (← $toMessageWithOptions:ident options x)))
+  let sWithOptions ←
+    match directPlanWithOptions? with
+    | some directPlanWithOptions =>
+        `(partial def $encodeWithOptionsId:ident : Encoding.EncodeOptions → $name → Except Encoding.ProtoError ByteArray := fun options x => do
+          let plan ← $directPlanWithOptions:ident options x
+          return Protobuf.Encoding.Direct.Plan.run plan)
+    | none =>
+        `(partial def $encodeWithOptionsId:ident : Encoding.EncodeOptions → $name → Except Encoding.ProtoError ByteArray := fun options x => do
+          return Binary.Put.run (Binary.put (← $toMessageWithOptions:ident options x)))
   let encodeId := push_name "encode"
   let s ← `(partial def $encodeId:ident : $name → Except Encoding.ProtoError ByteArray :=
     $encodeWithOptionsId:ident Encoding.EncodeOptions.default)
@@ -1561,7 +1718,14 @@ public def elabMessageDecCore (mutEnums mutOneofs messages : NameSet) : Syntax �
   let (merge', merge) ← construct_merge name push_name mdata
   let (_, decoder?, _, decoderWithOptions?) ← construct_decoder? name push_name fromMessageWithOptions' merge'
   let (_, decoder_rep, _, decoderRepWithOptions) ← construct_decoder_rep name push_name fromMessage' fromMessageWithOptions'
-  let (_, encode, _, encodeWithOptions) ← construct_encode name push_name toMessageWithOptions'
+  let directPlanForEncode? :=
+    if mdata.all directTypedFieldSupported then
+      some (push_name "directPlanWithOptions")
+    else
+      none
+  let (_, encode, _, encodeWithOptions) ←
+    construct_encode name push_name toMessageWithOptions' directPlanForEncode?
+  let directEncoding ← construct_direct_plan name push_name mdata toMessageWithOptions' messages
   let decodes ← construct_decode name push_name fromMessageWithOptions'
   let defaultedGetters ← construct_defaulted_getters name push_name mdata
   let memberGetters ← construct_member_getters name push_name mdata
@@ -1570,7 +1734,7 @@ public def elabMessageDecCore (mutEnums mutOneofs messages : NameSet) : Syntax �
     decls := #[struct],
     inhabitedFunctions := #[default],
     inhabitedInsts := #[inhInst],
-    functions := #[toMessageWithOptions, toMessage, builder, fromMessageWithOptions, fromMessage, merge, decoderWithOptions?, decoder?, decoderRepWithOptions, decoder_rep, encodeWithOptions, encode] ++ decodes ++ defaultedGetters,
+    functions := #[toMessageWithOptions, toMessage, builder, fromMessageWithOptions, fromMessage, merge, decoderWithOptions?, decoder?, decoderRepWithOptions, decoder_rep] ++ directEncoding ++ #[encodeWithOptions, encode] ++ decodes ++ defaultedGetters,
     postFunctions := memberGetters ++ presenceGetters
   }
 
