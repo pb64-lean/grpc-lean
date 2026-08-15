@@ -11,7 +11,9 @@ uninstrumented runtimes and enter `Async.block` once per batch, matching a
 production dispatch owner rather than charging an extra bridge to every call.
 A separate bounded pass checks exact registration and unregistration counts,
 verifies that no callback fired, and confirms that the no-deadline path never
-consults its supplied runtime.
+consults its supplied runtime.  After the scheduler is shut down, a fixed-wave
+phase measures the production dispatch-registration gate and separately checks
+that no task crosses the gate before its modeled publication point.
 -/
 
 private structure RuntimeCounters where
@@ -195,6 +197,114 @@ private def checkCounters (label : String) (snapshot : CounterSnapshot)
       snapshot.expirations == 0 && snapshot.failures == 0 do
     throw (IO.userError s!"{label} deadline runtime counter mismatch")
 
+private def dispatchRegistrationGateWaveWidth : Nat := 64
+
+private structure DispatchGateValidation where
+  publications : Nat
+  resolutions : Nat
+  completions : Nat
+  crossedBeforePublication : Nat
+  allTasksFinished : Bool
+  checksum : Nat
+
+private def runDispatchRegistrationGateAsync (iterations : Nat) : Std.Async.Async Nat := do
+  let mut launched := 0
+  let mut checksum := 0
+  while launched < iterations do
+    let waveSize := Nat.min dispatchRegistrationGateWaveWidth (iterations - launched)
+    let mut tasks := #[]
+    for _ in [0:waveSize] do
+      let registered ← IO.Promise.new
+      let task ← Std.Async.Async.toIO do
+        Http2.Connection.TestSupport.waitUntilDispatchRegisteredForBenchmark registered
+        pure 1
+      -- Model the production spawn -> publish -> resolve ordering.  The exact
+      -- spawned handle remains owned until the wave is joined below.
+      registered.resolve ()
+      tasks := tasks.push task
+    for task in tasks do
+      checksum := checksum + (← Std.Async.Async.ofAsyncTask task)
+    launched := launched + waveSize
+  pure checksum
+
+private def runDispatchRegistrationGate (iterations : Nat) : IO Nat :=
+  Std.Async.Async.block (runDispatchRegistrationGateAsync iterations)
+
+private def measureDispatchRegistrationGate (sink : IO.Ref Nat)
+    (iterations : Nat) : IO Nat := do
+  let started ← IO.monoNanosNow
+  sink.set (← runDispatchRegistrationGate iterations)
+  let ended ← IO.monoNanosNow
+  let checksum ← sink.get
+  unless checksum == iterations do
+    throw (IO.userError s!"dispatch registration gate benchmark checksum mismatch: {checksum}")
+  pure (ended - started)
+
+private def runDispatchRegistrationGateRounds (sink : IO.Ref Nat)
+    (iterations rounds : Nat) : IO (Array Nat) := do
+  let mut samples := #[]
+  for _ in [0:rounds] do
+    samples := samples.push (← measureDispatchRegistrationGate sink iterations)
+  pure samples
+
+private def validateDispatchRegistrationGateAsync
+    (iterations : Nat) : Std.Async.Async DispatchGateValidation := do
+  let publications ← IO.mkRef 0
+  let mut launched := 0
+  let mut resolutions := 0
+  let mut completions := 0
+  let mut crossedBeforePublication := 0
+  let mut checksum := 0
+  let mut allTasksFinished := true
+  while launched < iterations do
+    let waveSize := Nat.min dispatchRegistrationGateWaveWidth (iterations - launched)
+    let mut tasks := #[]
+    for offset in [0:waveSize] do
+      let gateId := launched + offset + 1
+      let registered ← IO.Promise.new
+      let task ← Std.Async.Async.toIO do
+        Http2.Connection.TestSupport.waitUntilDispatchRegisteredForBenchmark registered
+        let visiblePublication ← publications.get
+        pure (1, decide (visiblePublication < gateId))
+      publications.set gateId
+      registered.resolve ()
+      resolutions := resolutions + 1
+      tasks := tasks.push task
+    for task in tasks do
+      let result ← Std.Async.Async.ofAsyncTask task
+      checksum := checksum + result.1
+      completions := completions + 1
+      if result.2 then
+        crossedBeforePublication := crossedBeforePublication + 1
+    -- `ofAsyncTask` resumes from the async result promise.  Fence the exact
+    -- native task handles as well before checking their finished state.
+    for task in tasks do
+      discard <| Std.Async.AsyncTask.block task
+      unless ← IO.hasFinished task do
+        allTasksFinished := false
+    launched := launched + waveSize
+  pure {
+    publications := ← publications.get
+    resolutions := resolutions
+    completions := completions
+    crossedBeforePublication := crossedBeforePublication
+    allTasksFinished := allTasksFinished
+    checksum := checksum
+  }
+
+private def checkDispatchGateValidation (validation : DispatchGateValidation)
+    (expected : Nat) : IO Unit := do
+  unless validation.publications == expected &&
+      validation.resolutions == expected &&
+      validation.completions == expected &&
+      validation.crossedBeforePublication == 0 &&
+      validation.allTasksFinished && validation.checksum == expected do
+    throw (IO.userError <| s!"dispatch registration gate ordering validation failed: " ++
+      s!"publications={validation.publications} resolutions={validation.resolutions} " ++
+      s!"completions={validation.completions} " ++
+      s!"crossed_before_publication={validation.crossedBeforePublication} " ++
+      s!"all_tasks_finished={validation.allTasksFinished} checksum={validation.checksum}")
+
 private def parseNat (value? : Option String) (fallback : Nat) : Nat :=
   Nat.max 1 ((value? >>= String.toNat?).getD fallback)
 
@@ -246,6 +356,16 @@ def main (args : List String) : IO Unit := do
     | Except.ok samples => pure samples
     | Except.error error => throw error
 
+  -- Keep the deadline scheduler stopped throughout this phase so it measures
+  -- only the production dispatch-registration promise/task adapter.
+  let gateWarmup ← runDispatchRegistrationGate warmupIterations
+  unless gateWarmup == warmupIterations do
+    throw (IO.userError "dispatch registration gate warmup checksum mismatch")
+  let gateValidation ← Std.Async.Async.block <|
+    validateDispatchRegistrationGateAsync validationIterations
+  checkDispatchGateValidation gateValidation validationIterations
+  let gateSamples ← runDispatchRegistrationGateRounds sink iterations rounds
+
   let noDeadlineSnapshot ← noDeadlineCounters.snapshot
   let timedNoOpSnapshot ← timedNoOpCounters.snapshot
   let timedSchedulerSnapshot ← timedSchedulerCounters.snapshot
@@ -270,3 +390,10 @@ def main (args : List String) : IO Unit := do
   printDelta "timed_real_scheduler_total_incremental" timedSchedulerMedian noDeadlineMedian
     iterations
   IO.println "deadline_phase_counter_checks=pass benchmark_kind=informative thresholds=none"
+  printPhase "dispatch_registration_gate" gateSamples iterations
+  IO.println s!"dispatch_registration_gate_wave_width={dispatchRegistrationGateWaveWidth}"
+  IO.println <| s!"dispatch_registration_gate_validation publications={gateValidation.publications} " ++
+    s!"resolutions={gateValidation.resolutions} completions={gateValidation.completions} " ++
+    s!"crossed_before_publication={gateValidation.crossedBeforePublication} " ++
+    s!"all_tasks_finished={gateValidation.allTasksFinished} checksum={gateValidation.checksum}"
+  IO.println "dispatch_registration_gate_checks=pass benchmark_kind=informative thresholds=none"

@@ -1962,6 +1962,17 @@ private def waitUntilDispatchRegistered (registered : IO.Promise Unit) : Std.Asy
   | some () => pure ()
   | none => throw (IO.userError "dispatch registration gate was dropped")
 
+namespace TestSupport
+
+/-- Benchmark seam for the exact dispatch-registration gate used by production
+dispatch tasks.  Keeping the adapter here avoids duplicating its task/promise
+behavior in measurement code. -/
+def waitUntilDispatchRegisteredForBenchmark
+    (registered : IO.Promise Unit) : Std.Async.Async Unit :=
+  waitUntilDispatchRegistered registered
+
+end TestSupport
+
 /-- Drop all connection-level state for a stream and send RST_STREAM so the peer learns
 the stream is dead instead of waiting on a response that will never arrive. -/
 private def abortStreamShared (stateMutex : Std.Mutex State) (emit : Array Frame -> IO Unit)
