@@ -648,6 +648,19 @@ lean_binary(
     deps = [":grpc_lean"],
 )
 
+lean_binary(
+    name = "response_hpack_benchmark",
+    srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "response_header_cache_test",
+    srcs = ["Test/ResponseHeaderCacheTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_test(
     name = "endpoint_test",
     srcs = ["Test/EndpointTest.lean"],

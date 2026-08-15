@@ -21,6 +21,14 @@ structure State where
   pendingSizeUpdate : Option Nat := none
   deriving Inhabited, Repr
 
+/-- Whether an encoded field block is independent of every preceding outbound
+field block.  The peer-advertised upper bound is deliberately irrelevant: as
+long as this encoder has selected a zero-sized table, has no stale entries,
+and owes no table-size instruction, encoding cannot consult or change
+connection history. -/
+def State.canReuseHeaderBlock (state : State) : Bool :=
+  state.maxSize == 0 && state.dynamic.isEmpty && state.pendingSizeUpdate.isNone
+
 structure IntegerResult where
   value : Nat
   next : Nat
