@@ -133,6 +133,65 @@ def huffmanCodeLengths : Array Nat := #[
   30
 ]
 
+/-- The RFC table is canonical: codes of each bit length form one contiguous
+range.  These three small tables describe each range and index a fourth table
+ordered by `(length, code)`. -/
+private def huffmanFirstCodeByLength : Array Nat := #[
+  0, 0, 0, 0, 0, 0x0, 0x14, 0x5c, 0xf8, 0, 0x3f8, 0x7fa, 0xffa, 0x1ff8,
+  0x3ffc, 0x7ffc, 0, 0, 0, 0x7fff0, 0xfffe6, 0x1fffdc, 0x3fffd2, 0x7fffd8,
+  0xffffea, 0x1ffffec, 0x3ffffe0, 0x7ffffde, 0xfffffe2, 0, 0x3ffffffc
+]
+
+private def huffmanCodeCountByLength : Array Nat := #[
+  0, 0, 0, 0, 0, 10, 26, 32, 6, 0, 5, 3, 2, 6, 2, 3, 0, 0, 0, 3, 8, 13,
+  26, 29, 12, 4, 15, 19, 29, 0, 4
+]
+
+private def huffmanSymbolOffsetByLength : Array Nat := #[
+  0, 0, 0, 0, 0, 0, 10, 36, 68, 74, 74, 79, 82, 84, 90, 92, 95, 95, 95, 95,
+  98, 106, 119, 145, 174, 186, 190, 205, 224, 253, 253
+]
+
+private def huffmanSymbolsByCode : Array Nat := #[
+  48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
+  52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
+  110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+  77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
+  119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
+  43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
+  195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172,
+  176, 177, 179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136,
+  146, 154, 156, 160, 163, 164, 169, 170, 173, 178, 181, 185, 186, 187,
+  189, 190, 196, 198, 228, 232, 233, 1, 135, 137, 138, 139, 140, 141,
+  143, 147, 149, 150, 151, 152, 155, 157, 158, 165, 166, 168, 174, 175,
+  180, 182, 183, 188, 191, 197, 231, 239, 9, 142, 144, 145, 148, 159,
+  171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193, 200, 201,
+  202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
+  212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252,
+  253, 254, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
+  21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22, 256
+]
+
+/-- Bounded executable lookup for `findHuffmanSymbol?`.  The `i` argument is
+retained because the proof-facing definition supports searches beginning at
+an arbitrary table index, even though the decoder always starts at zero. -/
+def findHuffmanSymbolLookup? (code bits i : Nat) : Option Nat :=
+  if bits >= huffmanCodeCountByLength.size then
+    none
+  else
+    let firstCode := huffmanFirstCodeByLength[bits]!
+    if code < firstCode then
+      none
+    else
+      let codeOffset := code - firstCode
+      if codeOffset >= huffmanCodeCountByLength[bits]! then
+        none
+      else
+        let symbol := huffmanSymbolsByCode[huffmanSymbolOffsetByLength[bits]! + codeOffset]!
+        if symbol >= i then some symbol else none
+
+/-- Linear specification used by the Huffman codec proof.  The bounded decoder
+is differentially checked against this specification. -/
 def findHuffmanSymbol? (code bits i : Nat) : Option Nat :=
   if i >= huffmanCodes.size then
     none
@@ -183,8 +242,53 @@ private def decodeHuffmanBits
     · omega
     · omega
 
-def decodeHuffman (bytes : ByteArray) : Except Status ByteArray :=
+set_option maxRecDepth 4096 in
+private def decodeHuffmanLookupBits
+    (bytes : ByteArray) (offset bit code bits : Nat) (out : ByteArray) :
+    Except Status ByteArray := do
+  if offset >= bytes.size then
+    if validHuffmanPadding code bits then
+      pure out
+    else
+      throw (Status.internal "invalid HPACK Huffman padding")
+  else
+    let b := bitAt bytes[offset]! bit
+    let code := code * 2 + b
+    let bits := bits + 1
+    let (code, bits, out) ←
+      match findHuffmanSymbolLookup? code bits 0 with
+      | some symbol =>
+          if symbol == huffmanEOSSymbol then
+            throw (Status.internal "HPACK Huffman EOS appeared in data")
+          else
+            pure (0, 0, out.push (UInt8.ofNat symbol))
+      | none =>
+          if bits > 30 then
+            throw (Status.internal "invalid HPACK Huffman code")
+          else
+            pure (code, bits, out)
+    if bit = 0 then
+      decodeHuffmanLookupBits bytes (offset + 1) 7 code bits out
+    else
+      decodeHuffmanLookupBits bytes offset (bit - 1) code bits out
+  termination_by (bytes.size - offset) * 8 + bit
+  decreasing_by
+    · omega
+    · omega
+
+/-- Audited bit-serial specification retained for differential testing. -/
+def decodeHuffmanReference (bytes : ByteArray) : Except Status ByteArray :=
   decodeHuffmanBits bytes 0 7 0 0 ByteArray.empty
+
+/-- Bounded Huffman decoder used by executable HPACK paths. -/
+def decodeHuffmanLookup (bytes : ByteArray) : Except Status ByteArray :=
+  decodeHuffmanLookupBits bytes 0 7 0 0 ByteArray.empty
+
+/-- HPACK Huffman decoding.  The proof-facing definition remains the audited
+bit-serial specification; generated code uses the bounded lookup decoder. -/
+@[implemented_by decodeHuffmanLookup]
+def decodeHuffman (bytes : ByteArray) : Except Status ByteArray :=
+  decodeHuffmanReference bytes
 
 private def encodeHuffmanFlush (acc bits : Nat) (out : ByteArray) : Nat × Nat × ByteArray :=
   if bits >= 8 then
@@ -234,6 +338,27 @@ def encodeString (value : String) : Except Status ByteArray :=
     | .error status => .error status
     | .ok prefixBytes => .ok (prefixBytes.append bytes)
 
+def decodeStringLookup (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
+  if offset >= bytes.size then
+    .error (Status.internal "missing HPACK string")
+  else
+    match decodeInteger 7 bytes offset with
+    | .error status => .error status
+    | .ok length =>
+        if length.next + length.value > bytes.size then
+          .error (Status.internal "truncated HPACK string")
+        else
+          match (if bytes[offset]!.toNat >= 128 then
+              decodeHuffmanLookup (bytes.extract length.next (length.next + length.value))
+            else
+              .ok (bytes.extract length.next (length.next + length.value))) with
+          | .error status => .error status
+          | .ok raw =>
+              match String.fromUTF8? raw with
+              | some decoded => .ok { value := decoded, next := length.next + length.value }
+              | none => .error (Status.internal "HPACK string is not valid UTF-8")
+
+@[implemented_by decodeStringLookup]
 def decodeString (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
   if offset >= bytes.size then
     .error (Status.internal "missing HPACK string")
@@ -430,7 +555,7 @@ structure DecodeResult where
 private def decodeLiteralName (state : State) (index : Nat) (block : ByteArray) (offset : Nat) :
     Except Status (String × Nat) := do
   if index == 0 then
-    let name ← decodeString block offset
+    let name ← decodeStringLookup block offset
     if Header.normalizeName name.value != name.value then
       throw (Status.internal s!"HTTP/2 header field name must be lowercase: {name.value}")
     else
@@ -444,7 +569,7 @@ private def decodeLiteral (state : State) (block : ByteArray) (offset prefixBits
     (incremental : Bool) : Except Status (Header × State × Nat) := do
   let index ← decodeInteger prefixBits block offset
   let (name, next) ← decodeLiteralName state index.value block index.next
-  let value ← decodeString block next
+  let value ← decodeStringLookup block next
   let header : Header := { name := name, value := value.value }
   let state := if incremental then insert state header else state
   pure (header, state, value.next)

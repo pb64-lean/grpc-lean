@@ -19,6 +19,32 @@ def bytes (xs : List Nat) : ByteArray :=
 def byteArrayEq (a b : ByteArray) : Bool :=
   a.data == b.data
 
+def expectHuffmanDecodersEq (input : ByteArray) : IO Unit := do
+  let reference := Http2.Hpack.decodeHuffmanReference input
+  let lookup := Http2.Hpack.decodeHuffmanLookup input
+  let publicResult := Http2.Hpack.decodeHuffman input
+  let failDifferent (which : String) : IO Unit :=
+    throw (IO.userError s!"{which} Huffman decoder differed for input {repr input.data}")
+  match reference, lookup with
+  | .ok expected, .ok actual =>
+      if !byteArrayEq actual expected then failDifferent "bounded"
+  | .error expected, .error actual =>
+      if actual != expected then failDifferent "bounded"
+  | _, _ => failDifferent "bounded"
+  match lookup, publicResult with
+  | .ok expected, .ok actual =>
+      if !byteArrayEq actual expected then failDifferent "public"
+  | .error expected, .error actual =>
+      if actual != expected then failDifferent "public"
+  | _, _ => failDifferent "public"
+
+def expectHuffmanError (input : ByteArray) (message : String) : IO Unit := do
+  match Http2.Hpack.decodeHuffmanLookup input with
+  | .ok value =>
+      throw (IO.userError s!"expected Huffman error '{message}', decoded {repr value.data}")
+  | .error status =>
+      expectEq status.messageD message s!"unexpected Huffman error for {repr input.data}"
+
 def testHuffmanKnownVector : IO Unit := do
   let expected := bytes [0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
   let encoded ← expectStatusOk (Http2.Hpack.encodeString "www.example.com")
@@ -40,12 +66,68 @@ def testHuffmanRoundTrip : IO Unit := do
   for sample in samples do
     let raw := sample.toUTF8
     let encoded := Http2.Hpack.encodeHuffman raw
-    let decoded ← expectStatusOk (Http2.Hpack.decodeHuffman encoded)
+    let decoded ← expectStatusOk (Http2.Hpack.decodeHuffmanLookup encoded)
     expect (byteArrayEq decoded raw) s!"Huffman round trip should preserve: {sample}"
     -- encodeString/decodeString round trip regardless of which form is chosen
     let string ← expectStatusOk (Http2.Hpack.encodeString sample)
     let stringDecoded ← expectStatusOk (Http2.Hpack.decodeString string 0)
     expectEq stringDecoded.value sample s!"encodeString round trip should preserve: {sample}"
+
+def testHuffmanLookupTable : IO Unit := do
+  expectEq Http2.Hpack.huffmanCodes.size 257 "RFC Huffman table should contain EOS plus 256 symbols"
+  for symbol in [0:Http2.Hpack.huffmanCodes.size] do
+    let code := Http2.Hpack.huffmanCodes[symbol]!
+    let bits := Http2.Hpack.huffmanCodeLengths[symbol]!
+    expectEq (Http2.Hpack.findHuffmanSymbolLookup? code bits 0) (some symbol)
+      s!"bounded lookup should find RFC symbol {symbol}"
+    expectEq (Http2.Hpack.findHuffmanSymbolLookup? code bits symbol) (some symbol)
+      s!"bounded lookup should honor an inclusive start at RFC symbol {symbol}"
+    expectEq (Http2.Hpack.findHuffmanSymbolLookup? code bits (symbol + 1)) none
+      s!"bounded lookup should reject RFC symbol {symbol} before the requested start"
+    for prefixBits in [0:bits] do
+      let prefixCode := code / (2 ^ (bits - prefixBits))
+      expectEq (Http2.Hpack.findHuffmanSymbolLookup? prefixCode prefixBits 0)
+        (Http2.Hpack.findHuffmanSymbol? prefixCode prefixBits 0)
+        s!"bounded lookup should agree on proper prefix {prefixBits} of symbol {symbol}"
+    if code > 0 then
+      expectEq (Http2.Hpack.findHuffmanSymbolLookup? (code - 1) bits 0)
+        (Http2.Hpack.findHuffmanSymbol? (code - 1) bits 0)
+        s!"bounded lookup should agree below RFC symbol {symbol}"
+    expectEq (Http2.Hpack.findHuffmanSymbolLookup? (code + 1) bits 0)
+      (Http2.Hpack.findHuffmanSymbol? (code + 1) bits 0)
+      s!"bounded lookup should agree above RFC symbol {symbol}"
+  for bits in [31:36] do
+    for code in [0, 1, (2 ^ 30) - 1, 2 ^ 30] do
+      expectEq (Http2.Hpack.findHuffmanSymbolLookup? code bits 0)
+        (Http2.Hpack.findHuffmanSymbol? code bits 0)
+        s!"out-of-range code length {bits} should have no lookup result"
+
+def testHuffmanDecoderDifferential : IO Unit := do
+  -- Every one- and two-octet input exercises all byte boundaries, including
+  -- successful symbols, truncated codes, bad padding, and embedded EOS.
+  for first in [0:256] do
+    expectHuffmanDecodersEq (bytes [first])
+    for second in [0:256] do
+      expectHuffmanDecodersEq (bytes [first, second])
+  -- Every data symbol also crosses the encoder/decoder boundary directly.
+  for symbol in [0:256] do
+    let raw := bytes [symbol]
+    let encoded := Http2.Hpack.encodeHuffman raw
+    expectHuffmanDecodersEq encoded
+    let decoded ← expectStatusOk (Http2.Hpack.decodeHuffman encoded)
+    expect (byteArrayEq decoded raw) s!"bounded decoder should round trip byte {symbol}"
+
+def testHuffmanMalformedInputs : IO Unit := do
+  let validA ← expectStatusOk (Http2.Hpack.decodeHuffmanLookup (bytes [0x1f]))
+  expect (byteArrayEq validA "a".toUTF8) "three trailing EOS-prefix ones should be valid padding"
+  expectHuffmanError (bytes [0x18]) "invalid HPACK Huffman padding"
+  expectHuffmanError (bytes [0xff]) "invalid HPACK Huffman padding"
+  expectHuffmanError (bytes [0x1f, 0xff]) "invalid HPACK Huffman padding"
+  expectHuffmanError (bytes [0xff, 0xff, 0xff, 0xfc])
+    "HPACK Huffman EOS appeared in data"
+  for input in [bytes [0x18], bytes [0xff], bytes [0x1f, 0xff],
+      bytes [0xff, 0xff, 0xff, 0xfc]] do
+    expectHuffmanDecodersEq input
 
 def testHuffmanShorterFormChosen : IO Unit := do
   -- "www.example.com" Huffman form is 12 bytes vs 15 raw, so the H bit must be set
@@ -194,6 +276,9 @@ def testAuthorizationIsNeverIndexed : IO Unit := do
 def main : IO Unit := do
   testHuffmanKnownVector
   testHuffmanRoundTrip
+  testHuffmanLookupTable
+  testHuffmanDecoderDifferential
+  testHuffmanMalformedInputs
   testHuffmanShorterFormChosen
   testDynamicTableRoundTrip
   testEncoderDecoderTablesStayInSync

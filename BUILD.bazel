@@ -7,7 +7,7 @@ The public API lives in defs.bzl; this file marks the module root package so tha
 
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_binary", "lean_library", "lean_test")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("//:defs.bzl", "lean_proto_descriptor_library", "lean_proto_library")
 
@@ -443,7 +443,10 @@ lean_assurance_test(
         "Grpc.Posix.Native.closeRaw",
         "Grpc.Posix.Native.fstatRaw",
     ],
-    expected_implemented_by = {},
+    expected_implemented_by = {
+        "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
+        "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
+    },
     expected_extern_declarations = {
         "Zlib.Gzip.compress": "all:standard:grpc_zlib_gzip_compress",
         "Zlib.Gzip.decompress": "all:standard:grpc_zlib_gzip_decompress",
@@ -628,6 +631,13 @@ lean_test(
 lean_test(
     name = "hpack_test",
     srcs = ["Test/HpackTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "hpack_benchmark",
+    srcs = ["Benchmark/HpackBenchmark.lean"],
+    tags = ["manual"],
     deps = [":grpc_lean"],
 )
 
