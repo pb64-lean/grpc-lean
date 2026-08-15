@@ -693,6 +693,13 @@ lean_binary(
 )
 
 lean_binary(
+    name = "unary_body_benchmark",
+    srcs = ["Benchmark/UnaryBodyBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
     name = "response_hpack_benchmark",
     srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
     tags = ["manual"],

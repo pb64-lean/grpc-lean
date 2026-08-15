@@ -1973,6 +1973,12 @@ def waitUntilDispatchRegisteredForBenchmark
     (registered : IO.Promise Unit) : Std.Async.Async Unit :=
   waitUntilDispatchRegistered registered
 
+/-- Benchmark seam for the exact unary-body assembly performed when an
+authorized stream detaches for dispatch. -/
+def authorizedUnaryRequestForStreamForBenchmark (state : State) (stream : StreamState) :
+    Except Status Transport.UnaryRequestFrames :=
+  authorizedUnaryRequestForStream state stream
+
 end TestSupport
 
 /-- Drop all connection-level state for a stream and send RST_STREAM so the peer learns
