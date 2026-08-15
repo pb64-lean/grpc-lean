@@ -555,7 +555,7 @@ private partial def serveClientLoop (registry : Registry) (config : Config)
     (client : TCP.Socket.Client) (writer : SocketWriter)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken) :
     Std.Async.Async Connection.State := do
-  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  let deadline? := Connection.nextPendingDeadlineFallback? (← getConnectionState stateMutex)
   match ← nextConnectionEvent config client stopToken deadline? with
   | .stop => Connection.cancelActiveSharedOwned stateMutex
   | .received none => Connection.cancelActiveSharedOwned stateMutex
@@ -697,7 +697,7 @@ private partial def serveManagedClientLoop (registry : Registry) (config : Confi
     (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
     Std.Async.Async Connection.State := do
-  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  let deadline? := Connection.nextPendingDeadlineFallback? (← getConnectionState stateMutex)
   match ← nextConnectionEvent config client stopToken deadline? with
   | ConnectionEvent.stop =>
       -- Whoever cancelled the token recorded why; a bare shutdown did not.
@@ -1045,7 +1045,7 @@ private partial def serveTlsClientLoop (registry : Registry) (config : Config)
     (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
     Std.Async.Async Unit := do
-  let deadline? := Connection.nextPendingDeadline? (← getConnectionState stateMutex)
+  let deadline? := Connection.nextPendingDeadlineFallback? (← getConnectionState stateMutex)
   match ← nextTlsConnectionEvent config session stopToken deadline? with
   | TlsConnectionEvent.stop =>
       reportCloseCause closeCause CloseCause.serverShutdown

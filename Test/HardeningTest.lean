@@ -431,6 +431,11 @@ def testPendingBodyDeadlineIndependentOfBlockedAuthorization : IO Unit := do
   let pendingState ← stateMutex.atomically get
   expect (Http2.Connection.nextPendingDeadline? pendingState).isSome
     "timed request should be waiting for its incomplete body"
+  expect (Http2.Connection.nextPendingDeadlineFallback? pendingState).isNone
+    "independent scheduler should suppress the duplicate connection-loop timer"
+  let compatibilityState := { pendingState with deadlineScheduler := none }
+  expect (Http2.Connection.nextPendingDeadlineFallback? compatibilityState).isSome
+    "state owners without an independent scheduler should retain the fallback timer"
 
   let blockedHeaders := requestHeaders.insert "authorization" "block"
   let blockedBlock ← expectStatusOk

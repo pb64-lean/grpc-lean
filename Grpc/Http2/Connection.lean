@@ -1625,6 +1625,17 @@ def nextPendingDeadline? (state : State) : Option Nat :=
     else
       nearest
 
+/-- Deadline for a connection event loop that does not have an independent
+scheduler. Managed connections install that scheduler before processing input,
+so racing the same absolute instant with another `Selector.sleep` only
+allocates a redundant timer. Direct state-machine owners that leave the
+scheduler absent retain the compatibility fallback. -/
+def nextPendingDeadlineFallback? (state : State) : Option Nat :=
+  if state.deadlineScheduler.isSome then
+    none
+  else
+    nextPendingDeadline? state
+
 private def terminatePendingDeadlineStream (state : State) (stream : StreamState)
     (status : Status) : Except Status (State × Array Frame) := do
   let encoded ← Transport.encodeUnaryResponseFrames state.outboundHpack stream.streamId
