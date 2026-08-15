@@ -249,8 +249,8 @@ private def runDispatchRegistrationGateRounds (sink : IO.Ref Nat)
 
 private def validateDispatchRegistrationGateAsync
     (iterations : Nat) : Std.Async.Async DispatchGateValidation := do
-  let publications ← IO.mkRef 0
   let mut launched := 0
+  let mut publications := 0
   let mut resolutions := 0
   let mut completions := 0
   let mut crossedBeforePublication := 0
@@ -261,12 +261,13 @@ private def validateDispatchRegistrationGateAsync
     let mut tasks := #[]
     for offset in [0:waveSize] do
       let gateId := launched + offset + 1
+      let published ← IO.Promise.new
       let registered ← IO.Promise.new
       let task ← Std.Async.Async.toIO do
         Http2.Connection.TestSupport.waitUntilDispatchRegisteredForBenchmark registered
-        let visiblePublication ← publications.get
-        pure (1, decide (visiblePublication < gateId))
-      publications.set gateId
+        pure (1, !(← published.isResolved))
+      published.resolve ()
+      publications := gateId
       registered.resolve ()
       resolutions := resolutions + 1
       tasks := tasks.push task
@@ -284,7 +285,7 @@ private def validateDispatchRegistrationGateAsync
         allTasksFinished := false
     launched := launched + waveSize
   pure {
-    publications := ← publications.get
+    publications := publications
     resolutions := resolutions
     completions := completions
     crossedBeforePublication := crossedBeforePublication
