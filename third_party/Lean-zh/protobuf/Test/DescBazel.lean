@@ -86,10 +86,20 @@ def expectSome {α} (o : Option α) (msg : String) : IO α := do
   | some v => pure v
   | none => throw (IO.userError msg)
 
-def descriptorSetCandidates : Array FilePath :=
-  #[
+def descriptorSetCandidates : IO (Array FilePath) := do
+  let mut paths := #[]
+  for envName in #["RUNFILES_DIR", "TEST_SRCDIR"] do
+    match ← IO.getEnv envName with
+    | some root =>
+        paths := paths.push
+          (FilePath.mk (root ++ "/_main/Test/official/descriptor_set.bin"))
+        paths := paths.push
+          (FilePath.mk (root ++ "/grpc_lean_protobuf+/Test/official/descriptor_set.bin"))
+    | none => pure ()
+  return paths ++ #[
     FilePath.mk "Test/official/descriptor_set.bin",
     FilePath.mk "_main/Test/official/descriptor_set.bin",
+    FilePath.mk "grpc_lean_protobuf+/Test/official/descriptor_set.bin",
     FilePath.mk "grpc_lean_protobuf/Test/official/descriptor_set.bin",
     FilePath.mk "third_party/Lean-zh/protobuf/Test/official/descriptor_set.bin"
   ]
@@ -104,7 +114,7 @@ partial def readFirstExisting (paths : List FilePath) : IO ByteArray := do
         readFirstExisting rest
 
 def loadDescriptorSet : IO FileDescriptorSet := do
-  let bytes ← readFirstExisting descriptorSetCandidates.toList
+  let bytes ← readFirstExisting (← descriptorSetCandidates).toList
   let r := Binary.Get.run (Binary.getThe Protobuf.Encoding.Message) bytes
   let msg ← ofProtoExcept (Encoding.protoDecodeParseResultExcept r.toExcept)
   ofProtoExcept (FileDescriptorSet.fromMessage msg)
