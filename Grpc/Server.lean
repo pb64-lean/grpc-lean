@@ -539,14 +539,14 @@ private def deadlineForTimeout (timeout : Option Timeout) (headerDeadline : Opti
       | some deadline => pure (some deadline)
       | none => deadlineFromNow? timeout
 
-private def remainingUntilDeadlineMilliseconds (deadlineNanoseconds : Nat) : IO Nat := do
+private def remainingUntilDeadlineMilliseconds (deadlineNanoseconds : Nat) : BaseIO Nat := do
   let now ← IO.monoNanosNow
   if deadlineNanoseconds <= now then
     pure 0
   else
     pure ((deadlineNanoseconds - now + 999999) / 1000000)
 
-private def deadlineExceededAt (deadlineNanoseconds : Nat) : IO Bool := do
+private def deadlineExceededAt (deadlineNanoseconds : Nat) : BaseIO Bool := do
   let now ← IO.monoNanosNow
   pure (deadlineNanoseconds <= now)
 
