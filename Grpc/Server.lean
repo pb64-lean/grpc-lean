@@ -1005,6 +1005,42 @@ def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body 
   | .error status => pure (.error status)
   | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
 
+/-- Run one trusted managed-unary handler inline against a required absolute
+monotonic deadline.  `now` is read immediately before and after the arbitrary
+handler action, so a handler that starts or finishes at the deadline returns
+`DEADLINE_EXCEEDED`.
+
+This is a connection-owner primitive, not a standalone deadline runner.  It
+deliberately creates no task, Promise, timer, or scheduler registration.  The
+caller must retain and cancel the exact task executing this action, keep the
+absolute deadline armed independently, and arbitrate terminal response
+publication against expiry, reset, and shutdown. -/
+def dispatchManagedUnaryInlineUntilAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
+    (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler
+      (decodeUnaryRequest registry metadata body (some deadline) (some preflight)) with
+  | .error status =>
+      -- Decoding is part of the call phase too.  A malformed or oversized
+      -- body that finishes at/after the absolute boundary cannot beat a
+      -- scheduler callback merely because that callback has not run yet.
+      if deadline <= (← now) then
+        pure (.error Deadline.exceededStatus)
+      else
+        pure (.error status)
+  | .ok request =>
+      if deadline <= (← now) then
+        pure (.error Deadline.exceededStatus)
+      else
+        let result ← runHandler do
+          let response ← handler request
+          validateUnaryResponse registry response
+        if deadline <= (← now) then
+          pure (.error Deadline.exceededStatus)
+        else
+          pure result
+
 def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :

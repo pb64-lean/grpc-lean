@@ -646,6 +646,12 @@ lean_test(
 )
 
 lean_test(
+    name = "deadline_arbiter_test",
+    srcs = ["Test/DeadlineArbiterTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "hpack_test",
     srcs = ["Test/HpackTest.lean"],
     deps = [":grpc_lean"],

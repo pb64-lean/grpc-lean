@@ -14,8 +14,8 @@ verifies that no callback fired, and confirms that the no-deadline path never
 consults its supplied runtime.  After the scheduler is shut down, a fixed-wave
 phase measures the production dispatch-registration gate and separately checks
 that no task crosses the gate before its modeled publication point.  A managed
-lifecycle phase composes that gate with the production child-retention,
-scheduler-registration, terminal-selection, release, and join primitives.
+lifecycle phase composes that gate with production exact-task retention,
+scheduler registration, terminal selection, one-shot release, and retirement.
 -/
 
 private structure RuntimeCounters where
@@ -434,7 +434,7 @@ private def validateManagedLifecycleSuccess
       unless ← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark
           lifecycle do
         releaseHandlers.resolve ()
-        throw (IO.userError "managed lifecycle lost its registered child")
+        throw (IO.userError "managed lifecycle lost scheduler registration custody")
     releaseHandlers.resolve ()
     for lifecycle in lifecycles do
       match ← Std.Async.Async.block <|
@@ -448,7 +448,7 @@ private def validateManagedLifecycleSuccess
       | .ok (.error status) => throw (IO.userError status.messageD)
       | .error error => throw error
       if ← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark lifecycle then
-        throw (IO.userError "managed lifecycle retained a completed child")
+        throw (IO.userError "managed lifecycle retained a completed registration")
       releases := releases + 1
       unless ← IO.hasFinished lifecycle.task do
         allTasksFinished := false
@@ -488,8 +488,8 @@ private def validateManagedLifecycleCancellationRaces
       (← IO.hasFinished unpublished.task) do
     throw (IO.userError "managed lifecycle pre-publication cancellation race failed")
 
-  -- Cancellation after registration must take and join the exact child and
-  -- erase its scheduler entry even if the handler is still blocked.
+  -- Cancellation after registration must take scheduler custody, cancel and
+  -- join the exact task, and erase the entry even while the handler is blocked.
   let releaseHandler ← IO.Promise.new
   let handlerEntries ← IO.mkRef 0
   let registered ←
@@ -505,7 +505,7 @@ private def validateManagedLifecycleCancellationRaces
     Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark registered
     discard <| Std.Async.Async.block <|
       Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark registered
-    throw (IO.userError "managed cancellation race did not register its child")
+    throw (IO.userError "managed cancellation race did not publish registration custody")
   Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark registered
   releaseHandler.resolve ()
   discard <| Std.Async.Async.block <|
@@ -515,7 +515,7 @@ private def validateManagedLifecycleCancellationRaces
   unless registeredResidual == 0 &&
       !(← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark registered) &&
       (← IO.hasFinished registered.task) do
-    throw (IO.userError "managed lifecycle registered-child cancellation race failed")
+    throw (IO.userError "managed lifecycle registered-task cancellation race failed")
   pure 2
 
 private def validateManagedLifecycle

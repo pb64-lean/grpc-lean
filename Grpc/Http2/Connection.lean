@@ -302,6 +302,33 @@ private structure DeadlineChild where
   expire? : Option (IO Unit)
   join : Std.Async.Async Unit
 
+private inductive UnaryTerminalKind where
+  | response
+  | deadline
+  | schedulerFailure
+  deriving BEq, Inhabited
+
+private inductive UnaryTerminalPhase where
+  | open
+  | claimed (kind : UnaryTerminalKind)
+  | published (kind : UnaryTerminalKind)
+  | cancelled
+  deriving BEq, Inhabited
+
+/-- One connection-owned terminal race for a managed timed unary call.  The
+single outer dispatch task is installed before its publication gate opens;
+`unregister?` is transferred exactly once by normal completion, expiry, reset,
+or shutdown. -/
+private structure UnaryTerminalState where
+  phase : UnaryTerminalPhase := .open
+  unregister? : Option (IO Unit) := none
+  cancelTask? : Option (IO Unit) := none
+  deriving Inhabited
+
+private structure UnaryTerminalOwner where
+  state : IO.Ref UnaryTerminalState
+  completed : IO.Promise Unit
+
 structure ActiveDispatch where
   streamId : Nat
   task : Task (Except IO.Error Unit)
@@ -312,6 +339,8 @@ structure ActiveDispatch where
   Optional with a default to preserve construction compatibility for callers
   that use this public diagnostic structure. -/
   private deadlineChild : Option (IO.Ref (Option DeadlineChild)) := none
+  /-- Single-task terminal owner for scheduler-present managed unary calls. -/
+  private unaryTerminal : Option UnaryTerminalOwner := none
 
 /-- A custom request-header authorizer currently owned by the connection.
 The callback itself runs without the connection-state mutex.  Keeping its
@@ -1782,6 +1811,114 @@ private def joinDeadlineChildRef?
   | none => pure ()
   | some childRef => joinDeadlineChildRef childRef
 
+private def claimUnaryTerminal (owner : UnaryTerminalOwner)
+    (kind : UnaryTerminalKind) : IO Bool :=
+  owner.state.modifyGet fun state =>
+    match state.phase with
+    | .open => (true, { state with phase := .claimed kind })
+    | _ => (false, state)
+
+private def installUnaryTerminalTask (owner : UnaryTerminalOwner)
+    (task : Task α) : IO Unit :=
+  owner.state.modify fun state => { state with cancelTask? := some (IO.cancel task) }
+
+private def releaseUnaryTerminalTask (owner : UnaryTerminalOwner) : IO Unit :=
+  owner.state.modify fun state => { state with cancelTask? := none }
+
+/-- Publish the scheduler release only while a live claim can still consume it.
+If expiry, reset, or scheduler failure already reached a terminal phase, erase
+the just-created registration immediately. -/
+private def installUnaryTerminalUnregister (owner : UnaryTerminalOwner)
+    (unregister : IO Unit) : IO Unit := do
+  let retained ← owner.state.modifyGet fun state =>
+    match state.phase with
+    | .open | .claimed _ =>
+        (true, { state with unregister? := some unregister })
+    | .published _ | .cancelled => (false, state)
+  unless retained do
+    unregister
+
+private def releaseUnaryTerminal (owner : UnaryTerminalOwner) : IO Unit := do
+  match ← owner.state.modifyGet fun state =>
+      (state.unregister?, { state with unregister? := none }) with
+  | none => pure ()
+  | some unregister => unregister
+
+/-- Suppress every uncommitted terminal claim and transfer its one scheduler
+release.  The caller cancels and joins the exact task retained by
+`ActiveDispatch`; keeping those operations separate lets all children be
+signalled before shutdown waits for arbitrary user IO. -/
+private def cancelUnaryTerminal (owner : UnaryTerminalOwner) : IO Unit := do
+  let (unregister?, complete) ← owner.state.modifyGet fun state =>
+    let phase := match state.phase with
+      | .published kind => .published kind
+      | _ => .cancelled
+    let complete := match state.phase with
+      | .published _ => false
+      | .open | .claimed _ | .cancelled => true
+    ((state.unregister?, complete),
+      { state with phase := phase, unregister? := none })
+  match unregister? with
+  | none => pure ()
+  | some unregister => unregister
+  -- `IO.cancel` does not wake a task suspended on `Promise.result?`.  Reset
+  -- can therefore cancel a losing outer task only after cancellation releases
+  -- the selected-but-unpublished terminal handoff.  Published winners keep
+  -- their existing completion ordering through the scheduler callback.
+  if complete then
+    owner.completed.resolve ()
+
+private def cancelUnaryTerminalTask (owner : UnaryTerminalOwner) : IO Unit := do
+  match ← owner.state.modifyGet fun state =>
+      (state.cancelTask?, { state with cancelTask? := none }) with
+  | none => pure ()
+  | some cancel => cancel
+
+private def unaryTerminalPhase (owner : UnaryTerminalOwner) : IO UnaryTerminalPhase :=
+  return (← owner.state.get).phase
+
+private def completeUnaryTerminal (owner : UnaryTerminalOwner) : IO Unit :=
+  owner.completed.resolve ()
+
+private def waitForUnaryTerminalCompletionIfInFlight
+    (owner : UnaryTerminalOwner) : Std.Async.Async Unit := do
+  match ← unaryTerminalPhase owner with
+  | .claimed _ | .published _ =>
+      discard <| Std.Async.Async.ofAsyncTask <|
+        owner.completed.result?.map (sync := true) fun _ => .ok ()
+  | .open | .cancelled => pure ()
+
+private def publishClaimedUnaryTerminal (owner : UnaryTerminalOwner)
+    (kind : UnaryTerminalKind) : IO Bool :=
+  owner.state.modifyGet fun state =>
+    match state.phase with
+    | .claimed claimedKind =>
+        if claimedKind == kind then
+          (true, { state with phase := .published kind })
+        else
+          (false, state)
+    | _ => (false, state)
+
+/-- Record that a selected terminal attempt was closed with a transport reset
+instead of gRPC trailers.  The published phase makes outer-task unwinding
+bookkeeping-only, so the same failure cannot emit a second RST_STREAM. -/
+private def publishAbortedUnaryTerminal (owner : UnaryTerminalOwner)
+    (kind : UnaryTerminalKind) : IO Bool :=
+  owner.state.modifyGet fun state =>
+    match state.phase with
+    | .claimed claimedKind =>
+        if claimedKind == kind then
+          (true, { state with phase := .published kind })
+        else
+          (false, state)
+    | .published publishedKind => (publishedKind == kind, state)
+    | .open | .cancelled => (false, state)
+
+private def registerUnaryTerminal (scheduler : DeadlineScheduler) (deadline : Nat)
+    (owner : UnaryTerminalOwner) (expire fail : IO Unit) : IO Unit := do
+  let unregister ← scheduler.register deadline expire fail
+  installUnaryTerminalUnregister owner unregister
+
 /-- Run a prepared custom authorizer with exact child ownership.  Timed calls
 share the connection scheduler; untimed custom callbacks still get a retained
 cancellable task so shutdown never loses the computation merely because no
@@ -1908,6 +2045,11 @@ private def signalDispatches (dispatches : Array ActiveDispatch) : IO Unit := do
   -- only its outer task cannot wake it.  Signal the exact child first; its
   -- completion resolves the race and lets the retained outer owner retire.
   for dispatch in dispatches do
+    match dispatch.unaryTerminal with
+    | none => pure ()
+    | some owner =>
+        cancelUnaryTerminal owner
+        releaseUnaryTerminalTask owner
     match dispatch.deadlineChild with
     | none => pure ()
     | some childRef => cancelDeadlineChildRef childRef
@@ -1979,6 +2121,84 @@ private def waitUntilDispatchRegistered
       | some () => .ok ()
       | none => .error (IO.userError "dispatch registration gate was dropped")
 
+private inductive UnaryTerminalCommitResult where
+  | suppressed
+  | emitted (frames : Array Frame)
+  | failed (status : Status)
+
+private def activeUnaryTerminal (state : State) (streamId : Nat) : Bool :=
+  state.activeDispatches.any fun dispatch =>
+    dispatch.streamId == streamId && dispatch.unaryTerminal.isSome
+
+/-- Commit encoded terminal frames and their HPACK successor in the same
+connection-state transaction that validates the retained active stream. Actual
+socket emission remains outside the mutex, matching `queueOutboundShared`. -/
+private def commitUnaryTerminal (registry : Registry) (stateMutex : Std.Mutex State)
+    (cancelled : IO.Ref Bool) (detached : DetachedDispatch)
+    (owner : UnaryTerminalOwner) (kind : UnaryTerminalKind)
+    (response : UnaryResponse) : IO UnaryTerminalCommitResult := do
+  let gzip := registry.enableResponseCompression &&
+    detached.request.preflight?.any (·.clientAcceptsGzip)
+  let encoded := Transport.encodeUnaryResponseFrames detached.outboundHpack
+    detached.request.streamId response detached.maxDataFrameSize gzip
+  stateMutex.atomically do
+    let state ← get
+    let phase ← unaryTerminalPhase owner
+    let ownsTerminal := activeUnaryTerminal state detached.request.streamId
+    if state.closing || (← cancelled.get) || !ownsTerminal ||
+        phase != .claimed kind then
+      discard <| owner.state.modifyGet fun terminal =>
+        let nextPhase := match terminal.phase with
+          | .published publishedKind => .published publishedKind
+          | _ => .cancelled
+        ((), { terminal with phase := nextPhase })
+      pure .suppressed
+    else
+      match encoded with
+      | .error status =>
+          discard <| owner.state.modifyGet fun terminal =>
+            ((), { terminal with phase := .claimed kind })
+          pure (.failed status)
+      | .ok encoded =>
+          if framePayloadBytes state.pendingOutbound + framePayloadBytes encoded.1
+              > maxPendingOutboundBytes then
+            discard <| owner.state.modifyGet fun terminal =>
+              ((), { terminal with phase := .claimed kind })
+            pure (.failed (Status.resourceExhausted
+              "HTTP/2 outbound buffer limit exceeded: peer is not consuming flow-controlled data"))
+          else if !(← publishClaimedUnaryTerminal owner kind) then
+            pure .suppressed
+          else
+            let (state, emitted) := queueOutbound state encoded.1
+            set { state with outboundHpack := encoded.2 }
+            pure (.emitted emitted)
+
+private def emitCommittedUnaryTerminal (emit : Array Frame -> IO Unit)
+    (commit : UnaryTerminalCommitResult) : IO (Except Status Bool) := do
+  match commit with
+  | .suppressed => pure (.ok false)
+  | .failed status => pure (.error status)
+  | .emitted frames =>
+      match ← emitFrameBatch emit frames with
+      | .ok () => pure (.ok true)
+      | .error status => pure (.error status)
+
+/-- Decompression is part of managed unary execution, but it stays off the
+successful request's clock-read path.  If an error finishes at/after the
+absolute boundary, local self-expiry must beat that earlier-phase status even
+when the scheduler callback is delayed. -/
+private def decompressManagedUnaryBodyUntil
+    (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray)
+    (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
+    BaseIO (Except Status ByteArray) := do
+  match Message.decompressBody usesGzip maxDataSize? body with
+  | .ok body => pure (.ok body)
+  | .error status =>
+      if deadline <= (← now) then
+        pure (.error Deadline.exceededStatus)
+      else
+        pure (.error status)
+
 namespace TestSupport
 
 /-- Benchmark seam for the exact dispatch-registration gate used by production
@@ -1988,6 +2208,12 @@ def waitUntilDispatchRegisteredForBenchmark
     (registered : IO.Promise Unit) : Std.Async.Async Unit :=
   waitUntilDispatchRegistered registered
 
+/-- Exact production error-path seam for managed unary decompression. -/
+def decompressManagedUnaryBodyUntilForBenchmark
+    (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray)
+    (deadline : Nat) (now : BaseIO Nat) : BaseIO (Except Status ByteArray) :=
+  decompressManagedUnaryBodyUntil usesGzip maxDataSize? body deadline now
+
 /-- Exact production primitives owned by one managed deadline benchmark call.
 The benchmark retains `task` before invoking `publish`, matching the dispatch
 spawn/publication/gate order without constructing HTTP/2 frames. -/
@@ -1995,52 +2221,93 @@ structure ManagedDeadlineLifecycleForBenchmark (α : Type) where
   task : Task (Except IO.Error (Except Status α))
   publish : IO Unit
   private cancelled : IO.Ref Bool
-  private childRef : IO.Ref (Option DeadlineChild)
+  private owner : UnaryTerminalOwner
+  private expire : IO Unit
+  private fail : IO Unit
 
 /-- Spawn one production-shaped managed deadline owner.  The task uses the
-same registration gate, child publication, scheduler registration, terminal
-selection, release, and child join as a managed dispatch. -/
+same registration gate, exact-task publication, scheduler registration,
+terminal selection, one-shot release, and retirement as a managed dispatch. -/
 def spawnManagedDeadlineLifecycleForBenchmark
-    (scheduler : DeadlineScheduler) (deadline : Nat) (action : GrpcM α) :
+    (scheduler : DeadlineScheduler) (deadline : Nat) (action : GrpcM α)
+    (onLostTerminal : IO Unit := pure ()) :
     IO (ManagedDeadlineLifecycleForBenchmark α) := do
   let registered ← IO.Promise.new
   let cancelled ← IO.mkRef false
-  let childRef ← IO.mkRef (none : Option DeadlineChild)
-  let runtime : DeadlineRuntime := {
-    externalTimer := true,
-    registerTask := fun childDeadline cancel expire join => do
-      let unregister ← registerDeadlineChild childRef (some scheduler)
-        childDeadline cancel expire join
-      if ← cancelled.get then
-        cancelDeadlineChildRef childRef
-      pure unregister
+  let terminalState ← IO.mkRef (default : UnaryTerminalState)
+  let terminalCompleted ← IO.Promise.new
+  let owner : UnaryTerminalOwner := {
+    state := terminalState,
+    completed := terminalCompleted
   }
+  let finishCallback (kind : UnaryTerminalKind) : IO Unit := do
+    if ← claimUnaryTerminal owner kind then
+      discard <| publishClaimedUnaryTerminal owner kind
+      releaseUnaryTerminal owner
+      completeUnaryTerminal owner
+      cancelUnaryTerminalTask owner
+  let expire := finishCallback .deadline
+  let fail := finishCallback .schedulerFailure
   let task ← Std.Async.Async.toIO do
-    waitUntilDispatchRegistered registered
-    if ← cancelled.get then
-      pure (.error (Status.cancelled Status.dispatchCancelledMessage))
-    else
-      let result ← Registry.runWithDeadlineUntilAsync
-        (some deadline) action (some runtime)
-      joinDeadlineChildRef childRef
-      pure result
+    let result ← do
+      waitUntilDispatchRegistered registered
+      if ← cancelled.get then
+        pure (.error (Status.cancelled Status.dispatchCancelledMessage))
+      else
+        registerUnaryTerminal scheduler deadline owner expire fail
+        if ← cancelled.get then
+          cancelUnaryTerminal owner
+          pure (.error (Status.cancelled Status.dispatchCancelledMessage))
+        else if (← unaryTerminalPhase owner) != .open then
+          pure (.error Deadline.exceededStatus)
+        else
+          let result ← if deadline <= (← IO.monoNanosNow) then
+              pure (.error Deadline.exceededStatus)
+            else do
+              let result ← try action.run catch error =>
+                pure (.error (Status.ofIOError error))
+              if deadline <= (← IO.monoNanosNow) then
+                pure (.error Deadline.exceededStatus)
+              else
+                pure result
+          let kind := match result with
+            | .error status =>
+                if status.code == Code.deadlineExceeded then
+                  UnaryTerminalKind.deadline
+                else
+                  UnaryTerminalKind.response
+            | .ok _ => UnaryTerminalKind.response
+          if ← claimUnaryTerminal owner kind then
+            discard <| publishClaimedUnaryTerminal owner kind
+            releaseUnaryTerminal owner
+            completeUnaryTerminal owner
+            pure result
+          else
+            onLostTerminal
+            waitForUnaryTerminalCompletionIfInFlight owner
+            pure (.error Deadline.exceededStatus)
+    releaseUnaryTerminalTask owner
+    pure result
+  installUnaryTerminalTask owner task
   pure {
     task := task,
     publish := registered.resolve (),
     cancelled := cancelled,
-    childRef := childRef
+    owner := owner,
+    expire := expire,
+    fail := fail
   }
 
-/-- Signal the exact managed child before its outer owner, as production
-connection cancellation does. -/
+/-- Transfer terminal custody and cancel the exact retained task, as
+production connection cancellation does. -/
 def cancelManagedDeadlineLifecycleForBenchmark
     (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Unit := do
   lifecycle.cancelled.set true
-  cancelDeadlineChildRef lifecycle.childRef
-  IO.cancel lifecycle.task
+  cancelUnaryTerminal lifecycle.owner
+  cancelUnaryTerminalTask lifecycle.owner
 
-/-- Join both ownership levels.  The second join is normally empty after a
-successful unregister, but owns a child that raced outer-task cancellation. -/
+/-- Join the exact retained managed task after normal completion or
+cancellation. -/
 def joinManagedDeadlineLifecycleForBenchmark
     (lifecycle : ManagedDeadlineLifecycleForBenchmark α) :
     Std.Async.Async (Except IO.Error (Except Status α)) := do
@@ -2048,13 +2315,81 @@ def joinManagedDeadlineLifecycleForBenchmark
     pure (.ok (← Std.Async.Async.ofAsyncTask lifecycle.task))
   catch error =>
     pure (.error error)
-  joinDeadlineChildRef lifecycle.childRef
+  releaseUnaryTerminalTask lifecycle.owner
   pure result
 
-/-- Whether the managed owner currently retains an exact deadline child. -/
+/-- Whether the managed owner currently retains scheduler registration
+custody.  The name is retained for benchmark-source compatibility. -/
 def managedDeadlineChildOwnedForBenchmark
     (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Bool := do
-  pure (← lifecycle.childRef.get).isSome
+  pure (← lifecycle.owner.state.get).unregister?.isSome
+
+/-- Deterministically invoke the exact expiry callback installed by the
+single-task managed lifecycle seam. -/
+def expireManagedDeadlineLifecycleForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Unit :=
+  lifecycle.expire
+
+/-- Deterministically invoke the exact scheduler-failure callback. -/
+def failManagedDeadlineLifecycleForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Unit :=
+  lifecycle.fail
+
+/-- Select expiry without publishing it, exposing the production handoff in
+which a losing outer task must remain owned until the scheduler winner has
+finished its terminal work. -/
+def claimManagedDeadlineExpiryForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Bool :=
+  claimUnaryTerminal lifecycle.owner .deadline
+
+/-- Complete a deadline claim selected by
+`claimManagedDeadlineExpiryForBenchmark`. -/
+def finishClaimedManagedDeadlineExpiryForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Unit := do
+  if ← publishClaimedUnaryTerminal lifecycle.owner .deadline then
+    releaseUnaryTerminal lifecycle.owner
+    completeUnaryTerminal lifecycle.owner
+    cancelUnaryTerminalTask lifecycle.owner
+
+inductive ManagedDeadlineTerminalPhaseForBenchmark where
+  | open
+  | claimedResponse
+  | claimedDeadline
+  | claimedSchedulerFailure
+  | publishedResponse
+  | publishedDeadline
+  | publishedSchedulerFailure
+  | cancelled
+  deriving BEq, Repr
+
+private def terminalPhaseForBenchmark :
+    UnaryTerminalPhase -> ManagedDeadlineTerminalPhaseForBenchmark
+  | .open => .open
+  | .claimed .response => .claimedResponse
+  | .claimed .deadline => .claimedDeadline
+  | .claimed .schedulerFailure => .claimedSchedulerFailure
+  | .published .response => .publishedResponse
+  | .published .deadline => .publishedDeadline
+  | .published .schedulerFailure => .publishedSchedulerFailure
+  | .cancelled => .cancelled
+
+structure ManagedDeadlineLifecycleSnapshotForBenchmark where
+  phase : ManagedDeadlineTerminalPhaseForBenchmark
+  registrationOwned : Bool
+  cancelled : Bool
+  taskFinished : Bool
+  deriving Repr
+
+def managedDeadlineLifecycleSnapshotForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) :
+    IO ManagedDeadlineLifecycleSnapshotForBenchmark := do
+  let state ← lifecycle.owner.state.get
+  pure {
+    phase := terminalPhaseForBenchmark state.phase,
+    registrationOwned := state.unregister?.isSome,
+    cancelled := ← lifecycle.cancelled.get,
+    taskFinished := ← IO.hasFinished lifecycle.task
+  }
 
 /-- Number of live call registrations, excluding pending request bodies. -/
 def deadlineSchedulerRegistrationCountForBenchmark
@@ -2098,8 +2433,227 @@ private def abortStreamSharedUnlessCancelled (cancelled : IO.Ref Bool)
   unless ← cancelled.get do
     abortStreamShared stateMutex emit streamId code
 
+/-- Close a managed unary stream while leaving its exact outer task discoverable
+in `activeDispatches`.  Scheduler callbacks run outside that task, so only the
+task's own retirement (or connection teardown, which retains its handle) may
+remove this ownership record. -/
+private def abortStreamSharedRetainingDispatchUnlessCancelled
+    (cancelled : IO.Ref Bool) (stateMutex : Std.Mutex State)
+    (emit : Array Frame -> IO Unit) (streamId : Nat) (owner : UnaryTerminalOwner)
+    (kind : UnaryTerminalKind) (code : ErrorCode) : IO Unit := do
+  let shouldEmit ← stateMutex.atomically do
+    let state ← get
+    if state.closing || (← cancelled.get) || !activeUnaryTerminal state streamId then
+      pure false
+    else if !(← publishAbortedUnaryTerminal owner kind) then
+      pure false
+    else
+      let activeDispatches := state.activeDispatches
+      let peerEnded :=
+        (findActiveRequestStream? state.activeRequestStreams streamId).isNone
+      let state := { state with streams := removeStream state.streams streamId }
+      let state := removeInboundStreamState state streamId
+      let state := removeOutboundStreamState state streamId
+      let state := { state with activeDispatches := activeDispatches }
+      set (if peerEnded then state else drainResetInboundStreamBody state streamId)
+      pure true
+  if shouldEmit then
+    match RstStream.frame streamId code with
+    | .error _ => pure ()
+    | .ok rst =>
+        try
+          emit #[rst]
+        catch _ =>
+          pure ()
+  else
+    pure ()
+
+private structure ManagedUnaryTerminalDispatch where
+  deadline : Nat
+  scheduler : DeadlineScheduler
+  preflight : Headers.RequestPreflight
+  handler : UnaryHandler
+
+private def managedUnaryTerminalDispatch?
+    (registry : Registry) (detached : DetachedDispatch) : Option ManagedUnaryTerminalDispatch := do
+  if registry.usesCustomRequestHeaderAuthorizer then
+    none
+  else
+    let deadline ← detached.request.deadline
+    let scheduler ← detached.deadlineScheduler
+    let preflight ← detached.request.preflight?
+    let entry ← detached.request.authorizedEntry?
+    match entry.dispatchHandler with
+    | .unary handler => some { deadline, scheduler, preflight, handler }
+    | _ => none
+
+/-- Managed, pure-authorized unary calls let the connection's one outer task
+run the handler directly.  The scheduler races terminal publication through an
+atomic arbiter, publishes deadline trailers before cancellation, and never
+needs the generic runner's second handler task or winner Promise. -/
+private def spawnManagedUnaryTerminalDispatch (registry : Registry)
+    (stateMutex : Std.Mutex State) (emit : Array Frame -> IO Unit)
+    (detached : DetachedDispatch) (managed : ManagedUnaryTerminalDispatch) :
+    Std.Async.Async Unit := do
+  let cancelled ← IO.mkRef false
+  let registered ← IO.Promise.new
+  let requestStreamCancel ← IO.mkRef (none : Option (IO Unit))
+  let responseStreamCancel ← IO.mkRef (none : Option (IO Unit))
+  let terminalState ← IO.mkRef (default : UnaryTerminalState)
+  let terminalCompleted ← IO.Promise.new
+  let owner : UnaryTerminalOwner := {
+    state := terminalState,
+    completed := terminalCompleted
+  }
+  let publish (kind : UnaryTerminalKind) (response : UnaryResponse) :
+      IO (Except Status Bool) := do
+    unless ← claimUnaryTerminal owner kind do
+      return .ok false
+    try
+      let committed ← commitUnaryTerminal registry stateMutex cancelled detached
+        owner kind response
+      let emitted ← emitCommittedUnaryTerminal emit committed
+      releaseUnaryTerminal owner
+      pure emitted
+    catch error =>
+      releaseUnaryTerminal owner
+      pure (.error (Status.ofIOError error))
+  let finishScheduledTerminal (kind : UnaryTerminalKind)
+      (response : UnaryResponse) : IO Unit := do
+    let outcome ← publish kind response
+    match outcome with
+    | .ok false => pure ()
+    | .ok true =>
+        completeUnaryTerminal owner
+        cancelUnaryTerminalTask owner
+    | .error _ =>
+        abortStreamSharedRetainingDispatchUnlessCancelled cancelled stateMutex emit
+          detached.request.streamId owner kind ErrorCode.internalError
+        completeUnaryTerminal owner
+        cancelUnaryTerminalTask owner
+    -- A winning wire terminal is committed and emitted before cooperative
+    -- handler cancellation can unwind and retire its active owner. A
+    -- losing late timer must not cancel the handler winner.
+  let expire : IO Unit := do
+    finishScheduledTerminal .deadline {
+      status := Deadline.exceededStatus,
+      data := ByteArray.empty
+    }
+  let fail : IO Unit := do
+    finishScheduledTerminal .schedulerFailure {
+      status := Status.cancelled Status.dispatchCancelledMessage,
+      data := ByteArray.empty
+    }
+  let task ← Std.Async.Async.toIO do
+    waitUntilDispatchRegistered registered
+    if ← cancelled.get then
+      pure ()
+    else try
+      registerUnaryTerminal managed.scheduler managed.deadline owner expire fail
+      if ← cancelled.get then
+        cancelUnaryTerminal owner
+      else if (← unaryTerminalPhase owner) == .open then
+        let result ← match ← decompressManagedUnaryBodyUntil
+            managed.preflight.requestUsesGzip registry.maxReceiveMessageSize
+            detached.request.body managed.deadline with
+          | .error status => pure (.error status)
+          | .ok body =>
+              registry.dispatchManagedUnaryInlineUntilAsync detached.request.metadata
+                body managed.preflight managed.handler managed.deadline
+        let kind := match result with
+          | .error status =>
+              if status.code == Code.deadlineExceeded then
+                UnaryTerminalKind.deadline
+              else
+                UnaryTerminalKind.response
+          | .ok _ => UnaryTerminalKind.response
+        let response := match result with
+          | .ok response => response
+          | .error status => { status := status, data := ByteArray.empty }
+        match ← publish kind response with
+        | .ok true => completeUnaryTerminal owner
+        | .ok false => waitForUnaryTerminalCompletionIfInFlight owner
+        | .error _ =>
+            abortStreamSharedRetainingDispatchUnlessCancelled cancelled stateMutex emit
+              detached.request.streamId owner kind ErrorCode.internalError
+            completeUnaryTerminal owner
+      else
+        waitForUnaryTerminalCompletionIfInFlight owner
+      releaseUnaryTerminal owner
+      releaseUnaryTerminalTask owner
+      stateMutex.atomically do
+        modify fun state => {
+          state with
+          activeDispatches := removeActiveDispatchesForStream
+            state.activeDispatches detached.request.streamId
+        }
+    catch _ =>
+      releaseUnaryTerminal owner
+      releaseUnaryTerminalTask owner
+      stateMutex.atomically do
+        modify fun state => {
+          state with
+          activeDispatches := removeActiveDispatchesForStream
+            state.activeDispatches detached.request.streamId
+        }
+      match ← unaryTerminalPhase owner with
+      | .published _ => pure ()
+      | _ =>
+          abortStreamSharedUnlessCancelled cancelled stateMutex emit
+            detached.request.streamId ErrorCode.internalError
+  installUnaryTerminalTask owner task
+  let published ← stateMutex.atomically do
+    let state ← get
+    let ownsPublication :=
+      containsStreamId state.pendingDispatchPublications detached.request.streamId
+    let state := {
+      state with
+      pendingDispatchPublications := removeStreamId
+        state.pendingDispatchPublications detached.request.streamId
+    }
+    if state.closing || !ownsPublication then
+      set state
+      pure false
+    else
+      set {
+        state with
+        activeDispatches := state.activeDispatches.push {
+          streamId := detached.request.streamId,
+          task := task,
+          cancelled := cancelled,
+          requestStreamCancel := requestStreamCancel,
+          responseStreamCancel := responseStreamCancel,
+          unaryTerminal := some owner
+        }
+      }
+      pure true
+  unless published do
+    cancelled.set true
+    cancelUnaryTerminal owner
+    cancelUnaryTerminalTask owner
+  registered.resolve ()
+  unless published do
+    try
+      discard <| Std.Async.Async.ofAsyncTask task
+    catch _ =>
+      pure ()
+    return
+  if ← IO.hasFinished task then
+    releaseUnaryTerminalTask owner
+    stateMutex.atomically do
+      modify fun state => {
+        state with
+        activeDispatches := removeActiveDispatchesForStream
+          state.activeDispatches detached.request.streamId
+      }
+
 private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex State)
     (emit : Array Frame -> IO Unit) (detached : DetachedDispatch) : Std.Async.Async Unit := do
+  match managedUnaryTerminalDispatch? registry detached with
+  | some managed =>
+      spawnManagedUnaryTerminalDispatch registry stateMutex emit detached managed
+      return
+  | none => pure ()
   let cancelled ← IO.mkRef false
   let registered ← IO.Promise.new
   let deadlineChild? ←

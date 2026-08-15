@@ -234,6 +234,16 @@ partial def awaitTaskFinished (task : Task α) (remainingMilliseconds : Nat) : I
     IO.sleep 1
     awaitTaskFinished task (remainingMilliseconds - 1)
 
+partial def awaitNoActiveDispatches (stateMutex : Std.Mutex Http2.Connection.State)
+    (remainingMilliseconds : Nat) : IO Bool := do
+  if (← stateMutex.atomically get).activeDispatches.isEmpty then
+    pure true
+  else if remainingMilliseconds == 0 then
+    pure false
+  else
+    IO.sleep 1
+    awaitNoActiveDispatches stateMutex (remainingMilliseconds - 1)
+
 partial def awaitFlag (flag : IO.Ref Bool) (remainingMilliseconds : Nat) : IO Bool := do
   if ← flag.get then
     pure true
@@ -700,6 +710,76 @@ def testPeerRstCancelsDeadlineHandlerWithoutEchoReset : IO Unit := do
   expect (!sawRst)
     "peer RST should not provoke a second RST_STREAM from a deadline-wrapped dispatch"
 
+/-- A terminal response that cannot enter the bounded outbound queue closes
+the stream exactly once while retaining the outer task until it has unwound. -/
+def testManagedDeadlineTerminalQueueFailureOwnsOneReset : IO Unit := do
+  let scheduler ← Http2.Connection.DeadlineScheduler.new
+  let handlerStarted ← IO.mkRef false
+  let releaseHandler ← IO.mkRef false
+  let registry := Registry.empty.registerUnary echoMethod fun request => do
+    handlerStarted.set true
+    -- Deliberately ignore cooperative cancellation until the test releases
+    -- the gate, proving the connection keeps the exact outer task discoverable.
+    while !(← releaseHandler.get) do
+      try IO.sleep 1 catch _ => pure ()
+    pure { metadata := Metadata.empty, data := request.data, status := Status.ok }
+  let saturatedPayload := repeatByte Http2.Connection.maxPendingOutboundBytes 0
+  let saturatedFrame : Http2.Frame := {
+    header := {
+      length := saturatedPayload.size,
+      frameType := Http2.FrameType.data,
+      flags := 0,
+      streamId := 99
+    },
+    payload := saturatedPayload
+  }
+  let stateMutex ← Std.Mutex.new ({
+    prefaceReceived := true,
+    clientSettingsReceived := true,
+    outboundConnectionWindow := 0,
+    pendingOutbound := #[saturatedFrame],
+    deadlineScheduler := some scheduler
+  } : Http2.Connection.State)
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let emit (frames : Array Http2.Frame) : IO Unit :=
+    emittedRef.modify fun emitted => emitted.append frames
+  try
+    let timedHeaders := requestHeaders.insert "grpc-timeout" "1H"
+    let encodedHeaders ← expectStatusOk (Http2.Hpack.encodeHeaderBlock {} timedHeaders)
+    let headersWire ← frameWire Http2.FrameType.headers Http2.FrameFlag.endHeaders
+      1 encodedHeaders.1
+    let dataWire ← frameWire Http2.FrameType.data Http2.FrameFlag.endStream
+      1 (grpcMessageBytes (repeatByte 3 7))
+    match ← Http2.Connection.processBytesSharedWith registry stateMutex
+        (headersWire.append dataWire) emit with
+    | .error status => throw (IO.userError status.messageD)
+    | .ok () => pure ()
+
+    unless ← awaitFlag handlerStarted 1000 do
+      throw (IO.userError "outbound-cap handler did not enter its retained task")
+    expectEq
+      (← Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler)
+      1 "outbound-cap handler did not own one deadline registration"
+    Std.Async.Async.block scheduler.shutdown
+    unless ← awaitFrame emittedRef Http2.FrameType.rstStream 200 do
+      throw (IO.userError "outbound-cap terminal failure did not reset its stream")
+    let retained ← stateMutex.atomically get
+    expect (!retained.activeDispatches.isEmpty)
+      "scheduler terminal failure dropped an uncooperative handler task"
+    expectEq
+      (← Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler)
+      0 "scheduler terminal failure retained a deadline registration"
+    releaseHandler.set true
+    unless ← awaitNoActiveDispatches stateMutex 1000 do
+      throw (IO.userError "outbound-cap terminal failure lost its retained dispatch owner")
+    let resets := (← emittedRef.get).filter fun frame =>
+      frame.header.streamId == 1 && frame.header.frameType == Http2.FrameType.rstStream
+    expectEq resets.size 1
+      "outbound-cap terminal failure must emit exactly one RST_STREAM"
+  finally
+    releaseHandler.set true
+    discard <| Http2.Connection.cancelActiveShared stateMutex
+
 def main : IO Unit := do
   testPaddedDataFrame
   IO.println "padded DATA ok"
@@ -721,6 +801,8 @@ def main : IO Unit := do
   IO.println "peer RST cancels dispatch without an echo reset"
   testPeerRstCancelsDeadlineHandlerWithoutEchoReset
   IO.println "peer RST cancels a deadline-wrapped handler without an echo reset"
+  testManagedDeadlineTerminalQueueFailureOwnsOneReset
+  IO.println "managed deadline terminal queue failure owns one reset"
   testManagedH2CDeadlineThenConnectionReuse
   IO.println "managed h2c handler deadline preserves connection reuse"
   testManagedH2CAuthorizerDeadlineThenConnectionReuse
