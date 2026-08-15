@@ -1518,8 +1518,8 @@ direct-plan hook, but schemas outside this subset use the generic validated
 fallback. Its generated name component contains `$`, which cannot occur in a
 protobuf identifier, so legal field projections cannot collide with the hook.
 Keeping this predicate structural avoids message-name-specific
-codecs while allowing the Widget/ListWidgetsResponse shape to bypass the
-intermediate `Message`/`Record`/nested `ByteArray` graph. -/
+codecs while allowing the Widget/WidgetResponse/ListWidgetsResponse shape to
+bypass the intermediate `Message`/`Record`/nested `ByteArray` graph. -/
 private def directTypedFieldSupported (x : ProtoFieldMData) : Bool :=
   if x.map_info?.isSome || x.oneof_type?.isSome then
     false
@@ -1527,7 +1527,10 @@ private def directTypedFieldSupported (x : ProtoFieldMData) : Bool :=
     match x.mod with
     | .default =>
         match x.internal_type? with
-        | some .string | some .uint32 | some .uint64 => true
+        | some .bool | some .string | some .uint32 | some .uint64 => true
+        | none =>
+            x.enum_type?.isNone &&
+              !x.options.wired_as_group?.isEqSome true
         | _ => false
     | .repeated =>
         x.internal_type?.isNone && x.enum_type?.isNone &&
@@ -1558,7 +1561,30 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
 
   let directPlanWithOptions ←
     if fields.all directTypedFieldSupported then
-      let mut childSetups : Array (Ident × Term × Ident) := #[]
+      let childPlannerFor (x : ProtoFieldMData) : CommandElabM Term := do
+        let childDirectPlanWithOptionsId :=
+          mkIdentFrom x.proto_type
+            (x.proto_type.getId.str "_pb$directPlanWithOptions")
+        let childHasDirectPlan : Bool ←
+          if mutMessages.contains x.proto_type.getId then
+            pure true
+          else
+            try
+              let resolved ← resolveGlobalConst childDirectPlanWithOptionsId
+              pure !resolved.isEmpty
+            catch _ =>
+              pure false
+        if childHasDirectPlan then
+          `($childDirectPlanWithOptionsId:ident)
+        else
+          let childToMessageWithOptions :=
+            mkIdentFrom x.proto_type (x.proto_type.getId.str "toMessageWithOptions")
+          let childOptions ← mkIdent <$> mkFreshUserName `options
+          let childValue ← mkIdent <$> mkFreshUserName `value
+          `(fun $childOptions:ident $childValue:ident =>
+            $childToMessageWithOptions:ident $childOptions:ident $childValue:ident >>=
+              Protobuf.Encoding.Direct.Plan.ofMessage)
+      let mut childSetups : Array (Ident × Term) := #[]
       let mut sizeTerms : Array Term := #[]
       let mut putTerms : Array Term := #[]
       for x in fields do
@@ -1567,6 +1593,11 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
             let value ← `($(x.field_proj):ident $val:ident)
             let (fieldSize, fieldPut) ←
               match internalType with
+              | .bool =>
+                  pure (← `(Protobuf.Encoding.Direct.varintFieldSize $(x.field_num):num
+                    (if $value:term then 1 else 0)),
+                    ← `(Protobuf.Encoding.Direct.putVarintField $(x.field_num):num
+                      (if $value:term then 1 else 0)))
               | .string =>
                   pure (← `(Protobuf.Encoding.Direct.stringFieldSize $(x.field_num):num $value:term),
                     ← `(Protobuf.Encoding.Direct.putStringField $(x.field_num):num $value:term))
@@ -1584,33 +1615,30 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
                 (pure () : Binary.Put)
               else
                 $fieldPut:term))
+        | .default, none =>
+            let childPlan ← mkIdent <$> mkFreshUserName `childPlan
+            let childPlanner ← childPlannerFor x
+            childSetups := childSetups.push
+              (childPlan, ← `(Option.mapM
+                ($childPlanner:term $options:ident)
+                ($(x.field_proj):ident $val:ident)))
+            sizeTerms := sizeTerms.push
+              (← `(match $childPlan:ident with
+                | Option.none => 0
+                | Option.some child =>
+                    Protobuf.Encoding.Direct.messageFieldSize $(x.field_num):num child))
+            putTerms := putTerms.push
+              (← `(match $childPlan:ident with
+                | Option.none => (pure () : Binary.Put)
+                | Option.some child =>
+                    Protobuf.Encoding.Direct.putMessageField $(x.field_num):num child))
         | .repeated, none =>
             let childPlans ← mkIdent <$> mkFreshUserName `childPlans
-            let childDirectPlanWithOptionsId :=
-              mkIdentFrom x.proto_type
-                (x.proto_type.getId.str "_pb$directPlanWithOptions")
-            let childHasDirectPlan : Bool ←
-              if mutMessages.contains x.proto_type.getId then
-                pure true
-              else
-                try
-                  let resolved ← resolveGlobalConst childDirectPlanWithOptionsId
-                  pure !resolved.isEmpty
-                catch _ =>
-                  pure false
-            let childPlanner ←
-              if childHasDirectPlan then
-                `($childDirectPlanWithOptionsId:ident)
-              else
-                let childToMessageWithOptions :=
-                  mkIdentFrom x.proto_type (x.proto_type.getId.str "toMessageWithOptions")
-                let childOptions ← mkIdent <$> mkFreshUserName `options
-                let childValue ← mkIdent <$> mkFreshUserName `value
-                `(fun $childOptions:ident $childValue:ident =>
-                  $childToMessageWithOptions:ident $childOptions:ident $childValue:ident >>=
-                    Protobuf.Encoding.Direct.Plan.ofMessage)
+            let childPlanner ← childPlannerFor x
             childSetups := childSetups.push
-              (childPlans, childPlanner, x.field_proj)
+              (childPlans, ← `(Array.mapM
+                ($childPlanner:term $options:ident)
+                ($(x.field_proj):ident $val:ident)))
             sizeTerms := sizeTerms.push
               (← `(($childPlans:ident).foldl (init := 0) fun total child =>
                 total + Protobuf.Encoding.Direct.messageFieldSize $(x.field_num):num child))
@@ -1630,10 +1658,8 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
             { size := $knownSize:term + ($unknownPlan:ident).size
             , put := fun $out:ident => $putBody:term
             })
-      for (childPlans, childPlanner, fieldProj) in childSetups.reverse do
-        body ← `(Array.mapM
-            ($childPlanner:term $options:ident)
-            ($fieldProj:ident $val:ident) >>= fun $childPlans:ident =>
+      for (childPlans, childSetup) in childSetups.reverse do
+        body ← `($childSetup:term >>= fun $childPlans:ident =>
           $body:term)
       `(partial def $directPlanWithOptionsId:ident :
           Protobuf.Encoding.EncodeOptions → $name →
