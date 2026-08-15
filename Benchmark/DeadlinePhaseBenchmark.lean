@@ -7,9 +7,11 @@ open Grpc
 
 This informative benchmark separates the public deadline runner's task/promise
 cost from the connection scheduler's registration cost. Timed samples use
-uninstrumented runtimes; a separate bounded pass checks exact registration and
-unregistration counts, verifies that no callback fired, and confirms that the
-no-deadline path never consults its supplied runtime.
+uninstrumented runtimes and enter `Async.block` once per batch, matching a
+production dispatch owner rather than charging an extra bridge to every call.
+A separate bounded pass checks exact registration and unregistration counts,
+verifies that no callback fired, and confirms that the no-deadline path never
+consults its supplied runtime.
 -/
 
 private structure RuntimeCounters where
@@ -81,15 +83,18 @@ private def countedSchedulerRuntime (scheduler : Http2.Connection.DeadlineSchedu
       unregister
 }
 
-private def runRepeated (deadline? : Option Nat) (runtime : DeadlineRuntime)
-    (iterations : Nat) : IO Nat := do
+private def runRepeatedAsync (deadline? : Option Nat) (runtime : DeadlineRuntime)
+    (iterations : Nat) : Std.Async.Async Nat := do
   let mut checksum := 0
   for _ in [0:iterations] do
-    match ← Std.Async.Async.block <|
-        Registry.runWithDeadlineUntilAsync deadline? (pure 1) (some runtime) with
+    match ← Registry.runWithDeadlineUntilAsync deadline? (pure 1) (some runtime) with
     | .ok value => checksum := checksum + value
     | .error status => throw (IO.userError status.messageD)
   pure checksum
+
+private def runRepeated (deadline? : Option Nat) (runtime : DeadlineRuntime)
+    (iterations : Nat) : IO Nat :=
+  Std.Async.Async.block (runRepeatedAsync deadline? runtime iterations)
 
 private def measurePhase (sink : IO.Ref Nat) (deadline? : Option Nat)
     (runtime : DeadlineRuntime) (iterations : Nat) : IO Nat := do
