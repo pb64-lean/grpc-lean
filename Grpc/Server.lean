@@ -651,7 +651,9 @@ def runWithDeadlineUntilAsync (deadline? : Option Nat) (action : GrpcM α)
                 catch _ =>
                   pure ()
               runtime.registerTask deadline cancel expire join
-        let selected ← Std.Async.Async.ofPurePromise (pure winner)
+        let selected ← Std.Async.Async.ofAsyncTask
+          (Std.Async.AsyncTask.ofPurePromise winner
+            (error := "the promise linked to the Async was dropped"))
         -- `Sleep.stop` drops its waiter; cancelling the converted task first
         -- makes that cleanup explicit and keeps no losing timer continuation.
         stopDeadlineTimer
