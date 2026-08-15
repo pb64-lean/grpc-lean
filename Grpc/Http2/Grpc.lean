@@ -476,48 +476,89 @@ def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.Stat
   | .accept _ _ => pure none
   | .reject frames outboundHpack => pure (some (frames, outboundHpack))
 
-/-- Deadline-race only user-installed authorization IO.  The default
-registered-handler acceptor stays inline, while a cancelled custom callback is
-joined here before the header-processing owner proceeds. -/
-private def authorizeEntryUntil (registry : Registry) (entry : MethodEntry)
+/-- Run bounded pure authorization inline, with the same absolute deadline
+checked immediately before and after the callback. -/
+private def authorizePureEntryUntilWithClock (now : IO Nat)
+    (authorizer : PureRequestHeaderAuthorizer) (entry : MethodEntry)
+    (metadata : Metadata) (deadline : Option Nat) :
+    IO (Except Status (AuthorizationResult entry)) := do
+  match deadline with
+  | none => pure (.ok (authorizer entry metadata))
+  | some deadline =>
+      if deadline <= (← now) then
+        pure (.error Deadline.exceededStatus)
+      else
+        let decision := authorizer entry metadata
+        if deadline <= (← now) then
+          pure (.error Deadline.exceededStatus)
+        else
+          pure (.ok decision)
+
+/-- Deadline-race only user-installed authorization IO. Default and bounded
+pure acceptors stay inline, while a cancelled effectful callback is joined
+here before the header-processing owner proceeds. -/
+private def authorizeEntryUntilWithClock (now : IO Nat) (registry : Registry)
+    (entry : MethodEntry)
     (metadata : Metadata) (deadline : Option Nat)
     (runtime? : Option DeadlineRuntime := none) :
     IO (Except Status (AuthorizationResult entry)) := do
-  if !registry.usesCustomRequestHeaderAuthorizer || deadline.isNone then
-    try
-      registry.authorizeRequestHeaders entry metadata |>.run
-    catch error =>
-      pure (.error (Status.ofIOError error))
-  else
-    let childOwned ←
-      IO.mkRef (none : Option (Std.Async.Async Unit × IO Unit))
-    let runtime : DeadlineRuntime := {
-      externalTimer := runtime?.any (fun runtime => runtime.externalTimer),
-      registerTask := fun childDeadline cancel expire join => do
-        let release ← match runtime? with
-          | none => pure (pure ())
-          | some runtime =>
-              runtime.registerTask childDeadline cancel expire join
-        childOwned.set (some (join, release))
-        pure do
-          release
-          childOwned.set none
-    }
-    let result ← try
-      Std.Async.Async.block <|
-        Registry.runWithDeadlineUntilAsync deadline
-          (registry.authorizeRequestHeaders entry metadata) (some runtime)
-    catch error =>
-      pure (.error (Status.ofIOError error))
-    match ← childOwned.modifyGet fun child? => (child?, none) with
-    | none => pure ()
-    | some (join, release) =>
+  match registry.pureRequestHeaderAuthorizer? with
+  | some authorizer =>
+      authorizePureEntryUntilWithClock now authorizer entry metadata deadline
+  | none =>
+      if !registry.usesCustomRequestHeaderAuthorizer || deadline.isNone then
         try
-          Std.Async.Async.block join
-        catch _ =>
-          pure ()
-        release
-    pure result
+          registry.authorizeRequestHeaders entry metadata |>.run
+        catch error =>
+          pure (.error (Status.ofIOError error))
+      else
+        let childOwned ←
+          IO.mkRef (none : Option (Std.Async.Async Unit × IO Unit))
+        let runtime : DeadlineRuntime := {
+          externalTimer := runtime?.any (fun runtime => runtime.externalTimer),
+          registerTask := fun childDeadline cancel expire join => do
+            let release ← match runtime? with
+              | none => pure (pure ())
+              | some runtime =>
+                  runtime.registerTask childDeadline cancel expire join
+            childOwned.set (some (join, release))
+            pure do
+              release
+              childOwned.set none
+        }
+        let result ← try
+          Std.Async.Async.block <|
+            Registry.runWithDeadlineUntilAsync deadline
+              (registry.authorizeRequestHeaders entry metadata) (some runtime)
+        catch error =>
+          pure (.error (Status.ofIOError error))
+        match ← childOwned.modifyGet fun child? => (child?, none) with
+        | none => pure ()
+        | some (join, release) =>
+            try
+              Std.Async.Async.block join
+            catch _ =>
+              pure ()
+            release
+        pure result
+
+private def authorizeEntryUntil (registry : Registry) (entry : MethodEntry)
+    (metadata : Metadata) (deadline : Option Nat)
+    (runtime? : Option DeadlineRuntime := none) :
+    IO (Except Status (AuthorizationResult entry)) :=
+  authorizeEntryUntilWithClock IO.monoNanosNow registry entry metadata deadline runtime?
+
+namespace TestSupport
+
+/-- Deterministic registry-selection seam. It proves the registered default
+does not touch the pure-callback clock while an explicitly installed pure
+authorizer receives the required bracket checks. -/
+def authorizeRegistryEntryUntilWithClock (now : IO Nat) (registry : Registry)
+    (entry : MethodEntry) (metadata : Metadata) (deadline : Option Nat) :
+    IO (Except Status (AuthorizationResult entry)) :=
+  Transport.authorizeEntryUntilWithClock now registry entry metadata deadline
+
+end TestSupport
 
 /-- Run only authorization for an entry selected by `preflightEarlyRequest`.
 The original metadata value is passed through unchanged. -/

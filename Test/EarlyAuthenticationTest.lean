@@ -134,6 +134,30 @@ def authenticatedRegistry (authorizerCalls handlerCalls : IO.Ref Nat) : Registry
         | _ => throw (Status.internal "authorizer expected a unary method entry")
     | _ => throw (Status.error .unauthenticated "invalid local access token")
 
+def pureAuthenticatedRegistry (handlerCalls : IO.Ref Nat) : Registry :=
+  let registry := Registry.empty
+    |>.withMaxReceiveMessageSize 1
+    |>.registerUnary method (fun _ => do
+      handlerCalls.modify (fun calls => calls + 1000)
+      throw (Status.internal "registry fallback handler must not run"))
+  registry.withPureRequestHeaderAuthorizer fun entry requestMetadata =>
+    if entry.name != method then
+      .reject (Status.internal "pure authorizer received the wrong method")
+    else
+      match (requestMetadata.getAll "authorization").back? with
+      | some "TestScheme local-test-token" =>
+          let resolvedSession := 23
+          match entry with
+          | { shape := .unary, .. } =>
+              .accept fun request => do
+                handlerCalls.modify (fun calls => calls + 1)
+                pure {
+                  data := request.data.push (UInt8.ofNat resolvedSession)
+                  status := Status.ok
+                }
+          | _ => .reject (Status.internal "pure authorizer expected a unary method entry")
+      | _ => .reject (Status.error .unauthenticated "invalid local access token")
+
 partial def waitUntil (description : String) (remaining : Nat)
     (condition : IO Bool) : IO Unit := do
   if ← condition then
@@ -143,6 +167,160 @@ partial def waitUntil (description : String) (remaining : Nat)
   else
     IO.sleep 1
     waitUntil description (remaining - 1) condition
+
+def testPureAuthorizerDeadlineBracketsAndDefaultFastPath : IO Unit := do
+  let registry := Registry.empty.registerUnary method fun request =>
+    pure { data := request.data, status := Status.ok }
+  let some entry := registry.findEntry? method
+    | fail "registered unary entry was not found"
+
+  let defaultClockReads ← IO.mkRef 0
+  let defaultNow := do
+    defaultClockReads.modify (fun reads => reads + 1)
+    pure 100
+  let defaultDecision ← Http2.Transport.TestSupport.authorizeRegistryEntryUntilWithClock
+    defaultNow registry entry (metadata none) (some 100)
+  match defaultDecision with
+  | .ok (.accept _) => pure ()
+  | _ => fail "registered default authorizer did not accept inline"
+  expect ((← defaultClockReads.get) == 0)
+    "registered default authorizer entered the pure-callback clock path"
+
+  let pureRegistry := registry.withPureRequestHeaderAuthorizer fun _ _ =>
+    .reject (Status.error .permissionDenied "bounded policy rejection")
+  let untimedClockReads ← IO.mkRef 0
+  let untimedNow := do
+    untimedClockReads.modify (fun reads => reads + 1)
+    pure 100
+  let untimedDecision ← Http2.Transport.TestSupport.authorizeRegistryEntryUntilWithClock
+    untimedNow pureRegistry entry (metadata none) none
+  match untimedDecision with
+  | .ok (.reject status) =>
+      expect (status.code == .permissionDenied)
+        "untimed pure authorizer changed its policy decision"
+  | _ => fail "untimed pure authorizer returned the wrong result"
+  expect ((← untimedClockReads.get) == 0)
+    "untimed pure authorizer read a deadline clock"
+
+  let expiredBeforeReads ← IO.mkRef 0
+  let expiredBeforeNow := do
+    expiredBeforeReads.modify (fun reads => reads + 1)
+    pure 100
+  let expiredBefore ← Http2.Transport.TestSupport.authorizeRegistryEntryUntilWithClock
+    expiredBeforeNow pureRegistry entry (metadata none) (some 100)
+  match expiredBefore with
+  | .error status =>
+      expect (status.code == .deadlineExceeded)
+        "pre-authorization deadline check returned the wrong status"
+  | .ok _ => fail "expired request entered the pure authorizer"
+  expect ((← expiredBeforeReads.get) == 1)
+    "expired request did not stop after the pre-authorization clock check"
+
+  let bracketReads ← IO.mkRef 0
+  let bracketNow := do
+    let read ← bracketReads.modifyGet fun reads => (reads, reads + 1)
+    pure (if read == 0 then 99 else 100)
+  let expiredAfter ← Http2.Transport.TestSupport.authorizeRegistryEntryUntilWithClock
+    bracketNow pureRegistry entry (metadata none) (some 100)
+  match expiredAfter with
+  | .error status =>
+      expect (status.code == .deadlineExceeded)
+        "post-authorization deadline check did not override the policy result"
+  | .ok _ => fail "deadline reached during pure authorization was ignored"
+  expect ((← bracketReads.get) == 2)
+    "pure authorization was not bracketed by exactly two clock checks"
+
+def testAuthorizerInstallersAreLastWins : IO Unit := do
+  let base := Registry.empty.registerUnary method fun request =>
+    pure { data := request.data, status := Status.ok }
+  let some entry := base.findEntry? method
+    | fail "registered unary entry was not found"
+  let effectful : RequestHeaderAuthorizer := fun _ _ =>
+    pure (.reject (Status.error .unauthenticated "effectful"))
+  let bounded : PureRequestHeaderAuthorizer := fun _ _ =>
+    .reject (Status.error .permissionDenied "pure")
+
+  let pureLast := (base.withRequestHeaderAuthorizer effectful)
+    |>.withPureRequestHeaderAuthorizer bounded
+  let pureDecision ← expectOk
+    (← pureLast.authorizeRequestHeaders entry (metadata none) |>.run)
+    "run last-installed pure authorizer"
+  match pureDecision with
+  | .reject status =>
+      expect (status.code == .permissionDenied)
+        "effectful authorizer remained active after pure installation"
+  | .accept _ => fail "last-installed pure rejection was ignored"
+
+  let effectfulLast := (base.withPureRequestHeaderAuthorizer bounded)
+    |>.withRequestHeaderAuthorizer effectful
+  let effectfulDecision ← expectOk
+    (← effectfulLast.authorizeRequestHeaders entry (metadata none) |>.run)
+    "run last-installed effectful authorizer"
+  match effectfulDecision with
+  | .reject status =>
+      expect (status.code == .unauthenticated)
+        "pure authorizer remained active after effectful installation"
+  | .accept _ => fail "last-installed effectful rejection was ignored"
+
+def testPureAuthorizerRejectsBeforeBody : IO Unit := do
+  for presented in [none, some "TestScheme wrong"] do
+    let handlerCalls ← IO.mkRef 0
+    let registry := pureAuthenticatedRegistry handlerCalls
+    let headers ← headersFrame presented
+    let (state, emitted) ← expectOk
+      (← Http2.Connection.processFrame registry readyState headers)
+      "process pure-authorizer rejection"
+    expect (state.ignoredInboundStreams.contains 1)
+      "pure-authorizer rejection did not enter drain-only state at END_HEADERS"
+    expect ((← handlerCalls.get) == 0)
+      "pure-authorizer rejection entered the RPC handler"
+    let status ← rejectedStatus emitted
+    expect (status.code == .unauthenticated)
+      "pure-authorizer rejection returned the wrong status"
+
+def testPureAuthorizerRunsInlineAndCarriesCapability : IO Unit := do
+  let handlerCalls ← IO.mkRef 0
+  let registry := pureAuthenticatedRegistry handlerCalls
+  let scheduler ← Http2.Connection.DeadlineScheduler.new
+  let stateMutex ← Std.Mutex.new {
+    readyState with deadlineScheduler := some scheduler
+  }
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let emit (frames : Array Http2.Frame) : IO Unit :=
+    emittedRef.modify fun emitted => emitted.append frames
+  try
+    let requestMetadata := metadata (some "TestScheme local-test-token")
+      |>.insert "grpc-timeout" "1H"
+    let headers ← headersFrameFor requestMetadata
+    let anchor ← IO.monoNanosNow
+    discard <| expectOk (← Std.Async.Async.block <|
+      Http2.Connection.processFrameSharedWithOwned registry stateMutex headers emit
+        (some anchor)) "process bounded pure authorization"
+    let state ← stateMutex.atomically get
+    expect state.activeAuthorizations.isEmpty
+      "bounded pure authorization entered the effectful authorization lifecycle"
+    let some stream := state.streams.find? (fun stream => stream.streamId == 1)
+      | fail "pure-authorized open request was not retained"
+    expect stream.authorizedEntry?.isSome
+      "pure-authorized handler capability was not cached at END_HEADERS"
+
+    let requestMessage ← expectOk (Message.encode { data := ByteArray.mk #[1] })
+      "encode pure-authorized request"
+    expectOk (← Http2.Connection.processFrameSharedWith registry stateMutex
+      (dataFrame requestMessage) emit) "dispatch pure-authorized request"
+    waitUntil "pure-authorized response did not finish" 200 do
+      pure <| (← emittedRef.get).any fun frame =>
+        frame.header.frameType == .headers
+          && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+    expect ((← handlerCalls.get) == 1)
+      "dispatch did not use the handler capability selected by pure authorization"
+    let messages ← expectOk (Message.decodeAll (frameData (← emittedRef.get)))
+      "decode pure-authorized response"
+    expect (messages.size == 1 && messages[0]!.data == ByteArray.mk #[1, 23])
+      "pure-authorized capability did not carry resolved state into dispatch"
+  finally
+    discard <| Std.Async.Async.block <|
+      Http2.Connection.cancelActiveSharedOwned stateMutex
 
 def testMissingAndWrongRejectAtHeaders : IO Unit := do
   for presented in [none, some "TestScheme wrong"] do
@@ -613,6 +791,10 @@ def testStandaloneDispatchStillValidatesAndDerivesDeadline : IO Unit := do
 end Test.EarlyAuthentication
 
 def main : IO Unit := do
+  Test.EarlyAuthentication.testPureAuthorizerDeadlineBracketsAndDefaultFastPath
+  Test.EarlyAuthentication.testAuthorizerInstallersAreLastWins
+  Test.EarlyAuthentication.testPureAuthorizerRejectsBeforeBody
+  Test.EarlyAuthentication.testPureAuthorizerRunsInlineAndCarriesCapability
   Test.EarlyAuthentication.testMissingAndWrongRejectAtHeaders
   Test.EarlyAuthentication.testRejectResultIsEarlyStatus
   Test.EarlyAuthentication.testAuthorizerResourceFailureIsEarlyStatus

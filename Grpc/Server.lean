@@ -165,6 +165,12 @@ def AuthorizationResult.acceptRegistered (entry : MethodEntry) :
     AuthorizationResult entry :=
   .accept entry.handler
 
+/-- A bounded, non-blocking request-header authorizer.  Its accepted handler
+remains indexed by the looked-up entry's exact RPC shape, just like the
+effectful authorizer below. -/
+abbrev PureRequestHeaderAuthorizer :=
+  (entry : MethodEntry) -> Metadata -> AuthorizationResult entry
+
 /--
 Request-header authorization runs after gRPC method/header validation and
 method lookup, and before request DATA is accumulated or framed.  It may
@@ -183,6 +189,7 @@ structure DuplicateMethod where
 structure Registry where
   maxReceiveMessageSize : Option Nat := none
   maxSendMessageSize : Option Nat := none
+  private pureRequestHeaderAuthorizer : Option PureRequestHeaderAuthorizer := none
   private requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
     pure (.accept entry.handler)
   entries : Array MethodEntry := #[]
@@ -205,15 +212,34 @@ def withRequestHeaderAuthorizer (registry : Registry)
     (authorizer : RequestHeaderAuthorizer) : Registry :=
   {
     registry with
+    pureRequestHeaderAuthorizer := none,
     requestHeaderAuthorizer := authorizer,
     customRequestHeaderAuthorizer := true
   }
 
+/-- Install a bounded pure callback that authorizes complete request headers.
+Pure callbacks run inline and must not block or perform hidden effects. -/
+def withPureRequestHeaderAuthorizer (registry : Registry)
+    (authorizer : PureRequestHeaderAuthorizer) : Registry :=
+  {
+    registry with
+    pureRequestHeaderAuthorizer := some authorizer,
+    requestHeaderAuthorizer := fun entry metadata => pure (authorizer entry metadata),
+    customRequestHeaderAuthorizer := false
+  }
+
 /-- Whether header authorization contains user IO that must share the call's
 deadline.  The backing fields are private so installing a callback cannot
-silently bypass this invariant; use `withRequestHeaderAuthorizer`. -/
+silently bypass this invariant; use `withRequestHeaderAuthorizer` or
+`withPureRequestHeaderAuthorizer`. -/
 def usesCustomRequestHeaderAuthorizer (registry : Registry) : Bool :=
   registry.customRequestHeaderAuthorizer
+
+/-- The installed bounded pure authorizer, when authorization can run inline
+without entering the effectful task/cancellation lifecycle. -/
+def pureRequestHeaderAuthorizer? (registry : Registry) :
+    Option PureRequestHeaderAuthorizer :=
+  registry.pureRequestHeaderAuthorizer
 
 /-- Run the installed request-header authorizer for a looked-up entry. -/
 def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)

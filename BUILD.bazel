@@ -641,6 +641,13 @@ lean_binary(
     deps = [":grpc_lean"],
 )
 
+lean_binary(
+    name = "authorization_benchmark",
+    srcs = ["Benchmark/AuthorizationBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
 lean_test(
     name = "endpoint_test",
     srcs = ["Test/EndpointTest.lean"],
