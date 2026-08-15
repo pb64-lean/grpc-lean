@@ -1957,10 +1957,12 @@ private def feedRequestStream (feed : RequestStreamFeed) : IO (Except Status Uni
 /-- Wait for the dispatch to be registered in connection state before running the
 handler. Resolved immediately after the spawn site's registration, so the wait is
 momentary; a promise (instead of a poll loop) avoids adding latency to every RPC. -/
-private def waitUntilDispatchRegistered (registered : IO.Promise Unit) : Std.Async.Async Unit := do
-  match ← Std.Async.Async.ofTask registered.result? with
-  | some () => pure ()
-  | none => throw (IO.userError "dispatch registration gate was dropped")
+private def waitUntilDispatchRegistered
+    (registered : IO.Promise Unit) : Std.Async.Async Unit :=
+  Std.Async.Async.ofAsyncTask <|
+    registered.result?.map (sync := true) fun
+      | some () => .ok ()
+      | none => .error (IO.userError "dispatch registration gate was dropped")
 
 namespace TestSupport
 
