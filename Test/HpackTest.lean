@@ -45,6 +45,35 @@ def expectHuffmanError (input : ByteArray) (message : String) : IO Unit := do
   | .error status =>
       expectEq status.messageD message s!"unexpected Huffman error for {repr input.data}"
 
+def expectStringDecodersEq (input : ByteArray) (offset : Nat) : IO Unit := do
+  let reference := Http2.Hpack.decodeStringReference input offset
+  let lookup := Http2.Hpack.decodeStringLookup input offset
+  let publicResult := Http2.Hpack.decodeString input offset
+  let failDifferent (which : String) : IO Unit :=
+    throw (IO.userError
+      s!"{which} HPACK string decoder differed at offset {offset} for {repr input.data}")
+  match reference, lookup with
+  | .ok expected, .ok actual =>
+      if actual != expected then failDifferent "bounded"
+  | .error expected, .error actual =>
+      if actual != expected then failDifferent "bounded"
+  | _, _ => failDifferent "bounded"
+  match lookup, publicResult with
+  | .ok expected, .ok actual =>
+      if actual != expected then failDifferent "public"
+  | .error expected, .error actual =>
+      if actual != expected then failDifferent "public"
+  | _, _ => failDifferent "public"
+
+def expectStringError (input : ByteArray) (offset : Nat) (message : String) : IO Unit := do
+  expectStringDecodersEq input offset
+  match Http2.Hpack.decodeStringLookup input offset with
+  | .ok value =>
+      throw (IO.userError s!"expected HPACK string error '{message}', decoded {repr value}")
+  | .error status =>
+      expectEq status.messageD message
+        s!"unexpected HPACK string error at offset {offset} for {repr input.data}"
+
 def testHuffmanKnownVector : IO Unit := do
   let expected := bytes [0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
   let encoded ← expectStatusOk (Http2.Hpack.encodeString "www.example.com")
@@ -128,6 +157,56 @@ def testHuffmanMalformedInputs : IO Unit := do
   for input in [bytes [0x18], bytes [0xff], bytes [0x1f, 0xff],
       bytes [0xff, 0xff, 0xff, 0xfc]] do
     expectHuffmanDecodersEq input
+
+def testStringDecoderDifferential : IO Unit := do
+  let leading := bytes [0xde, 0xad, 0xbe]
+  let trailing := bytes [0xfa, 0xce]
+  for sample in ["www.example.com", "raw \\ value", "", "application/grpc"] do
+    let encoded ← expectStatusOk (Http2.Hpack.encodeString sample)
+    let input := (leading.append encoded).append trailing
+    expectStringDecodersEq input leading.size
+    let decoded ← expectStatusOk (Http2.Hpack.decodeStringLookup input leading.size)
+    expectEq decoded.value sample s!"string decoder should recover {repr sample}"
+    expectEq decoded.next (leading.size + encoded.size)
+      "string decoder should stop before residual bytes"
+
+  -- Exercise a multi-octet raw length independently of encodeString's choice.
+  let longRaw := String.ofList (List.replicate 130 'z')
+  let rawPrefix ← expectStatusOk (Http2.Hpack.encodeInteger 7 0 longRaw.toUTF8.size)
+  let rawEncoded := rawPrefix.append longRaw.toUTF8
+  let rawInput := (leading.append rawEncoded).append trailing
+  expectStringDecodersEq rawInput leading.size
+  let rawDecoded ← expectStatusOk (Http2.Hpack.decodeStringLookup rawInput leading.size)
+  expectEq rawDecoded.value longRaw "multi-octet raw string length should decode"
+  expectEq rawDecoded.next (leading.size + rawEncoded.size)
+    "multi-octet raw decoder should preserve the absolute cursor"
+
+  -- Force the Huffman representation rather than relying on the size heuristic.
+  let huffmanValue := "www.example.com"
+  let huffmanPayload := Http2.Hpack.encodeHuffman huffmanValue.toUTF8
+  let huffmanPrefix ← expectStatusOk
+    (Http2.Hpack.encodeInteger 7 128 huffmanPayload.size)
+  let huffmanEncoded := huffmanPrefix.append huffmanPayload
+  let huffmanInput := (leading.append huffmanEncoded).append trailing
+  expectStringDecodersEq huffmanInput leading.size
+  let huffmanDecoded ← expectStatusOk
+    (Http2.Hpack.decodeStringLookup huffmanInput leading.size)
+  expectEq huffmanDecoded.value huffmanValue "explicit Huffman string should decode"
+  expectEq huffmanDecoded.next (leading.size + huffmanEncoded.size)
+    "Huffman decoder should preserve the absolute cursor"
+
+  let malformed : List (ByteArray × Nat × String) := [
+    (ByteArray.empty, 0, "missing HPACK string"),
+    (bytes [0xaa], 1, "missing HPACK string"),
+    (bytes [0xff], 0, "truncated HPACK integer"),
+    (bytes [0x02, 0x61], 0, "truncated HPACK string"),
+    (bytes [0x82, 0x1f], 0, "truncated HPACK string"),
+    (bytes [0x01, 0xff], 0, "HPACK string is not valid UTF-8"),
+    (bytes [0x81, 0x18], 0, "invalid HPACK Huffman padding"),
+    (bytes [0x84, 0xff, 0xff, 0xff, 0xfc], 0, "HPACK Huffman EOS appeared in data")
+  ]
+  for (input, offset, message) in malformed do
+    expectStringError input offset message
 
 def testHuffmanShorterFormChosen : IO Unit := do
   -- "www.example.com" Huffman form is 12 bytes vs 15 raw, so the H bit must be set
@@ -279,6 +358,7 @@ def main : IO Unit := do
   testHuffmanLookupTable
   testHuffmanDecoderDifferential
   testHuffmanMalformedInputs
+  testStringDecoderDifferential
   testHuffmanShorterFormChosen
   testDynamicTableRoundTrip
   testEncoderDecoderTablesStayInSync

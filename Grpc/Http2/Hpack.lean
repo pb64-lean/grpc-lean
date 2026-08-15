@@ -338,6 +338,30 @@ def encodeString (value : String) : Except Status ByteArray :=
     | .error status => .error status
     | .ok prefixBytes => .ok (prefixBytes.append bytes)
 
+/-! Keep the proof-facing and executable string decoders separately callable so
+tests can compare the complete length/UTF-8 wrapper as well as the Huffman
+kernel. -/
+
+def decodeStringReference (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
+  if offset >= bytes.size then
+    .error (Status.internal "missing HPACK string")
+  else
+    match decodeInteger 7 bytes offset with
+    | .error status => .error status
+    | .ok length =>
+        if length.next + length.value > bytes.size then
+          .error (Status.internal "truncated HPACK string")
+        else
+          match (if bytes[offset]!.toNat >= 128 then
+              decodeHuffmanReference (bytes.extract length.next (length.next + length.value))
+            else
+              .ok (bytes.extract length.next (length.next + length.value))) with
+          | .error status => .error status
+          | .ok raw =>
+              match String.fromUTF8? raw with
+              | some decoded => .ok { value := decoded, next := length.next + length.value }
+              | none => .error (Status.internal "HPACK string is not valid UTF-8")
+
 def decodeStringLookup (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
   if offset >= bytes.size then
     .error (Status.internal "missing HPACK string")
@@ -360,24 +384,7 @@ def decodeStringLookup (bytes : ByteArray) (offset : Nat) : Except Status String
 
 @[implemented_by decodeStringLookup]
 def decodeString (bytes : ByteArray) (offset : Nat) : Except Status StringResult :=
-  if offset >= bytes.size then
-    .error (Status.internal "missing HPACK string")
-  else
-    match decodeInteger 7 bytes offset with
-    | .error status => .error status
-    | .ok length =>
-        if length.next + length.value > bytes.size then
-          .error (Status.internal "truncated HPACK string")
-        else
-          match (if bytes[offset]!.toNat >= 128 then
-              decodeHuffman (bytes.extract length.next (length.next + length.value))
-            else
-              .ok (bytes.extract length.next (length.next + length.value))) with
-          | .error status => .error status
-          | .ok raw =>
-              match String.fromUTF8? raw with
-              | some decoded => .ok { value := decoded, next := length.next + length.value }
-              | none => .error (Status.internal "HPACK string is not valid UTF-8")
+  decodeStringReference bytes offset
 
 def staticEntries : Array Header :=
   #[
@@ -555,7 +562,7 @@ structure DecodeResult where
 private def decodeLiteralName (state : State) (index : Nat) (block : ByteArray) (offset : Nat) :
     Except Status (String × Nat) := do
   if index == 0 then
-    let name ← decodeStringLookup block offset
+    let name ← decodeString block offset
     if Header.normalizeName name.value != name.value then
       throw (Status.internal s!"HTTP/2 header field name must be lowercase: {name.value}")
     else
@@ -569,7 +576,7 @@ private def decodeLiteral (state : State) (block : ByteArray) (offset prefixBits
     (incremental : Bool) : Except Status (Header × State × Nat) := do
   let index ← decodeInteger prefixBits block offset
   let (name, next) ← decodeLiteralName state index.value block index.next
-  let value ← decodeStringLookup block next
+  let value ← decodeString block next
   let header : Header := { name := name, value := value.value }
   let state := if incremental then insert state header else state
   pure (header, state, value.next)
@@ -1814,7 +1821,8 @@ private theorem encodeInteger_huffman_head {value : Nat} {encoded : ByteArray}
 private theorem decodeString_prefixed {value : String} {payload prefixBytes : ByteArray}
     {mask : Nat} (hmask : mask % 2 ^ 7 = 0) (hfits : mask + 2 ^ 7 ≤ 256)
     (hint : encodeInteger 7 mask payload.size = .ok prefixBytes) (rest : ByteArray)
-    (hbranch : (if (prefixBytes ++ payload ++ rest)[0]!.toNat ≥ 128 then decodeHuffman payload
+    (hbranch : (if (prefixBytes ++ payload ++ rest)[0]!.toNat ≥ 128 then
+        decodeHuffmanReference payload
         else .ok payload) = .ok value.toUTF8) :
     decodeString (prefixBytes ++ payload ++ rest) 0
       = .ok { value := value, next := (prefixBytes ++ payload).size } := by
@@ -1835,7 +1843,7 @@ private theorem decodeString_prefixed {value : String} {payload prefixBytes : By
         = ByteArray.empty from ByteArray.extract_eq_empty_iff.mpr (by omega)]
     rw [ByteArray.empty_append]
     exact ByteArray.extract_append_eq_left (by omega)
-  unfold decodeString
+  unfold decodeString decodeStringReference
   rw [if_neg (by omega), hdec]
   simp only
   rw [if_neg (by omega), hextract, hbranch]
@@ -1873,7 +1881,8 @@ theorem decodeString_encodeString {value : String} {encoded : ByteArray}
         have h := encodeInteger_huffman_head hint
         rw [getElem!_pos prefixBytes 0 hpre] at h
         omega)]
-      rw [hcand, decodeHuffman_encodeHuffman]
+      rw [hcand]
+      simpa [decodeHuffman] using (decodeHuffman_encodeHuffman value.toUTF8)
   next hraw =>
     split at henc
     next => cases henc

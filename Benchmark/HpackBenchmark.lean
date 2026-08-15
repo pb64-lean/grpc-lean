@@ -27,11 +27,16 @@ private def measureDecoder (decode : ByteArray → Except Status ByteArray)
   let checksum ← decodeRepeated decode encoded iterations
   pure ((← IO.monoNanosNow) - started, checksum)
 
+private def formatHundredths (value : Nat) : String :=
+  let fraction := value % 100
+  let fractionText := if fraction < 10 then s!"0{fraction}" else toString fraction
+  s!"{value / 100}.{fractionText}"
+
 private def printMeasurement (label : String) (elapsed checksum decodedBytes : Nat) : IO Unit := do
   let mibTimes100 :=
     if elapsed = 0 then 0 else decodedBytes * 100 * 1000000000 / elapsed / (1024 * 1024)
   IO.println s!"{label}: elapsed_ns={elapsed} decoded_bytes={decodedBytes} checksum={checksum}"
-  IO.println s!"{label}: throughput_mib_s={mibTimes100 / 100}.{mibTimes100 % 100}"
+  IO.println s!"{label}: throughput_mib_s={formatHundredths mibTimes100}"
 
 private def parseIterations (args : List String) : Nat :=
   match args.head? >>= String.toNat? with
@@ -51,4 +56,4 @@ def main (args : List String) : IO Unit := do
   printMeasurement "reference" referenceElapsed referenceChecksum decodedBytes
   printMeasurement "lookup" lookupElapsed lookupChecksum decodedBytes
   let speedupTimes100 := if lookupElapsed = 0 then 0 else referenceElapsed * 100 / lookupElapsed
-  IO.println s!"speedup_x={speedupTimes100 / 100}.{speedupTimes100 % 100}"
+  IO.println s!"speedup_x={formatHundredths speedupTimes100}"
