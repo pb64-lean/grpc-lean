@@ -679,6 +679,13 @@ lean_binary(
 )
 
 lean_binary(
+    name = "deadline_phase_benchmark",
+    srcs = ["Benchmark/DeadlinePhaseBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
     name = "response_hpack_benchmark",
     srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
     tags = ["manual"],
