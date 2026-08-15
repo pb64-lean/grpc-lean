@@ -111,7 +111,8 @@ def testOneByteShortConnection : IO Unit := do
     "the queued connection-limited DATA suffix must retain END_STREAM"
 
   let update ← expectStatusOk (WindowUpdate.frame 0 1)
-  let flushed ← expectStatusOk (processFrame Registry.empty result.1 update)
+  let processed ← processFrame Registry.empty result.1 update
+  let flushed ← expectStatusOk processed
   expect (flushed.2.size == 1)
     "connection WINDOW_UPDATE should emit the terminal DATA suffix"
   expect (FrameFlag.has flushed.2[0]!.header.flags FrameFlag.endStream)
@@ -137,7 +138,8 @@ def testOneByteShortStream : IO Unit := do
     "the queued stream-limited DATA suffix must retain END_STREAM"
 
   let update ← expectStatusOk (WindowUpdate.frame 1 1)
-  let flushed ← expectStatusOk (processFrame Registry.empty result.1 update)
+  let processed ← processFrame Registry.empty result.1 update
+  let flushed ← expectStatusOk processed
   expect (flushed.2.size == 1)
     "stream WINDOW_UPDATE should emit the terminal DATA suffix"
   expect (FrameFlag.has flushed.2[0]!.header.flags FrameFlag.endStream)
@@ -277,3 +279,6 @@ def main : IO Unit := do
   IO.println "outbound queue exact-fit differential tests passed"
 
 end Grpc.Http2.Connection.OutboundQueueTest
+
+def main : IO Unit :=
+  Grpc.Http2.Connection.OutboundQueueTest.main

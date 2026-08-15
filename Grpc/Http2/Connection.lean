@@ -5134,8 +5134,10 @@ private theorem WellFormed.withPendingOutbound {state : State} (h : WellFormed s
 
 private theorem cleanupOutboundIfEndStream_wellFormed {state : State}
     (h : WellFormed state) (frame : Frame) :
-    WellFormed (cleanupOutboundIfEndStream state frame) :=
-  h.ofFields (cleanupOutboundIfEndStream_same state frame)
+    WellFormed (cleanupOutboundIfEndStream state frame) := by
+  have hs := cleanupOutboundIfEndStream_same state frame
+  exact h.ofFields
+    ⟨hs.1, Nat.le_of_eq hs.2.1, hs.2.2.1, hs.2.2.2.1, hs.2.2.2.2⟩
     (cleanupOutboundIfEndStream_streams state frame)
     (cleanupOutboundIfEndStream_lastClientStreamId state frame)
 
@@ -5151,6 +5153,7 @@ private theorem debitOutboundFrameDirect?_wellFormed {state state' : State}
     split at h
     next => cases h
     next =>
+      simp only at h
       split at h
       next => cases h
       next =>
@@ -6405,8 +6408,7 @@ theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
     rename_i ih
     rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
     clear ih
-    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, withoutEndStream,
-      setOutboundStreamWindow]
+    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, setOutboundStreamWindow]
     try omega
   case case5 =>
     rw [dataPayloadBytes_push]
@@ -6428,13 +6430,19 @@ private theorem debitOutboundFrameDirect?_conserves {state state' : State}
     split at h
     next => cases h
     next =>
+      simp only at h
       split at h
       next => cases h
       next =>
+        have hpayload : frame.payload.size ≤ Nat.min state.outboundConnectionWindow
+            (outboundStreamWindow state frame.header.streamId).toNat := by
+          simp_all only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or]
+          omega
+        have hfit : frame.payload.size ≤ state.outboundConnectionWindow :=
+          Nat.le_trans hpayload (Nat.min_le_left _ _)
         cases h
         rw [cleanupOutboundIfEndStream_outboundConnectionWindow]
         simp_all +zetaDelta [frameDataPayloadBytes, setOutboundStreamWindow]
-        omega
 
 private theorem dataPayloadBytesList_acc (frames : List Frame) (initial : Nat) :
     frames.foldl (fun total frame => total + frameDataPayloadBytes frame) initial
@@ -6443,7 +6451,8 @@ private theorem dataPayloadBytesList_acc (frames : List Frame) (initial : Nat) :
   | nil => simp
   | cons frame frames ih =>
       simp only [List.foldl_cons]
-      rw [ih, ih]
+      rw [ih (initial := initial + frameDataPayloadBytes frame),
+        ih (initial := 0 + frameDataPayloadBytes frame)]
       omega
 
 private theorem debitOutboundFramesDirectList?_conserves :
