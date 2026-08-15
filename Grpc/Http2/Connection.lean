@@ -1468,6 +1468,15 @@ def decodeActiveRequestData (registry : Registry) (active : ActiveRequestStream)
                     (active.receivedBodyBytes + frame.payload.size),
                 messages, FrameFlag.has frame.header.flags FrameFlag.endStream)
 
+@[inline] private def authorizedUnaryDataPayload (streamId : Nat) (frame : Frame) :
+    Except Status ByteArray := do
+  if frame.header.streamId != streamId then
+    throw (Status.internal "HTTP/2 request frames changed stream id")
+  if frame.header.frameType != FrameType.data then
+    throw (Status.internal "expected HTTP/2 DATA frame")
+  let frame ← Transport.normalizeDataFrame frame
+  pure frame.payload
+
 private def authorizedUnaryRequestForStream (state : State) (stream : StreamState) :
     Except Status Transport.UnaryRequestFrames := do
   let entry ← match stream.authorizedEntry? with
@@ -1480,14 +1489,20 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
   let preflight ← match stream.requestPreflight with
     | some preflight => pure preflight
     | none => throw (Status.internal "authorized request preflight was not retained")
-  let body ← (stream.frames.extract 1 stream.frames.size).foldlM
-    (init := ByteArray.empty) fun body frame => do
-      if frame.header.streamId != stream.streamId then
-        throw (Status.internal "HTTP/2 request frames changed stream id")
-      if frame.header.frameType != FrameType.data then
-        throw (Status.internal "expected HTTP/2 DATA frame")
-      let frame ← Transport.normalizeDataFrame frame
-      pure (body.append frame.payload)
+  let body ←
+    if 2 < stream.frames.size then
+      (stream.frames.extract 1 stream.frames.size).foldlM
+        (init := ByteArray.empty) fun body frame => do
+          if frame.header.streamId != stream.streamId then
+            throw (Status.internal "HTTP/2 request frames changed stream id")
+          if frame.header.frameType != FrameType.data then
+            throw (Status.internal "expected HTTP/2 DATA frame")
+          let frame ← Transport.normalizeDataFrame frame
+          pure (body.append frame.payload)
+    else if h : 1 < stream.frames.size then
+      authorizedUnaryDataPayload stream.streamId stream.frames[1]
+    else
+      pure ByteArray.empty
   pure {
     streamId := stream.streamId,
     metadata := metadata,
