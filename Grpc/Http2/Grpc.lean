@@ -239,6 +239,12 @@ private def headerBlockFrames (streamId : Nat) (block : ByteArray) (endStream : 
   else if block.isEmpty then
     pure #[headerBlockFrame streamId FrameType.headers ByteArray.empty
       (headerBlockFlags true true endStream)]
+  else if block.size <= maxSize then
+    -- Keep a reusable complete field-block payload intact.  Besides avoiding a
+    -- full-range extract for ordinary blocks, this lets cached immutable HPACK
+    -- bytes be shared while the stream-specific frame header remains fresh.
+    pure #[headerBlockFrame streamId FrameType.headers block
+      (headerBlockFlags true true endStream)]
   else
     headerBlockFramesLoop streamId maxSize 0 block endStream #[]
 
@@ -280,6 +286,42 @@ private def responseHeadersFor (gzip : Bool) : Metadata :=
   else
     Headers.responseHeaders
 
+/-- Canonical encoder state used only to build immutable common response
+blocks.  A live connection's state is never replaced with this value. -/
+private def commonResponseCacheState : Hpack.State :=
+  { (Hpack.withoutDynamicTable {}) with pendingSizeUpdate := none }
+
+private def encodeCommonResponseBlock (metadata : Metadata) : Except Status ByteArray := do
+  let encoded ← Hpack.encodeHeaderBlock commonResponseCacheState metadata
+  pure encoded.1
+
+/- These closed values are initialized once by Lean's compiled runtime.  Keep
+the failure in `Except` so a future incompatible HPACK change fails normally
+instead of silently substituting an invalid block. -/
+private def cachedIdentityResponseHeaders : Except Status ByteArray :=
+  encodeCommonResponseBlock (responseHeadersFor false)
+
+private def cachedGzipResponseHeaders : Except Status ByteArray :=
+  encodeCommonResponseBlock (responseHeadersFor true)
+
+private def cachedOkResponseTrailers : Except Status ByteArray :=
+  encodeCommonResponseBlock (Headers.trailers Status.ok)
+
+private def encodeResponseHeadersBlock (state : Hpack.State) (gzip : Bool)
+    (metadata : Metadata) : Except Status (ByteArray × Hpack.State) := do
+  if state.canReuseHeaderBlock && metadata.isEmpty then
+    let block ← if gzip then cachedGzipResponseHeaders else cachedIdentityResponseHeaders
+    pure (block, state)
+  else
+    Hpack.encodeHeaderBlock state (Metadata.append (responseHeadersFor gzip) metadata)
+
+private def encodeResponseTrailersBlock (state : Hpack.State) (status : Status)
+    (trailers : Metadata) : Except Status (ByteArray × Hpack.State) := do
+  if state.canReuseHeaderBlock && status == Status.ok && trailers.isEmpty then
+    pure (← cachedOkResponseTrailers, state)
+  else
+    Hpack.encodeHeaderBlock state (Headers.trailers status trailers)
+
 private def appendMessageDataFrames (streamId maxDataFrameSize : Nat)
     (frames : Array Frame) (data : ByteArray) (gzip : Bool := false) :
     Except Status (Array Frame) := do
@@ -298,13 +340,11 @@ def encodeUnaryResponseFrames (state : Hpack.State) (streamId : Nat) (response :
     let frames ← headerBlockFrames streamId block.1 true maxDataFrameSize
     pure (frames, state)
   else
-    let initialMetadata := Metadata.append (responseHeadersFor gzip) response.metadata
-    let initialBlock ← Hpack.encodeHeaderBlock state initialMetadata
+    let initialBlock ← encodeResponseHeadersBlock state gzip response.metadata
     let state := initialBlock.2
     let initial ← headerBlockFrames streamId initialBlock.1 false maxDataFrameSize
 
-    let trailers := Headers.trailers response.status response.trailers
-    let trailerBlock ← Hpack.encodeHeaderBlock state trailers
+    let trailerBlock ← encodeResponseTrailersBlock state response.status response.trailers
     let state := trailerBlock.2
     let trailerFrames ← headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize
 
@@ -328,13 +368,11 @@ def encodeServerStreamingResponseFrames (state : Hpack.State) (streamId : Nat)
     let frames ← headerBlockFrames streamId block.1 true maxDataFrameSize
     pure (frames, state)
   else
-    let initialMetadata := Metadata.append (responseHeadersFor gzip) response.metadata
-    let initialBlock ← Hpack.encodeHeaderBlock state initialMetadata
+    let initialBlock ← encodeResponseHeadersBlock state gzip response.metadata
     let state := initialBlock.2
     let initial ← headerBlockFrames streamId initialBlock.1 false maxDataFrameSize
 
-    let trailers := Headers.trailers response.status response.trailers
-    let trailerBlock ← Hpack.encodeHeaderBlock state trailers
+    let trailerBlock ← encodeResponseTrailersBlock state response.status response.trailers
     let state := trailerBlock.2
     let trailerFrames ← headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize
 
@@ -550,6 +588,20 @@ private def authorizeEntryUntil (registry : Registry) (entry : MethodEntry)
 
 namespace TestSupport
 
+/-- Focused response-block seam used by deterministic equivalence tests and
+the manual cache benchmark.  It deliberately excludes HTTP/2 frame creation
+so the measurement isolates HPACK work. -/
+structure ResponseHeaderBlocks where
+  initial : ByteArray
+  trailers : ByteArray
+  state : Hpack.State
+
+def encodeCommonResponseHeaderBlocks (state : Hpack.State) (gzip : Bool) :
+    Except Status ResponseHeaderBlocks := do
+  let initial ← encodeResponseHeadersBlock state gzip Metadata.empty
+  let trailers ← encodeResponseTrailersBlock initial.2 Status.ok Metadata.empty
+  pure { initial := initial.1, trailers := trailers.1, state := trailers.2 }
+
 /-- Deterministic registry-selection seam. It proves the registered default
 does not touch the pure-callback clock while an explicitly installed pure
 authorizer receives the required bracket checks. -/
@@ -624,7 +676,7 @@ private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
             | .error status => pure (.error status)
             | .ok () => pure (.ok encoded.2)
     | .ok (some firstMessage) =>
-        match Hpack.encodeHeaderBlock state (Metadata.append (responseHeadersFor gzip) response.metadata) with
+        match encodeResponseHeadersBlock state gzip response.metadata with
         | .error status => pure (.error status)
         | .ok initialBlock =>
             let state := initialBlock.2
@@ -646,8 +698,8 @@ private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
                             | .ok streamStatus? =>
                                 let finalStatus := streamStatus?.getD response.status
                                 finishStreamAfterTerminalFrames response.messages streamStatus? <| do
-                                  match Hpack.encodeHeaderBlock state
-                                      (Headers.trailers finalStatus response.trailers) with
+                                  match encodeResponseTrailersBlock state finalStatus
+                                      response.trailers with
                                   | .error status => pure (.error status)
                                   | .ok trailerBlock =>
                                       match headerBlockFrames streamId trailerBlock.1 true
@@ -658,7 +710,7 @@ private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
                                           | .error status => pure (.error status)
                                           | .ok () => pure (.ok trailerBlock.2)
   else
-    match Hpack.encodeHeaderBlock state (Metadata.append (responseHeadersFor gzip) response.metadata) with
+    match encodeResponseHeadersBlock state gzip response.metadata with
     | .error status => pure (.error status)
     | .ok initialBlock =>
         let state := initialBlock.2
@@ -674,8 +726,7 @@ private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
                 | .ok streamStatus? =>
                     let finalStatus := streamStatus?.getD response.status
                     finishStreamAfterTerminalFrames response.messages streamStatus? <| do
-                      match Hpack.encodeHeaderBlock state
-                          (Headers.trailers finalStatus response.trailers) with
+                      match encodeResponseTrailersBlock state finalStatus response.trailers with
                       | .error status => pure (.error status)
                       | .ok trailerBlock =>
                           match headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize with
