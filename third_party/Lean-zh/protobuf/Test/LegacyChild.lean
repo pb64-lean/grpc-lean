@@ -45,15 +45,27 @@ def LegacyChild.fromMessageWithOptions (_options : DecodeOptions) (_depth : Nat)
   let label := (← Message.getString? msg 2).getD ""
   return { id, label }
 
-def LegacyChild.decoderRepWithOptions (options : DecodeOptions) (depth : Nat)
-    (msg : Message) (fieldNumber : Nat) : Except ProtoError (Array LegacyChild) := do
-  let children ← Message.getExpandedMessageWithOptions options (depth + 1) msg fieldNumber
-  children.mapM (LegacyChild.fromMessageWithOptions options (depth + 1))
-
 def LegacyChild.merge (left right : LegacyChild) : LegacyChild :=
   { id := if right.id == 0 then left.id else right.id
   , label := if right.label.isEmpty then left.label else right.label
   , «Unknown.Fields» := right.«Unknown.Fields»
   }
+
+partial def LegacyChild.decoderWithOptions? (options : DecodeOptions) (depth : Nat)
+    (msg : Message) (fieldNumber : Nat) : Except ProtoError (Option LegacyChild) := do
+  let children ← Message.getExpandedMessageWithOptions options (depth + 1) msg fieldNumber
+  let decoded ← children.mapM (LegacyChild.fromMessageWithOptions options (depth + 1))
+  match decoded.toList with
+  | [] => return none
+  | child :: rest => return some (rest.foldl (init := child) LegacyChild.merge)
+
+partial def LegacyChild.decoder? (msg : Message) (fieldNumber : Nat) :
+    Except ProtoError (Option LegacyChild) :=
+  LegacyChild.decoderWithOptions? DecodeOptions.default 0 msg fieldNumber
+
+def LegacyChild.decoderRepWithOptions (options : DecodeOptions) (depth : Nat)
+    (msg : Message) (fieldNumber : Nat) : Except ProtoError (Array LegacyChild) := do
+  let children ← Message.getExpandedMessageWithOptions options (depth + 1) msg fieldNumber
+  children.mapM (LegacyChild.fromMessageWithOptions options (depth + 1))
 
 end ImportedLegacy
