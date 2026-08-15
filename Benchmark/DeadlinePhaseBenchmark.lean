@@ -13,7 +13,9 @@ A separate bounded pass checks exact registration and unregistration counts,
 verifies that no callback fired, and confirms that the no-deadline path never
 consults its supplied runtime.  After the scheduler is shut down, a fixed-wave
 phase measures the production dispatch-registration gate and separately checks
-that no task crosses the gate before its modeled publication point.
+that no task crosses the gate before its modeled publication point.  A managed
+lifecycle phase composes that gate with the production child-retention,
+scheduler-registration, terminal-selection, release, and join primitives.
 -/
 
 private structure RuntimeCounters where
@@ -306,6 +308,240 @@ private def checkDispatchGateValidation (validation : DispatchGateValidation)
       s!"crossed_before_publication={validation.crossedBeforePublication} " ++
       s!"all_tasks_finished={validation.allTasksFinished} checksum={validation.checksum}")
 
+private def managedLifecycleWaveWidth : Nat := 64
+
+private abbrev ManagedLifecycle :=
+  Http2.Connection.TestSupport.ManagedDeadlineLifecycleForBenchmark Nat
+
+private def runManagedLifecycleAsync (scheduler : Http2.Connection.DeadlineScheduler)
+    (deadline iterations : Nat) : Std.Async.Async Nat := do
+  let mut launched := 0
+  let mut checksum := 0
+  while launched < iterations do
+    let waveSize := Nat.min managedLifecycleWaveWidth (iterations - launched)
+    let mut lifecycles : Array ManagedLifecycle := #[]
+    for _ in [0:waveSize] do
+      let lifecycle ←
+        Http2.Connection.TestSupport.spawnManagedDeadlineLifecycleForBenchmark
+          scheduler deadline (pure 1)
+      -- Retain the exact outer task before opening its production gate.
+      lifecycles := lifecycles.push lifecycle
+      lifecycle.publish
+    for lifecycle in lifecycles do
+      match ← Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark
+          lifecycle with
+      | .ok (.ok value) => checksum := checksum + value
+      | .ok (.error status) => throw (IO.userError status.messageD)
+      | .error error => throw error
+    launched := launched + waveSize
+  pure checksum
+
+private def runManagedLifecycle (scheduler : Http2.Connection.DeadlineScheduler)
+    (deadline iterations : Nat) : IO Nat :=
+  Std.Async.Async.block (runManagedLifecycleAsync scheduler deadline iterations)
+
+private def measureManagedLifecycle (sink : IO.Ref Nat)
+    (scheduler : Http2.Connection.DeadlineScheduler) (deadline iterations : Nat) : IO Nat := do
+  let started ← IO.monoNanosNow
+  sink.set (← runManagedLifecycle scheduler deadline iterations)
+  let ended ← IO.monoNanosNow
+  let checksum ← sink.get
+  unless checksum == iterations do
+    throw (IO.userError s!"managed deadline lifecycle checksum mismatch: {checksum}")
+  pure (ended - started)
+
+private def runManagedLifecycleRounds (sink : IO.Ref Nat)
+    (scheduler : Http2.Connection.DeadlineScheduler) (deadline iterations rounds : Nat) :
+    IO (Array Nat) := do
+  let mut samples := #[]
+  for _ in [0:rounds] do
+    samples := samples.push
+      (← measureManagedLifecycle sink scheduler deadline iterations)
+  pure samples
+
+private structure ManagedLifecycleValidation where
+  publications : Nat
+  registrations : Nat
+  terminalSelections : Nat
+  releases : Nat
+  joins : Nat
+  crossedBeforePublication : Nat
+  allTasksFinished : Bool
+  cancellationRaces : Nat
+  checksum : Nat
+
+private partial def waitForManagedRegistrations
+    (scheduler : Http2.Connection.DeadlineScheduler) (handlerEntries : IO.Ref Nat)
+    (expected remainingMilliseconds : Nat) : IO Bool := do
+  let registrations ←
+    Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler
+  if registrations == expected && (← handlerEntries.get) == expected then
+    pure true
+  else if remainingMilliseconds == 0 then
+    pure false
+  else
+    IO.sleep 1
+    waitForManagedRegistrations scheduler handlerEntries expected
+      (remainingMilliseconds - 1)
+
+private abbrev ValidatedManagedLifecycle :=
+  Http2.Connection.TestSupport.ManagedDeadlineLifecycleForBenchmark (Nat × Bool)
+
+private def validateManagedLifecycleSuccess
+    (scheduler : Http2.Connection.DeadlineScheduler) (deadline iterations : Nat) :
+    IO ManagedLifecycleValidation := do
+  let mut launched := 0
+  let mut publications := 0
+  let mut registrations := 0
+  let mut terminalSelections := 0
+  let mut releases := 0
+  let mut joins := 0
+  let mut crossedBeforePublication := 0
+  let mut allTasksFinished := true
+  let mut checksum := 0
+  while launched < iterations do
+    let waveSize := Nat.min managedLifecycleWaveWidth (iterations - launched)
+    let releaseHandlers ← IO.Promise.new
+    let handlerEntries ← IO.mkRef 0
+    let mut lifecycles : Array ValidatedManagedLifecycle := #[]
+    for _ in [0:waveSize] do
+      let published ← IO.Promise.new
+      let action : GrpcM (Nat × Bool) := do
+        handlerEntries.modify (fun count => count + 1)
+        let crossed := !(← published.isResolved)
+        match ← IO.wait releaseHandlers.result? with
+        | some () => pure (1, crossed)
+        | none => throw (Status.internal "managed lifecycle validation gate was dropped")
+      let lifecycle ←
+        Http2.Connection.TestSupport.spawnManagedDeadlineLifecycleForBenchmark
+          scheduler deadline action
+      lifecycles := lifecycles.push lifecycle
+      published.resolve ()
+      publications := publications + 1
+      lifecycle.publish
+    unless ← waitForManagedRegistrations scheduler handlerEntries waveSize 2000 do
+      releaseHandlers.resolve ()
+      for lifecycle in lifecycles do
+        Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark lifecycle
+      for lifecycle in lifecycles do
+        discard <| Std.Async.Async.block <|
+          Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark lifecycle
+      throw (IO.userError "managed lifecycle registrations did not become observable")
+    let activeRegistrations ←
+      Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler
+    registrations := registrations + activeRegistrations
+    for lifecycle in lifecycles do
+      unless ← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark
+          lifecycle do
+        releaseHandlers.resolve ()
+        throw (IO.userError "managed lifecycle lost its registered child")
+    releaseHandlers.resolve ()
+    for lifecycle in lifecycles do
+      match ← Std.Async.Async.block <|
+          Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark lifecycle with
+      | .ok (.ok (value, crossed)) =>
+          checksum := checksum + value
+          terminalSelections := terminalSelections + 1
+          joins := joins + 1
+          if crossed then
+            crossedBeforePublication := crossedBeforePublication + 1
+      | .ok (.error status) => throw (IO.userError status.messageD)
+      | .error error => throw error
+      if ← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark lifecycle then
+        throw (IO.userError "managed lifecycle retained a completed child")
+      releases := releases + 1
+      unless ← IO.hasFinished lifecycle.task do
+        allTasksFinished := false
+    let residual ←
+      Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler
+    unless residual == 0 do
+      throw (IO.userError s!"managed lifecycle retained {residual} scheduler registrations")
+    launched := launched + waveSize
+  pure {
+    publications := publications,
+    registrations := registrations,
+    terminalSelections := terminalSelections,
+    releases := releases,
+    joins := joins,
+    crossedBeforePublication := crossedBeforePublication,
+    allTasksFinished := allTasksFinished,
+    cancellationRaces := 0,
+    checksum := checksum
+  }
+
+private def validateManagedLifecycleCancellationRaces
+    (scheduler : Http2.Connection.DeadlineScheduler) (deadline : Nat) : IO Nat := do
+  -- Cancellation before publication must retire the gated outer task without
+  -- starting a handler or publishing a scheduler registration.
+  let unpublishedStarted ← IO.mkRef false
+  let unpublished ←
+    Http2.Connection.TestSupport.spawnManagedDeadlineLifecycleForBenchmark
+      scheduler deadline (do unpublishedStarted.set true; pure 1)
+  Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark unpublished
+  unpublished.publish
+  discard <| Std.Async.Async.block <|
+    Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark unpublished
+  let unpublishedRegistrations ←
+    Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler
+  unless !(← unpublishedStarted.get) && unpublishedRegistrations == 0 &&
+      !(← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark unpublished) &&
+      (← IO.hasFinished unpublished.task) do
+    throw (IO.userError "managed lifecycle pre-publication cancellation race failed")
+
+  -- Cancellation after registration must take and join the exact child and
+  -- erase its scheduler entry even if the handler is still blocked.
+  let releaseHandler ← IO.Promise.new
+  let handlerEntries ← IO.mkRef 0
+  let registered ←
+    Http2.Connection.TestSupport.spawnManagedDeadlineLifecycleForBenchmark
+      scheduler deadline (do
+        handlerEntries.modify (fun count => count + 1)
+        match ← IO.wait releaseHandler.result? with
+        | some () => pure 1
+        | none => throw (Status.internal "managed cancellation gate was dropped"))
+  registered.publish
+  unless ← waitForManagedRegistrations scheduler handlerEntries 1 2000 do
+    releaseHandler.resolve ()
+    Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark registered
+    discard <| Std.Async.Async.block <|
+      Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark registered
+    throw (IO.userError "managed cancellation race did not register its child")
+  Http2.Connection.TestSupport.cancelManagedDeadlineLifecycleForBenchmark registered
+  releaseHandler.resolve ()
+  discard <| Std.Async.Async.block <|
+    Http2.Connection.TestSupport.joinManagedDeadlineLifecycleForBenchmark registered
+  let registeredResidual ←
+    Http2.Connection.TestSupport.deadlineSchedulerRegistrationCountForBenchmark scheduler
+  unless registeredResidual == 0 &&
+      !(← Http2.Connection.TestSupport.managedDeadlineChildOwnedForBenchmark registered) &&
+      (← IO.hasFinished registered.task) do
+    throw (IO.userError "managed lifecycle registered-child cancellation race failed")
+  pure 2
+
+private def validateManagedLifecycle
+    (scheduler : Http2.Connection.DeadlineScheduler) (deadline iterations : Nat) :
+    IO ManagedLifecycleValidation := do
+  let validation ← validateManagedLifecycleSuccess scheduler deadline iterations
+  let cancellationRaces ←
+    validateManagedLifecycleCancellationRaces scheduler deadline
+  pure { validation with cancellationRaces := cancellationRaces }
+
+private def checkManagedLifecycleValidation
+    (validation : ManagedLifecycleValidation) (expected : Nat) : IO Unit := do
+  unless validation.publications == expected &&
+      validation.registrations == expected &&
+      validation.terminalSelections == expected &&
+      validation.releases == expected && validation.joins == expected &&
+      validation.crossedBeforePublication == 0 && validation.allTasksFinished &&
+      validation.cancellationRaces == 2 && validation.checksum == expected do
+    throw (IO.userError <| s!"managed deadline lifecycle validation failed: " ++
+      s!"publications={validation.publications} registrations={validation.registrations} " ++
+      s!"terminal_selections={validation.terminalSelections} " ++
+      s!"releases={validation.releases} joins={validation.joins} " ++
+      s!"crossed_before_publication={validation.crossedBeforePublication} " ++
+      s!"all_tasks_finished={validation.allTasksFinished} " ++
+      s!"cancellation_races={validation.cancellationRaces} checksum={validation.checksum}")
+
 private def parseNat (value? : Option String) (fallback : Nat) : Nat :=
   Nat.max 1 ((value? >>= String.toNat?).getD fallback)
 
@@ -318,6 +554,7 @@ def main (args : List String) : IO Unit := do
   let timedNoOpCounters ← RuntimeCounters.new
   let timedSchedulerCounters ← RuntimeCounters.new
   let scheduler ← Http2.Connection.DeadlineScheduler.new
+  let lifecycleValidationScheduler ← Http2.Connection.DeadlineScheduler.new
   let timedSchedulerRuntime := realSchedulerRuntime scheduler
   let countedNoDeadlineRuntime := countedNoOpRuntime noDeadlineCounters
   let countedTimedNoOpRuntime := countedNoOpRuntime timedNoOpCounters
@@ -326,19 +563,25 @@ def main (args : List String) : IO Unit := do
   let deadline := (← IO.monoNanosNow) + 24 * 60 * 60 * 1000000000
   let validationIterations := Nat.min iterations 1000
 
-  let result : Except IO.Error Samples ←
+  let result : Except IO.Error
+      (Samples × Array Nat × ManagedLifecycleValidation) ←
     try
       let warmupNoDeadline ← runRepeated none noOpRuntime warmupIterations
       let warmupTimedNoOp ← runRepeated
         (some deadline) noOpRuntime warmupIterations
       let warmupTimedScheduler ← runRepeated
         (some deadline) timedSchedulerRuntime warmupIterations
+      let warmupManagedLifecycle ←
+        runManagedLifecycle scheduler deadline warmupIterations
       unless warmupNoDeadline == warmupIterations &&
           warmupTimedNoOp == warmupIterations &&
-          warmupTimedScheduler == warmupIterations do
+          warmupTimedScheduler == warmupIterations &&
+          warmupManagedLifecycle == warmupIterations do
         throw (IO.userError "deadline phase benchmark warmup checksum mismatch")
       let samples ← runRounds sink deadline noOpRuntime noOpRuntime
         timedSchedulerRuntime iterations rounds
+      let managedLifecycleSamples ←
+        runManagedLifecycleRounds sink scheduler deadline iterations rounds
       let validationNoDeadline ← runRepeated none countedNoDeadlineRuntime
         validationIterations
       let validationTimedNoOp ← runRepeated (some deadline) countedTimedNoOpRuntime
@@ -349,12 +592,16 @@ def main (args : List String) : IO Unit := do
           validationTimedNoOp == validationIterations &&
           validationTimedScheduler == validationIterations do
         throw (IO.userError "deadline phase benchmark validation checksum mismatch")
-      pure (Except.ok samples)
+      let managedLifecycleValidation ← validateManagedLifecycle
+        lifecycleValidationScheduler deadline validationIterations
+      checkManagedLifecycleValidation managedLifecycleValidation validationIterations
+      pure (Except.ok (samples, managedLifecycleSamples, managedLifecycleValidation))
     catch error =>
       pure (Except.error error)
+  discard <| Std.Async.Async.block lifecycleValidationScheduler.shutdown
   discard <| Std.Async.Async.block scheduler.shutdown
-  let samples ← match result with
-    | Except.ok samples => pure samples
+  let (samples, managedLifecycleSamples, managedLifecycleValidation) ← match result with
+    | Except.ok result => pure result
     | Except.error error => throw error
 
   -- Keep the deadline scheduler stopped throughout this phase so it measures
@@ -391,6 +638,19 @@ def main (args : List String) : IO Unit := do
   printDelta "timed_real_scheduler_total_incremental" timedSchedulerMedian noDeadlineMedian
     iterations
   IO.println "deadline_phase_counter_checks=pass benchmark_kind=informative thresholds=none"
+  printPhase "managed_deadline_lifecycle" managedLifecycleSamples iterations
+  IO.println s!"managed_deadline_lifecycle_wave_width={managedLifecycleWaveWidth}"
+  IO.println <| s!"managed_deadline_lifecycle_validation " ++
+    s!"publications={managedLifecycleValidation.publications} " ++
+    s!"registrations={managedLifecycleValidation.registrations} " ++
+    s!"terminal_selections={managedLifecycleValidation.terminalSelections} " ++
+    s!"releases={managedLifecycleValidation.releases} " ++
+    s!"joins={managedLifecycleValidation.joins} " ++
+    s!"crossed_before_publication={managedLifecycleValidation.crossedBeforePublication} " ++
+    s!"all_tasks_finished={managedLifecycleValidation.allTasksFinished} " ++
+    s!"cancellation_races={managedLifecycleValidation.cancellationRaces} " ++
+    s!"checksum={managedLifecycleValidation.checksum}"
+  IO.println "managed_deadline_lifecycle_checks=pass benchmark_kind=informative thresholds=none"
   printPhase "dispatch_registration_gate" gateSamples iterations
   IO.println s!"dispatch_registration_gate_wave_width={dispatchRegistrationGateWaveWidth}"
   IO.println <| s!"dispatch_registration_gate_validation publications={gateValidation.publications} " ++

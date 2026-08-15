@@ -1988,6 +1988,80 @@ def waitUntilDispatchRegisteredForBenchmark
     (registered : IO.Promise Unit) : Std.Async.Async Unit :=
   waitUntilDispatchRegistered registered
 
+/-- Exact production primitives owned by one managed deadline benchmark call.
+The benchmark retains `task` before invoking `publish`, matching the dispatch
+spawn/publication/gate order without constructing HTTP/2 frames. -/
+structure ManagedDeadlineLifecycleForBenchmark (α : Type) where
+  task : Task (Except IO.Error (Except Status α))
+  publish : IO Unit
+  private cancelled : IO.Ref Bool
+  private childRef : IO.Ref (Option DeadlineChild)
+
+/-- Spawn one production-shaped managed deadline owner.  The task uses the
+same registration gate, child publication, scheduler registration, terminal
+selection, release, and child join as a managed dispatch. -/
+def spawnManagedDeadlineLifecycleForBenchmark
+    (scheduler : DeadlineScheduler) (deadline : Nat) (action : GrpcM α) :
+    IO (ManagedDeadlineLifecycleForBenchmark α) := do
+  let registered ← IO.Promise.new
+  let cancelled ← IO.mkRef false
+  let childRef ← IO.mkRef (none : Option DeadlineChild)
+  let runtime : DeadlineRuntime := {
+    externalTimer := true,
+    registerTask := fun childDeadline cancel expire join => do
+      let unregister ← registerDeadlineChild childRef (some scheduler)
+        childDeadline cancel expire join
+      if ← cancelled.get then
+        cancelDeadlineChildRef childRef
+      pure unregister
+  }
+  let task ← Std.Async.Async.toIO do
+    waitUntilDispatchRegistered registered
+    if ← cancelled.get then
+      pure (.error (Status.cancelled Status.dispatchCancelledMessage))
+    else
+      let result ← Registry.runWithDeadlineUntilAsync
+        (some deadline) action (some runtime)
+      joinDeadlineChildRef childRef
+      pure result
+  pure {
+    task := task,
+    publish := registered.resolve (),
+    cancelled := cancelled,
+    childRef := childRef
+  }
+
+/-- Signal the exact managed child before its outer owner, as production
+connection cancellation does. -/
+def cancelManagedDeadlineLifecycleForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Unit := do
+  lifecycle.cancelled.set true
+  cancelDeadlineChildRef lifecycle.childRef
+  IO.cancel lifecycle.task
+
+/-- Join both ownership levels.  The second join is normally empty after a
+successful unregister, but owns a child that raced outer-task cancellation. -/
+def joinManagedDeadlineLifecycleForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) :
+    Std.Async.Async (Except IO.Error (Except Status α)) := do
+  let result ← try
+    pure (.ok (← Std.Async.Async.ofAsyncTask lifecycle.task))
+  catch error =>
+    pure (.error error)
+  joinDeadlineChildRef lifecycle.childRef
+  pure result
+
+/-- Whether the managed owner currently retains an exact deadline child. -/
+def managedDeadlineChildOwnedForBenchmark
+    (lifecycle : ManagedDeadlineLifecycleForBenchmark α) : IO Bool := do
+  pure (← lifecycle.childRef.get).isSome
+
+/-- Number of live call registrations, excluding pending request bodies. -/
+def deadlineSchedulerRegistrationCountForBenchmark
+    (scheduler : DeadlineScheduler) : IO Nat :=
+  scheduler.state.atomically do
+    pure <| (← get).registrations.fold (init := 0) fun count _ _ => count + 1
+
 /-- Benchmark seam for the exact unary-body assembly performed when an
 authorized stream detaches for dispatch. -/
 def authorizedUnaryRequestForStreamForBenchmark (state : State) (stream : StreamState) :
