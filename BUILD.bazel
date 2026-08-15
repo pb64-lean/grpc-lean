@@ -686,6 +686,13 @@ lean_binary(
 )
 
 lean_binary(
+    name = "inbound_decode_benchmark",
+    srcs = ["Benchmark/InboundDecodeBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
     name = "response_hpack_benchmark",
     srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
     tags = ["manual"],
