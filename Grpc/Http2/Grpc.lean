@@ -844,7 +844,7 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
   let clientAcceptsGzip := match managedPreflight? with
     | some preflight => preflight.clientAcceptsGzip
     | none => Headers.clientAcceptsGzip request.metadata
-  let gzip := enableGzip && clientAcceptsGzip
+  let gzip := enableGzip && registry.enableResponseCompression && clientAcceptsGzip
   let finish (outboundHpack : Hpack.State) : UnaryDispatchStateResult := {
     inboundHpack := request.hpack,
     outboundHpack := outboundHpack

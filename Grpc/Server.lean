@@ -189,6 +189,9 @@ structure DuplicateMethod where
 structure Registry where
   maxReceiveMessageSize : Option Nat := none
   maxSendMessageSize : Option Nat := none
+  /-- Whether responses may use gzip when the peer advertises it. Request
+  decompression remains available independently. -/
+  enableResponseCompression : Bool := true
   private pureRequestHeaderAuthorizer : Option PureRequestHeaderAuthorizer := none
   private requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
     pure (.accept entry.handler)
@@ -206,6 +209,11 @@ def withMaxReceiveMessageSize (registry : Registry) (size : Nat) : Registry :=
 
 def withMaxSendMessageSize (registry : Registry) (size : Nat) : Registry :=
   { registry with maxSendMessageSize := some size }
+
+/-- Enable or disable negotiated response compression for every registered
+method. Disabling it does not change accepted request encodings. -/
+def withResponseCompression (registry : Registry) (enabled : Bool) : Registry :=
+  { registry with enableResponseCompression := enabled }
 
 /-- Install the callback that authorizes complete request headers. -/
 def withRequestHeaderAuthorizer (registry : Registry)

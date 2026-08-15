@@ -687,6 +687,47 @@ def testManagedDispatchUsesCachedCompressionFacts : IO Unit := do
   expect (restored.data == responsePayload)
     "cached gzip response did not preserve the handler payload"
 
+def testRegistryCanDisableResponseCompression : IO Unit := do
+  let responsePayload := ByteArray.mk (Array.replicate 4096 0x62)
+  let registry := (Registry.empty.registerUnary method fun _ =>
+    pure { data := responsePayload, status := Status.ok })
+    |>.withResponseCompression false
+  let some entry := registry.findEntry? method
+    | fail "registered identity-response entry was not found"
+  let requestBody ← expectOk (Message.encode { data := ByteArray.empty })
+    "encode identity-response request"
+  let preflight : Headers.RequestPreflight := {
+    method := method
+    timeout := none
+    contentLength := none
+    requestUsesGzip := false
+    clientAcceptsGzip := true
+  }
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let dispatchResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 1
+    metadata := metadata none
+    body := requestBody
+    hpack := {}
+    authorizedEntry? := some entry
+    preflight? := some preflight
+  } (fun frames => emittedRef.modify fun emitted => emitted.append frames)
+  discard <| expectOk dispatchResult "dispatch response-compression-disabled request"
+  let emitted ← emittedRef.get
+  let some initialHeaders := emitted.find? fun frame =>
+      frame.header.frameType == .headers
+        && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+    | fail "identity response omitted initial headers"
+  let decodedHeaders ← expectOk (Http2.Hpack.decodeHeaderBlock {} initialHeaders.payload)
+    "decode identity response headers"
+  expect (Metadata.get? decodedHeaders.headers "grpc-encoding" == none)
+    "disabled response compression still selected grpc-encoding"
+  let messages ← expectOk (Message.decodeAll (frameData emitted))
+    "decode identity response body"
+  expect (messages.size == 1 && messages[0]!.compressed == .identity
+      && messages[0]!.data == responsePayload)
+    "disabled response compression changed the response payload"
+
 def testManagedDispatchUsesCachedContentLength : IO Unit := do
   let handlerCalls ← IO.mkRef 0
   let registry := Registry.empty.registerUnary method fun request => do
@@ -807,6 +848,7 @@ def main : IO Unit := do
   Test.EarlyAuthentication.testManagedPreflightRejectionPrecedence
   Test.EarlyAuthentication.testPreflightPreservesMetadataAndEndHeadersDeadline
   Test.EarlyAuthentication.testManagedDispatchUsesCachedCompressionFacts
+  Test.EarlyAuthentication.testRegistryCanDisableResponseCompression
   Test.EarlyAuthentication.testManagedDispatchUsesCachedContentLength
   Test.EarlyAuthentication.testStandaloneDispatchStillValidatesAndDerivesDeadline
   IO.println "gRPC early request authentication tests passed"
