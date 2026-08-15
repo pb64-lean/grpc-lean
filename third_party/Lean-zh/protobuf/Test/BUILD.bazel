@@ -1,4 +1,4 @@
-load("@rules_lean//lean:defs.bzl", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -12,6 +12,21 @@ lean_test(
     srcs = ["Proto3Bazel.lean"],
     strip_module_prefix = "",
     deps = ["//:protobuf"],
+)
+
+lean_test(
+    name = "varint_test",
+    srcs = ["VarintBazel.lean"],
+    strip_module_prefix = "",
+    deps = ["//Protobuf/Encoding"],
+)
+
+lean_binary(
+    name = "varint_benchmark",
+    srcs = ["Bench/Varint.lean"],
+    tags = ["manual"],
+    strip_module_prefix = "",
+    deps = ["//Protobuf/Encoding"],
 )
 
 lean_test(

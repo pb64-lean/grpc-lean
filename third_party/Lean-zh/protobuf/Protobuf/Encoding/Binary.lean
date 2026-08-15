@@ -141,45 +141,41 @@ private def checkRecursionDepthInGet (options : DecodeOptions) (depth : Nat) : G
   | none => pure ()
 
 @[always_inline]
-private partial def get_varint_bytes : Get ((bs : ByteArray) ×' bs.size > 0) := do
-  let rec go (acc : ByteArray) : Get ((bs : ByteArray) ×' bs.size > 0) := do
-    if acc.size ≥ 10 then
-      throw (.userError "protobuf: varint too long")
-    let b ← getThe UInt8
-    let acc := acc.push b
-    if !b.toBitVec.msb then
-      return ⟨acc, by simp [acc, ByteArray.push]; unfold ByteArray.size; simp⟩
-    go acc
-  go (ByteArray.emptyWithCapacity 10)
-
-@[always_inline]
-partial def get_varint : Get Nat := do
-  let ⟨bs, h⟩ ← get_varint_bytes
-  let rec go (acc : Nat) (shift : Nat) (idx : USize) (h : idx.toNat < bs.size) : Nat :=
-    let b := bs.uget idx h
-    let j := idx + 1
-    let acc := acc ||| ((b &&& 0x7F).toNat <<< shift)
-    if h' : j.toNat < bs.size then
-      go acc (shift + 7) j h'
+partial def get_varint : Get Nat := fun d =>
+  let rec go (acc : UInt64) (shift count cursor : Nat) : DecodeResult Nat :=
+    if h : cursor < d.data.size then
+      let b := d.data.get cursor
+      let next := cursor + 1
+      let k := { d with offset := next }
+      if count == 9 then
+        -- A uint64 varint's tenth byte may contain only bit 63. Consume the
+        -- byte before rejecting it, matching the decoder's historical cursor.
+        if b.toBitVec.msb then
+          .error (.userError "protobuf: varint too long") k
+        else if b > 1 then
+          .error (.userError "protobuf: varint overflows uint64") k
+        else
+          .success (acc ||| (UInt64.ofNat b.toNat <<< 63)).toNat k
+      else
+        let acc := acc ||| (UInt64.ofNat (b &&& 0x7F).toNat <<< UInt64.ofNat shift)
+        if b.toBitVec.msb then
+          go acc (shift + 7) (count + 1) next
+        else
+          .success acc.toNat k
     else
-      acc
-  let n := go 0 0 0 h
-  if n < UInt64.size then
-    return n
-  else
-    throw (.userError "protobuf: varint overflows uint64")
+      .error .eoi { d with offset := cursor }
+  go 0 0 0 d.offset
 
 @[always_inline]
-partial def put_varint (n : Nat) : Put := do
-  let rec go (acc : ByteArray) (v : UInt64) : ByteArray :=
+partial def put_varint (n : Nat) : Put := fun out =>
+  let rec go (out : ByteArray) (v : UInt64) : ByteArray :=
     let byte : UInt8 := UInt8.ofNat ((v &&& (0x7F : UInt64)).toNat)
     let v := v >>> 7
     if v = 0 then
-      acc.push byte
+      out.push byte
     else
-      go (acc.push (byte ||| (0x80 : UInt8))) v
-  let bs := go (ByteArray.emptyWithCapacity 10) (UInt64.ofNat n)
-  put_bytes bs
+      go (out.push (byte ||| (0x80 : UInt8))) v
+  ((), go out (UInt64.ofNat n))
 
 open Primitive.LE in
 @[always_inline]
