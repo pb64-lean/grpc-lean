@@ -45,6 +45,24 @@ def headersFrame (authorization? : Option String) (streamId : Nat := 1) : IO Htt
     payload := encoded.1
   }
 
+def headersFrameFor (requestMetadata : Metadata) (streamId : Nat := 1) : IO Http2.Frame := do
+  let encoded ← expectOk (Http2.Hpack.encodeHeaderBlock {} requestMetadata)
+    "encode request headers"
+  pure {
+    header := {
+      length := encoded.1.size
+      frameType := .headers
+      flags := Http2.FrameFlag.endHeaders
+      streamId
+    }
+    payload := encoded.1
+  }
+
+def replaceHeaderValue (source : Metadata) (name value : String) : Metadata :=
+  let normalized := Header.normalizeName name
+  source.map fun header =>
+    if header.name == normalized then { header with value := value } else header
+
 def dataFrame (payload : ByteArray) (streamId : Nat := 1) : Http2.Frame := {
   header := {
     length := payload.size
@@ -70,6 +88,27 @@ def rejectedStatus (frames : Array Http2.Frame) : IO Status := do
     "decode authorization rejection"
   expectOk (Headers.statusFromTrailers decoded.headers)
     "decode authorization rejection status"
+
+def responseHttpStatus (frames : Array Http2.Frame) : IO String := do
+  let some frame := frames.find? fun frame => frame.header.frameType == .headers
+    | fail "request rejection did not emit HTTP headers"
+  let decoded ← expectOk (Http2.Hpack.decodeHeaderBlock {} frame.payload)
+    "decode request rejection headers"
+  match Metadata.get? decoded.headers ":status" with
+  | some status => pure status
+  | none => fail "request rejection omitted :status"
+
+def preflightRejectionFrames (registry : Registry) (requestMetadata : Metadata) :
+    IO (Array Http2.Frame) := do
+  match ← expectOk
+      (Http2.Transport.preflightEarlyRequest registry {} 1 requestMetadata)
+      "preflight request headers" with
+  | .reject frames _ => pure frames
+  | .accept _ _ => fail "invalid request headers passed managed preflight"
+
+def frameData (frames : Array Http2.Frame) : ByteArray :=
+  frames.foldl (init := ByteArray.empty) fun body frame =>
+    if frame.header.frameType == .data then body.append frame.payload else body
 
 def authenticatedRegistry (authorizerCalls handlerCalls : IO.Ref Nat) : Registry :=
   let registry := Registry.empty
@@ -338,6 +377,239 @@ def testAcceptedCapabilityCarriesResolvedStateOnce : IO Unit := do
   expect (messages[0]!.data == ByteArray.mk #[1, 23])
     "authorized dispatch did not receive the state captured at header authorization"
 
+def testManagedPreflightRejectionPrecedence : IO Unit := do
+  let registry := Registry.empty
+
+  let invalidMetadata :=
+    replaceHeaderValue
+      (replaceHeaderValue (metadata none) ":method" "GET")
+      "content-type" "application/json"
+    |>.push { name := "bad header", value := "x" }
+  let invalidMetadataFrames ← preflightRejectionFrames registry invalidMetadata
+  let invalidMetadataStatus ← rejectedStatus invalidMetadataFrames
+  expect (invalidMetadataStatus.code == .invalidArgument)
+    "metadata validation did not win managed preflight precedence"
+  expect (invalidMetadataStatus.message == some "invalid gRPC metadata name bad header")
+    s!"wrong metadata-precedence detail: {invalidMetadataStatus.message}"
+
+  let unsupportedContentType :=
+    replaceHeaderValue
+      (replaceHeaderValue (metadata none) ":method" "GET")
+      "content-type" "application/json"
+  let unsupportedFrames ← preflightRejectionFrames registry unsupportedContentType
+  expect ((← responseHttpStatus unsupportedFrames) == "415")
+    "unsupported content-type did not win over full method validation"
+
+  let invalidMethod :=
+    replaceHeaderValue (metadata none) ":method" "GET"
+    |>.insert "grpc-timeout" "not-a-timeout"
+  let invalidMethodFrames ← preflightRejectionFrames registry invalidMethod
+  let invalidMethodStatus ← rejectedStatus invalidMethodFrames
+  expect (invalidMethodStatus.code == .invalidArgument)
+    "invalid method did not produce INVALID_ARGUMENT"
+  expect (invalidMethodStatus.message == some "gRPC requests must use POST")
+    "grpc-timeout validation displaced the earlier method error"
+
+  let duplicateContentType :=
+    metadata none |>.insert "content-type" "application/json"
+  let duplicateFrames ← preflightRejectionFrames registry duplicateContentType
+  let duplicateStatus ← rejectedStatus duplicateFrames
+  expect (duplicateStatus.code == .invalidArgument)
+    "duplicate content-type did not produce INVALID_ARGUMENT"
+  expect (duplicateStatus.message == some "duplicate content-type header")
+    "a later unsupported content-type displaced the duplicate-header error"
+
+def testPreflightPreservesMetadataAndEndHeadersDeadline : IO Unit := do
+  let capturedMetadata ← IO.mkRef (none : Option Metadata)
+  let registry :=
+    (Registry.empty.registerUnary method fun request =>
+      pure { data := request.data, status := Status.ok })
+    |>.withRequestHeaderAuthorizer fun entry requestMetadata => do
+      capturedMetadata.set (some requestMetadata)
+      pure (AuthorizationResult.acceptRegistered entry)
+  let requestMetadata := metadata none
+    |>.insert "grpc-timeout" "1H"
+    |>.insert "x-order" "first"
+    |>.insert "x-order" "second"
+  let headers ← headersFrameFor requestMetadata
+  let stateMutex ← Std.Mutex.new readyState
+  let anchor ← IO.monoNanosNow
+  let result ← Std.Async.Async.block <|
+    Http2.Connection.processFrameSharedWithOwned registry stateMutex headers
+      (fun _ => pure ()) (some anchor)
+  discard <| expectOk result "process anchored request headers"
+  expect ((← capturedMetadata.get) == some requestMetadata)
+    "request-header authorization did not receive the original metadata unchanged"
+  let state ← stateMutex.atomically get
+  let some stream := state.streams.find? (fun stream => stream.streamId == 1)
+    | fail "accepted open request was not retained"
+  expect (stream.requestMetadata == some requestMetadata)
+    "stream state did not retain the original metadata"
+  let expectedPreflight ← expectOk
+    (Headers.validateUnaryRequestPreflight requestMetadata) "validate expected preflight"
+  expect (stream.requestPreflight == some expectedPreflight)
+    "stream state did not retain the parsed request preflight"
+  expect (stream.endHeadersReceivedAt == some anchor)
+    "stream state lost the END_HEADERS receive time"
+  expect (stream.deadline == some (anchor + 3600000000000))
+    "managed deadline was not anchored exactly once at END_HEADERS"
+
+def testManagedDispatchUsesCachedCompressionFacts : IO Unit := do
+  let handlerCalls ← IO.mkRef 0
+  let requestPayload := ByteArray.mk (Array.replicate 4096 0x61)
+  let responsePayload := ByteArray.mk (Array.replicate 4096 0x62)
+  let registry := Registry.empty.registerUnary method fun request => do
+    handlerCalls.modify (fun calls => calls + 1)
+    if request.data != requestPayload then
+      throw (Status.internal "cached gzip request was not decompressed")
+    pure { data := responsePayload, status := Status.ok }
+  let some entry := registry.findEntry? method
+    | fail "registered unary entry was not found"
+  let requestBody ← expectOk (Message.encode (Message.gzipped requestPayload))
+    "encode cached gzip request"
+  let contradictoryMetadata := metadata none
+    |>.insert "content-length" "not-a-number"
+    |>.insert "grpc-encoding" "deflate"
+    |>.insert "grpc-accept-encoding" "identity"
+  let preflight : Headers.RequestPreflight := {
+    method := method
+    timeout := none
+    contentLength := none
+    requestUsesGzip := true
+    clientAcceptsGzip := true
+  }
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let dispatchResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 1
+    metadata := contradictoryMetadata
+    body := requestBody
+    hpack := {}
+    authorizedEntry? := some entry
+    preflight? := some preflight
+  } (fun frames => emittedRef.modify fun emitted => emitted.append frames)
+  discard <| expectOk dispatchResult "dispatch cached gzip request"
+  expect ((← handlerCalls.get) == 1)
+    "cached gzip request did not invoke its authorized handler exactly once"
+  let emitted ← emittedRef.get
+  let some initialHeaders := emitted.find? fun frame =>
+      frame.header.frameType == .headers
+        && !Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
+    | fail "cached gzip response omitted initial headers"
+  let decodedHeaders ← expectOk (Http2.Hpack.decodeHeaderBlock {} initialHeaders.payload)
+    "decode cached gzip response headers"
+  expect (Metadata.get? decodedHeaders.headers "grpc-encoding" == some "gzip")
+    "cached client gzip acceptance did not select gzip response encoding"
+  let messages ← expectOk (Message.decodeAll (frameData emitted))
+    "decode cached gzip response body"
+  expect (messages.size == 1 && messages[0]!.compressed == .compressed)
+    "cached client gzip acceptance did not compress the response message"
+  let restored ← expectOk
+    (Message.decompress true (responsePayload.size + 16) messages[0]!)
+    "decompress cached gzip response"
+  expect (restored.data == responsePayload)
+    "cached gzip response did not preserve the handler payload"
+
+def testManagedDispatchUsesCachedContentLength : IO Unit := do
+  let handlerCalls ← IO.mkRef 0
+  let registry := Registry.empty.registerUnary method fun request => do
+    handlerCalls.modify (fun calls => calls + 1)
+    pure { data := request.data, status := Status.ok }
+  let some entry := registry.findEntry? method
+    | fail "registered unary entry was not found"
+  let requestBody ← expectOk (Message.encode { data := ByteArray.mk #[1, 2, 3] })
+    "encode cached-length request"
+  let requestMetadata := metadata none |>.insert "content-length" "not-a-number"
+  let preflight : Headers.RequestPreflight := {
+    method := method
+    timeout := none
+    contentLength := some requestBody.size
+    requestUsesGzip := false
+    clientAcceptsGzip := false
+  }
+  let emittedRef ← IO.mkRef (#[] : Array Http2.Frame)
+  let dispatchResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 1
+    metadata := requestMetadata
+    body := requestBody
+    hpack := {}
+    authorizedEntry? := some entry
+    preflight? := some preflight
+  } (fun frames => emittedRef.modify fun emitted => emitted.append frames)
+  discard <| expectOk dispatchResult "dispatch cached-length request"
+  expect ((← handlerCalls.get) == 1)
+    "managed dispatch reparsed invalid content-length metadata"
+
+  let mismatchedPreflight := {
+    preflight with contentLength := some (requestBody.size + 1)
+  }
+  let mismatchFrames ← IO.mkRef (#[] : Array Http2.Frame)
+  let mismatchResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 3
+    metadata := requestMetadata
+    body := requestBody
+    hpack := {}
+    authorizedEntry? := some entry
+    preflight? := some mismatchedPreflight
+  } (fun frames => mismatchFrames.modify fun emitted => emitted.append frames)
+  discard <| expectOk mismatchResult "dispatch cached content-length mismatch"
+  expect ((← handlerCalls.get) == 1)
+    "cached content-length mismatch entered the handler"
+  let mismatchStatus ← rejectedStatus (← mismatchFrames.get)
+  expect (mismatchStatus.code == .invalidArgument)
+    "cached content-length mismatch did not produce INVALID_ARGUMENT"
+  expect (mismatchStatus.message == some
+      s!"content-length {requestBody.size + 1} does not match request body size {requestBody.size}")
+    "cached content-length mismatch changed its rejection detail"
+
+def testStandaloneDispatchStillValidatesAndDerivesDeadline : IO Unit := do
+  let handlerCalls ← IO.mkRef 0
+  let seenDeadline ← IO.mkRef (none : Option (Option Nat))
+  let registry := Registry.empty.registerUnary method fun request => do
+    handlerCalls.modify (fun calls => calls + 1)
+    seenDeadline.set (some request.deadline)
+    pure { data := request.data, status := Status.ok }
+  let some entry := registry.findEntry? method
+    | fail "registered unary entry was not found"
+  let requestBody ← expectOk (Message.encode { data := ByteArray.mk #[4, 5, 6] })
+    "encode standalone request"
+
+  let invalidFrames ← IO.mkRef (#[] : Array Http2.Frame)
+  let invalidResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 1
+    metadata := metadata none |>.insert "content-length" "not-a-number"
+    body := requestBody
+    hpack := {}
+    authorizedEntry? := some entry
+    preflight? := none
+  } (fun frames => invalidFrames.modify fun emitted => emitted.append frames)
+  discard <| expectOk invalidResult "dispatch preflight-absent invalid request"
+  let invalidStatus ← rejectedStatus (← invalidFrames.get)
+  expect (invalidStatus.code == .invalidArgument)
+    "preflight-absent request bypassed ordinary validation"
+  expect (invalidStatus.message == some "invalid content-length header not-a-number")
+    "preflight-absent request changed ordinary validation detail"
+  expect ((← handlerCalls.get) == 0)
+    "preflight-absent invalid request entered the retained handler"
+
+  let before ← IO.monoNanosNow
+  let liveFrames ← IO.mkRef (#[] : Array Http2.Frame)
+  let liveResult ← Http2.Transport.dispatchDecodedUnaryFramesWith registry {} {
+    streamId := 3
+    metadata := metadata none |>.insert "grpc-timeout" "1H"
+    body := requestBody
+    hpack := {}
+  } (fun frames => liveFrames.modify fun emitted => emitted.append frames)
+  discard <| expectOk liveResult "dispatch ordinary timed request"
+  let after ← IO.monoNanosNow
+  expect ((← handlerCalls.get) == 1)
+    "ordinary timed request did not invoke its handler"
+  match ← seenDeadline.get with
+  | some (some deadline) =>
+      expect (before + 3600000000000 <= deadline
+          && deadline <= after + 3600000000000)
+        "standalone dispatch did not derive grpc-timeout at dispatch time"
+  | _ => fail "standalone timed request handler did not receive a deadline"
+
 end Test.EarlyAuthentication
 
 def main : IO Unit := do
@@ -350,4 +622,9 @@ def main : IO Unit := do
   Test.EarlyAuthentication.testSharedServerPathReusesAcceptedCapability
   Test.EarlyAuthentication.testAuthorizationAdvancesHpackBeforeBody
   Test.EarlyAuthentication.testAcceptedCapabilityCarriesResolvedStateOnce
+  Test.EarlyAuthentication.testManagedPreflightRejectionPrecedence
+  Test.EarlyAuthentication.testPreflightPreservesMetadataAndEndHeadersDeadline
+  Test.EarlyAuthentication.testManagedDispatchUsesCachedCompressionFacts
+  Test.EarlyAuthentication.testManagedDispatchUsesCachedContentLength
+  Test.EarlyAuthentication.testStandaloneDispatchStillValidatesAndDerivesDeadline
   IO.println "gRPC early request authentication tests passed"

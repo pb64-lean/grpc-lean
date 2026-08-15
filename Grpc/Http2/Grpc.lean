@@ -25,6 +25,9 @@ structure UnaryRequestFrames where
   transport callers leave this as `none` and Registry dispatch derives it
   from `grpc-timeout` at dispatch time. -/
   deadline : Option Nat := none
+  /-- Parsed header facts retained only by managed connections. Standalone
+  callers leave this as `none` and keep the public validation path. -/
+  preflight? : Option Headers.RequestPreflight := none
 
 structure RequestHeadersFrames where
   streamId : Nat
@@ -413,33 +416,65 @@ private def unsupportedContentType? (metadata : Metadata) : Option String :=
       if Headers.isGrpcContentType value then none else some value
   | none => none
 
-private def registryContainsMethod (registry : Registry) (method : MethodName) : Bool :=
-  (registry.findEntry? method).isSome
-
 inductive EarlyRequestDecision where
   | accept (entry : MethodEntry)
   | reject (frames : Array Frame) (outboundHpack : Hpack.State)
 
-def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.State) (streamId : Nat)
+inductive EarlyRequestPreflightDecision where
+  | accept (entry : MethodEntry) (preflight : Headers.RequestPreflight)
+  | reject (frames : Array Frame) (outboundHpack : Hpack.State)
+
+/-- Parse and validate every managed-request header fact once while preserving
+the historical wire-error precedence: metadata errors, unsupported
+content-type as HTTP 415, then the complete gRPC header/method validation. -/
+def preflightEarlyRequest (registry : Registry) (state : Hpack.State) (streamId : Nat)
     (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :
-    Except Status (Option (Array Frame × Hpack.State)) := do
+    Except Status EarlyRequestPreflightDecision := do
   let encodeGrpcStatus (status : Status) : Except Status (Array Frame × Hpack.State) :=
     encodeUnaryResponseFrames state streamId { status := status, data := ByteArray.empty }
       maxDataFrameSize
   match Metadata.validate metadata with
-  | .error status => some <$> encodeGrpcStatus status
+  | .error status =>
+      let encoded ← encodeGrpcStatus status
+      pure (.reject encoded.1 encoded.2)
   | .ok () =>
-      match unsupportedContentType? metadata with
-      | some _ => some <$> encodeHttpStatusOnlyFrames state streamId "415" maxDataFrameSize
+      let contentTypes := metadata.getAll "content-type"
+      match contentTypes[0]? with
+      | some value =>
+          if !Headers.isGrpcContentType value then
+            let encoded ← encodeHttpStatusOnlyFrames state streamId "415" maxDataFrameSize
+            pure (.reject encoded.1 encoded.2)
+          else
+            match Headers.validateUnaryRequestPreflightAfterMetadata metadata contentTypes with
+            | .error status =>
+                let encoded ← encodeGrpcStatus status
+                pure (.reject encoded.1 encoded.2)
+            | .ok preflight =>
+                match registry.findEntry? preflight.method with
+                | some entry => pure (.accept entry preflight)
+                | none =>
+                    let encoded ← encodeGrpcStatus
+                      (Status.unimplemented s!"unknown gRPC method {preflight.method.path}")
+                    pure (.reject encoded.1 encoded.2)
       | none =>
-          match Headers.validateUnaryRequestHeaders metadata with
-          | .error status => some <$> encodeGrpcStatus status
-          | .ok method =>
-              if registryContainsMethod registry method then
-                pure none
-              else
-                some <$> encodeGrpcStatus
-                  (Status.unimplemented s!"unknown gRPC method {method.path}")
+          match Headers.validateUnaryRequestPreflightAfterMetadata metadata contentTypes with
+          | .error status =>
+              let encoded ← encodeGrpcStatus status
+              pure (.reject encoded.1 encoded.2)
+          | .ok preflight =>
+              match registry.findEntry? preflight.method with
+              | some entry => pure (.accept entry preflight)
+              | none =>
+                  let encoded ← encodeGrpcStatus
+                    (Status.unimplemented s!"unknown gRPC method {preflight.method.path}")
+                  pure (.reject encoded.1 encoded.2)
+
+def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.State) (streamId : Nat)
+    (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :
+    Except Status (Option (Array Frame × Hpack.State)) := do
+  match ← preflightEarlyRequest registry state streamId metadata maxDataFrameSize with
+  | .accept _ _ => pure none
+  | .reject frames outboundHpack => pure (some (frames, outboundHpack))
 
 /-- Deadline-race only user-installed authorization IO.  The default
 registered-handler acceptor stays inline, while a cancelled custom callback is
@@ -484,6 +519,24 @@ private def authorizeEntryUntil (registry : Registry) (entry : MethodEntry)
         release
     pure result
 
+/-- Run only authorization for an entry selected by `preflightEarlyRequest`.
+The original metadata value is passed through unchanged. -/
+def authorizePreflightedEarlyRequest (registry : Registry) (state : Hpack.State)
+    (streamId : Nat) (metadata : Metadata) (entry : MethodEntry)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
+    (deadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
+    IO (Except Status EarlyRequestDecision) := do
+  let rejectWith (status : Status) : Except Status EarlyRequestDecision :=
+    match encodeUnaryResponseFrames state streamId
+        { status := status, data := ByteArray.empty } maxDataFrameSize with
+    | .ok encoded => .ok (.reject encoded.1 encoded.2)
+    | .error encodeStatus => .error encodeStatus
+  let authorizationResult ← authorizeEntryUntil registry entry metadata deadline runtime?
+  match authorizationResult with
+  | .ok (.accept handler) => pure (.ok (.accept { entry with handler := handler }))
+  | .ok (.reject status) => pure (rejectWith status)
+  | .error status => pure (rejectWith status)
+
 /--
 Validate and authorize a complete request header block.  This function is
 called as soon as END_HEADERS arrives, before the connection accepts DATA for
@@ -496,28 +549,12 @@ def authorizeEarlyRequest (registry : Registry) (state : Hpack.State) (streamId 
     (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
     (deadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     IO (Except Status EarlyRequestDecision) := do
-  match encodeEarlyRequestRejectionFrames?
-      registry state streamId metadata maxDataFrameSize with
+  match preflightEarlyRequest registry state streamId metadata maxDataFrameSize with
   | .error status => pure (.error status)
-  | .ok (some encoded) => pure (.ok (.reject encoded.1 encoded.2))
-  | .ok none =>
-    let method ← match Headers.validateUnaryRequestHeaders metadata with
-      | .ok method => pure method
-      | .error status => return .error status
-    let rejectWith (status : Status) : Except Status EarlyRequestDecision :=
-      match encodeUnaryResponseFrames state streamId
-          { status := status, data := ByteArray.empty } maxDataFrameSize with
-      | .ok encoded => .ok (.reject encoded.1 encoded.2)
-      | .error encodeStatus => .error encodeStatus
-    match registry.findEntry? method with
-    | none =>
-        pure (rejectWith (Status.unimplemented s!"unknown gRPC method {method.path}"))
-    | some entry =>
-      let authorizationResult ← authorizeEntryUntil registry entry metadata deadline runtime?
-      match authorizationResult with
-      | .ok (.accept handler) => pure (.ok (.accept { entry with handler := handler }))
-      | .ok (.reject status) => pure (rejectWith status)
-      | .error status => pure (rejectWith status)
+  | .ok (.reject frames outboundHpack) => pure (.ok (.reject frames outboundHpack))
+  | .ok (.accept entry _) =>
+      authorizePreflightedEarlyRequest registry state streamId metadata entry
+        maxDataFrameSize deadline runtime?
 
 private def encodeServerStreamingStreamResponseFramesWithAsyncImpl
     (state : Hpack.State) (streamId : Nat)
@@ -700,7 +737,13 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
     (onResponseStream : MessageStream ByteArray -> IO (MessageStream ByteArray) := pure)
     (enableGzip : Bool := true) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryDispatchStateResult) := do
-  let gzip := enableGzip && Headers.clientAcceptsGzip request.metadata
+  let managedPreflight? := match request.authorizedEntry?, request.preflight? with
+    | some _, some preflight => some preflight
+    | _, _ => none
+  let clientAcceptsGzip := match managedPreflight? with
+    | some preflight => preflight.clientAcceptsGzip
+    | none => Headers.clientAcceptsGzip request.metadata
+  let gzip := enableGzip && clientAcceptsGzip
   let finish (outboundHpack : Hpack.State) : UnaryDispatchStateResult := {
     inboundHpack := request.hpack,
     outboundHpack := outboundHpack
@@ -734,12 +777,14 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
     messages := { recv? := pure none },
     status := status
   }
-  let decompressBody : Except Status ByteArray := do
-    let usesGzip ← Headers.requestUsesGzip request.metadata
+  let decompressBodyWith (usesGzip : Bool) : Except Status ByteArray :=
     Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
+  let decompressBodyFromMetadata : Except Status ByteArray := do
+    let usesGzip ← Headers.requestUsesGzip request.metadata
+    decompressBodyWith usesGzip
   let runEntry (entry : MethodEntry) :
       Std.Async.Async (Except Status UnaryDispatchStateResult) := do
-    match decompressBody with
+    match decompressBodyFromMetadata with
     | .error status => encodeUnary { status := status, data := ByteArray.empty }
     | .ok body =>
       match entry.dispatchHandler with
@@ -771,14 +816,42 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
           | .ok (response, deadline) => encodeStreaming response deadline
           | .error status =>
               encodeStreaming (emptyStreamingResponse status) none
+  let runManagedEntry (entry : MethodEntry) (preflight : Headers.RequestPreflight) :
+      Std.Async.Async (Except Status UnaryDispatchStateResult) := do
+    match decompressBodyWith preflight.requestUsesGzip with
+    | .error status => encodeUnary { status := status, data := ByteArray.empty }
+    | .ok body =>
+      match entry.dispatchHandler with
+      | .unary handler =>
+          match (← registry.dispatchManagedUnaryAsync request.metadata body preflight
+              handler request.deadline runtime?) with
+          | .ok response => encodeUnary response
+          | .error status =>
+              encodeUnary { status := status, data := ByteArray.empty }
+      | .serverStreaming handler =>
+          match (← registry.dispatchManagedServerStreamingStreamAsync
+              request.metadata body preflight handler request.deadline runtime?) with
+          | .ok (response, deadline) => encodeStreaming response deadline
+          | .error status => encodeStreaming (emptyStreamingResponse status) none
+      | .clientStreaming handler =>
+          match (← registry.dispatchManagedClientStreamingAsync request.metadata body
+              preflight handler request.deadline runtime?) with
+          | .ok response => encodeUnary response
+          | .error status =>
+              encodeUnary { status := status, data := ByteArray.empty }
+      | .bidirectionalStreaming handler =>
+          match (← registry.dispatchManagedBidirectionalStreamingStreamAsync
+              request.metadata body preflight handler request.deadline runtime?) with
+          | .ok (response, deadline) => encodeStreaming response deadline
+          | .error status => encodeStreaming (emptyStreamingResponse status) none
   -- A retained entry is a capability produced only after the managed
   -- connection validated and authorized END_HEADERS.  Repeating the complete
   -- validation here reparses grpc-timeout on every timed call and cannot
   -- change the decision.  Standalone decoded requests carry `none` and retain
   -- the original validation and HTTP 415 precedence below.
-  match request.authorizedEntry? with
-  | some entry => runEntry entry
-  | none =>
+  match request.authorizedEntry?, request.preflight? with
+  | some entry, some preflight => runManagedEntry entry preflight
+  | _, _ =>
     match Metadata.validate request.metadata with
     | .error status =>
         encodeUnary { status := status, data := ByteArray.empty }
@@ -792,7 +865,7 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
         | .ok method =>
             match registry.findEntry? method with
             | none =>
-                match decompressBody with
+                match decompressBodyFromMetadata with
                 | .error status =>
                     encodeUnary { status := status, data := ByteArray.empty }
                 | .ok _ =>

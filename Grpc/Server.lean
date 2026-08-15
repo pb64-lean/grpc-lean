@@ -731,18 +731,24 @@ private def withDeadlineUntil (deadline? : Option Nat) (stream : MessageStream �
   }
 
 private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (headerDeadline : Option Nat := none) :
+    (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM UnaryRequest := do
-  let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
-  let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
-  GrpcM.ofExcept (Headers.validateContentLength metadata body.size)
+  let (method, timeout, deadline?) ← match trustedPreflight? with
+    | none => do
+        let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
+        let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
+        GrpcM.ofExcept (Headers.validateContentLength metadata body.size)
+        pure (method, timeout, ← deadlineForTimeout timeout headerDeadline)
+    | some preflight => do
+        GrpcM.ofExcept (Headers.validateContentLengthValue preflight.contentLength body.size)
+        pure (preflight.method, preflight.timeout, headerDeadline)
   let messages : Array Message ← GrpcM.ofExcept (Message.decodeAllWithLimit registry.maxReceiveMessageSize body)
   if messages.size != 1 then
     throw (Status.invalidArgument s!"unary request expected one message, got {messages.size}")
   let message : Message := messages[0]!
   if message.compressed != CompressionFlag.identity then
     throw (Status.unimplemented "compressed requests are not supported")
-  let deadline? ← deadlineForTimeout timeout headerDeadline
   pure {
     method := method,
     metadata := metadata,
@@ -752,16 +758,22 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
   }
 
 private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata)
-    (body : ByteArray) (headerDeadline : Option Nat := none) :
+    (body : ByteArray) (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM ClientStreamingRequest := do
-  let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
-  let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
-  GrpcM.ofExcept (Headers.validateContentLength metadata body.size)
+  let (method, timeout, deadline?) ← match trustedPreflight? with
+    | none => do
+        let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
+        let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
+        GrpcM.ofExcept (Headers.validateContentLength metadata body.size)
+        pure (method, timeout, ← deadlineForTimeout timeout headerDeadline)
+    | some preflight => do
+        GrpcM.ofExcept (Headers.validateContentLengthValue preflight.contentLength body.size)
+        pure (preflight.method, preflight.timeout, headerDeadline)
   let messages : Array Message ← GrpcM.ofExcept (Message.decodeAllWithLimit registry.maxReceiveMessageSize body)
   for message in messages do
     if message.compressed != CompressionFlag.identity then
       throw (Status.unimplemented "compressed requests are not supported")
-  let deadline? ← deadlineForTimeout timeout headerDeadline
   pure {
     method := method,
     metadata := metadata,
@@ -771,11 +783,16 @@ private def decodeClientStreamingRequest (registry : Registry) (metadata : Metad
   }
 
 private def decodeClientStreamingStreamRequest (metadata : Metadata)
-    (messages : MessageStream ByteArray) (headerDeadline : Option Nat := none) :
+    (messages : MessageStream ByteArray) (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (ClientStreamingStreamRequest × Option Nat) := do
-  let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
-  let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
-  let deadline? ← deadlineForTimeout timeout headerDeadline
+  let (method, timeout, deadline?) ← match trustedPreflight? with
+    | none => do
+        let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
+        let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
+        pure (method, timeout, ← deadlineForTimeout timeout headerDeadline)
+    | some preflight =>
+        pure (preflight.method, preflight.timeout, headerDeadline)
   pure ({
     method := method,
     metadata := metadata,
@@ -839,9 +856,10 @@ private def runPreparedDispatch (prepared : PreparedDispatch α)
     | .ok value => pure (.ok value)
 
 private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option UnaryHandler) (headerDeadline : Option Nat) :
+    (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (PreparedDispatch UnaryResponse) := do
-  let request ← decodeUnaryRequest registry metadata body headerDeadline
+  let request ← decodeUnaryRequest registry metadata body headerDeadline trustedPreflight?
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
@@ -857,9 +875,10 @@ private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (bo
 
 private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata : Metadata)
     (body : ByteArray) (handler? : Option ServerStreamingStreamHandler)
-    (headerDeadline : Option Nat) :
+    (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (PreparedDispatch ServerStreamingStreamResponse) := do
-  let request ← decodeUnaryRequest registry metadata body headerDeadline
+  let request ← decodeUnaryRequest registry metadata body headerDeadline trustedPreflight?
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
@@ -878,9 +897,11 @@ private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata
 
 private def prepareClientStreamingDispatch (registry : Registry) (metadata : Metadata)
     (messages : MessageStream ByteArray) (handler? : Option ClientStreamingStreamHandler)
-    (headerDeadline : Option Nat) : GrpcM (PreparedDispatch UnaryResponse) := do
+    (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM (PreparedDispatch UnaryResponse) := do
   let (request, deadline?) ←
-    decodeClientStreamingStreamRequest metadata messages headerDeadline
+    decodeClientStreamingStreamRequest metadata messages headerDeadline trustedPreflight?
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
@@ -899,10 +920,11 @@ private def prepareClientStreamingDispatch (registry : Registry) (metadata : Met
 
 private def prepareBidirectionalStreamingDispatch (registry : Registry) (metadata : Metadata)
     (messages : MessageStream ByteArray) (handler? : Option BidirectionalStreamingStreamHandler)
-    (headerDeadline : Option Nat) :
+    (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (PreparedDispatch ServerStreamingStreamResponse) := do
   let (request, deadline?) ←
-    decodeClientStreamingStreamRequest metadata messages headerDeadline
+    decodeClientStreamingStreamRequest metadata messages headerDeadline trustedPreflight?
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
@@ -936,6 +958,17 @@ def dispatchUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteA
   | .error status => pure (.error status)
   | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
 
+/-- Managed-transport dispatch for a request whose original metadata has
+already produced the supplied preflight and authorized handler capability. -/
+def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
+    (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler
+      (prepareUnaryDispatch registry metadata body (some handler) deadline (some preflight)) with
+  | .error status => pure (.error status)
+  | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
+
 def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
@@ -953,6 +986,20 @@ def dispatchServerStreamingStreamAsync (registry : Registry) (metadata : Metadat
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
   match ← runHandler <|
       prepareServerStreamingStreamDispatch registry metadata body handler? headerDeadline with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      match ← runPreparedDispatchAsync prepared (runtime? := runtime?) with
+      | .error status => pure (.error status)
+      | .ok response => pure (.ok (response, prepared.deadline))
+
+def dispatchManagedServerStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (preflight : Headers.RequestPreflight)
+    (handler : ServerStreamingStreamHandler) (deadline : Option Nat)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler <|
+      prepareServerStreamingStreamDispatch registry metadata body (some handler) deadline
+        (some preflight) with
   | .error status => pure (.error status)
   | .ok prepared =>
       match ← runPreparedDispatchAsync prepared (runtime? := runtime?) with
@@ -986,6 +1033,18 @@ def dispatchClientStreamingMessageStreamAsync (registry : Registry) (metadata : 
   | .ok prepared =>
       runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime?
 
+def dispatchManagedClientStreamingMessageStreamAsync (registry : Registry)
+    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (preflight : Headers.RequestPreflight) (handler : ClientStreamingStreamHandler)
+    (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler <|
+      prepareClientStreamingDispatch registry metadata messages (some handler) deadline
+        (some preflight) with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime?
+
 def dispatchClientStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option ClientStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
@@ -1006,6 +1065,21 @@ def dispatchClientStreamingAsync (registry : Registry) (metadata : Metadata) (bo
       | .ok messages =>
           registry.dispatchClientStreamingMessageStreamAsync
             metadata messages handler? request.deadline runtime?
+
+def dispatchManagedClientStreamingAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray) (preflight : Headers.RequestPreflight)
+    (handler : ClientStreamingStreamHandler) (deadline : Option Nat)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler
+      (decodeClientStreamingRequest registry metadata body deadline (some preflight)) with
+  | .error status => pure (.error status)
+  | .ok request =>
+      match ← runHandler (MessageStream.ofArray request.messages) with
+      | .error status => pure (.error status)
+      | .ok messages =>
+          registry.dispatchManagedClientStreamingMessageStreamAsync
+            metadata messages preflight handler deadline runtime?
 
 def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata : Metadata)
     (messages : MessageStream ByteArray)
@@ -1050,6 +1124,30 @@ def dispatchBidirectionalStreamingMessageStreamAsync (registry : Registry)
           }
           pure (.ok (response, prepared.deadline))
 
+def dispatchManagedBidirectionalStreamingMessageStreamAsync (registry : Registry)
+    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (preflight : Headers.RequestPreflight) (handler : BidirectionalStreamingStreamHandler)
+    (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler <|
+      prepareBidirectionalStreamingDispatch registry metadata messages (some handler) deadline
+        (some preflight) with
+  | .error status => pure (.error status)
+  | .ok prepared =>
+      match ← runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime? with
+      | .error status => pure (.error status)
+      | .ok response =>
+          let response := {
+            response with
+            messages := {
+              recv? := response.messages.recv?,
+              cancel := do
+                response.messages.cancel
+                messages.cancel
+            }
+          }
+          pure (.ok (response, prepared.deadline))
+
 def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : Metadata)
     (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
@@ -1071,6 +1169,21 @@ def dispatchBidirectionalStreamingStreamAsync (registry : Registry) (metadata : 
       | .ok messages =>
           registry.dispatchBidirectionalStreamingMessageStreamAsync
             metadata messages handler? request.deadline runtime?
+
+def dispatchManagedBidirectionalStreamingStreamAsync (registry : Registry)
+    (metadata : Metadata) (body : ByteArray) (preflight : Headers.RequestPreflight)
+    (handler : BidirectionalStreamingStreamHandler) (deadline : Option Nat)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
+  match ← runHandler
+      (decodeClientStreamingRequest registry metadata body deadline (some preflight)) with
+  | .error status => pure (.error status)
+  | .ok request =>
+      match ← runHandler (MessageStream.ofArray request.messages) with
+      | .error status => pure (.error status)
+      | .ok messages =>
+          registry.dispatchManagedBidirectionalStreamingMessageStreamAsync
+            metadata messages preflight handler deadline runtime?
 
 def dispatchBidirectionalStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option BidirectionalStreamingStreamHandler := none)

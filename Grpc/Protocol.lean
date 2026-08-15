@@ -645,12 +645,15 @@ def contentType (metadata : Metadata) : Option String :=
 def isGrpcContentType (value : String) : Bool :=
   value == "application/grpc" || value == "application/grpc+proto"
 
-private def singletonHeader? (metadata : Metadata) (name : String) : Except Status (Option String) := do
-  let values := metadata.getAll name
+private def singletonValues? (name : String) (values : Array String) :
+    Except Status (Option String) := do
   if values.size > 1 then
     throw (Status.invalidArgument s!"duplicate {Header.normalizeName name} header")
   else
     pure values[0]?
+
+private def singletonHeader? (metadata : Metadata) (name : String) : Except Status (Option String) :=
+  singletonValues? name (metadata.getAll name)
 
 def timeout? (metadata : Metadata) : Except Status (Option Timeout) := do
   match ← singletonHeader? metadata "grpc-timeout" with
@@ -668,14 +671,18 @@ def contentLength? (metadata : Metadata) : Except Status (Option Nat) := do
       | some length => pure (some length)
       | none => throw (Status.invalidArgument s!"invalid content-length header {value}")
 
-def validateContentLength (metadata : Metadata) (actual : Nat) : Except Status Unit := do
-  match ← contentLength? metadata with
+def validateContentLengthValue (contentLength : Option Nat) (actual : Nat) :
+    Except Status Unit := do
+  match contentLength with
   | none => pure ()
   | some expected =>
       if expected == actual then
         pure ()
       else
         throw (Status.invalidArgument s!"content-length {expected} does not match request body size {actual}")
+
+def validateContentLength (metadata : Metadata) (actual : Nat) : Except Status Unit := do
+  validateContentLengthValue (← contentLength? metadata) actual
 
 def identityEncoding : String := "identity"
 
@@ -705,8 +712,26 @@ def clientAcceptsGzip (metadata : Metadata) : Bool :=
   metadata.getAll "grpc-accept-encoding" |>.any fun value =>
     value.splitOn "," |>.any fun token => token.trim == gzipEncoding
 
-def validateUnaryRequestHeaders (metadata : Metadata) : Except Status MethodName := do
-  Metadata.validate metadata
+/-! Parsed facts retained by a managed HTTP/2 connection after the request
+header block has passed the complete gRPC validation sequence. -/
+structure RequestPreflight where
+  method : MethodName
+  timeout : Option Timeout
+  contentLength : Option Nat
+  requestUsesGzip : Bool
+  clientAcceptsGzip : Bool
+  deriving Repr, DecidableEq
+
+private structure ValidatedRequestCore where
+  method : MethodName
+  timeout : Option Timeout
+  contentLength : Option Nat
+  requestUsesGzip : Bool
+
+/-- Fallible request validation shared by the legacy method-only API and the
+managed preflight. The managed wrapper alone scans response gzip acceptance. -/
+private def validateUnaryRequestCoreAfterMetadata (metadata : Metadata)
+    (contentTypes : Array String) : Except Status ValidatedRequestCore := do
 
   match metadata.get? ":method" with
   | some "POST" => pure ()
@@ -731,7 +756,7 @@ def validateUnaryRequestHeaders (metadata : Metadata) : Except Status MethodName
     | some method => pure method
     | none => throw (Status.invalidArgument s!"invalid gRPC method path {path}")
 
-  match ← singletonHeader? metadata "content-type" with
+  match ← singletonValues? "content-type" contentTypes with
   | some value =>
       if isGrpcContentType value then pure () else
         throw (Status.invalidArgument s!"unsupported content-type {value}")
@@ -742,11 +767,39 @@ def validateUnaryRequestHeaders (metadata : Metadata) : Except Status MethodName
   | some _ => throw (Status.invalidArgument "gRPC requests must send te: trailers")
   | none => throw (Status.invalidArgument "missing te header")
 
-  discard <| timeout? metadata
-  discard <| contentLength? metadata
-  validateRequestEncoding metadata
+  let timeout ← timeout? metadata
+  let contentLength ← contentLength? metadata
+  let requestUsesGzip ← requestUsesGzip metadata
 
-  pure method
+  pure {
+    method := method,
+    timeout := timeout,
+    contentLength := contentLength,
+    requestUsesGzip := requestUsesGzip
+  }
+
+/-- Complete request validation after `Metadata.validate` has already
+succeeded. `contentTypes` is supplied by the early HTTP-status preflight so
+that its first-value check and the full singleton check share one scan. -/
+def validateUnaryRequestPreflightAfterMetadata (metadata : Metadata)
+    (contentTypes : Array String) : Except Status RequestPreflight := do
+  let core ← validateUnaryRequestCoreAfterMetadata metadata contentTypes
+  pure {
+    method := core.method
+    timeout := core.timeout
+    contentLength := core.contentLength
+    requestUsesGzip := core.requestUsesGzip
+    clientAcceptsGzip := clientAcceptsGzip metadata
+  }
+
+def validateUnaryRequestPreflight (metadata : Metadata) : Except Status RequestPreflight := do
+  Metadata.validate metadata
+  validateUnaryRequestPreflightAfterMetadata metadata (metadata.getAll "content-type")
+
+def validateUnaryRequestHeaders (metadata : Metadata) : Except Status MethodName := do
+  Metadata.validate metadata
+  pure (← validateUnaryRequestCoreAfterMetadata metadata
+    (metadata.getAll "content-type")).method
 
 def responseHeaders : Metadata :=
   Metadata.empty

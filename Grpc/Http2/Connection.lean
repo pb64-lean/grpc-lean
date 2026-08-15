@@ -264,6 +264,8 @@ structure StreamState where
   streamId : Nat
   frames : Array Frame := #[]
   requestMetadata : Option Metadata := none
+  /-- Validated header facts parsed once when END_HEADERS completed. -/
+  requestPreflight : Option Headers.RequestPreflight := none
   /-- The registry entry accepted by request-header authorization at
   END_HEADERS.  `none` means the header block has not been authorized, so the
   stream must not dispatch. -/
@@ -1090,10 +1092,9 @@ structure RequestStreamingDispatch where
   outboundHpack : Hpack.State
   maxDataFrameSize : Nat
   kind : RequestStreamingKind
-  contentLength : Option Nat := none
+  preflight : Headers.RequestPreflight
   requestError : Option Status := none
   closeImmediately : Bool := false
-  usesGzip : Bool := false
   /-- Absolute request deadline captured at END_HEADERS. -/
   deadline : Option Nat := none
   private deadlineScheduler : Option DeadlineScheduler := none
@@ -1111,6 +1112,7 @@ private structure PendingAuthorization where
   streamId : Nat
   entry : MethodEntry
   metadata : Metadata
+  preflight : Headers.RequestPreflight
   deadline : Option Nat
   endStream : Bool
   scheduler : DeadlineScheduler
@@ -1157,15 +1159,16 @@ private def requestStreamingDispatchForStream? (state : State)
     let metadata ← match stream.requestMetadata with
       | some metadata => pure metadata
       | none => throw (Status.internal "authorized request metadata was not retained")
+    let preflight ← match stream.requestPreflight with
+      | some preflight => pure preflight
+      | none => throw (Status.internal "authorized request preflight was not retained")
     match requestStreamingKind? entry with
     | none => pure (state, none)
     | some kind =>
-        let contentLength ← Headers.contentLength? metadata
-        let usesGzip ← Headers.requestUsesGzip metadata
         let closeImmediately := FrameFlag.has headersFrame.header.flags FrameFlag.endStream
         let requestError :=
           if closeImmediately then
-            match Headers.validateContentLength metadata 0 with
+            match Headers.validateContentLengthValue preflight.contentLength 0 with
             | .ok () => none
             | .error status => some status
           else
@@ -1200,10 +1203,9 @@ private def requestStreamingDispatchForStream? (state : State)
           outboundHpack := state.outboundHpack,
           maxDataFrameSize := state.outboundMaxFramePayloadLength,
           kind := kind,
-          contentLength := contentLength,
+          preflight := preflight,
           requestError := requestError,
-          closeImmediately := closeImmediately,
-          usesGzip := usesGzip
+          closeImmediately := closeImmediately
         })
 
 /-- Pure state transition for a request rejected at completed request
@@ -1253,13 +1255,6 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
   match decoded with
   | .error status => pure (.error status)
   | .ok (stream, _headersFrame, headers) =>
-    -- Capture the absolute deadline before invoking the request authorizer, so
-    -- authorization latency consumes the same budget as body and handler work.
-    -- An invalid timeout is still passed through `authorizeEarlyRequest`, which
-    -- encodes its INVALID_ARGUMENT as a stream-scoped gRPC response.
-    let deadline ← match Headers.timeout? headers.metadata with
-      | .ok timeout? => Deadline.fromTimeoutAt? timeout? stream.endHeadersReceivedAt
-      | .error _ => pure none
     if containsStreamId state.refusedInboundStreams streamId then
       -- The field block is decoded (`headers.hpack` carries the advanced
       -- decoder), so the connection stays in step; the stream itself is reset.
@@ -1277,94 +1272,73 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
             if headers.endStream then state else drainResetInboundStreamBody state streamId
           pure (.ok (state, .rejected #[rst]))
     else
-      match state.deadlineScheduler with
-      | some scheduler =>
-        if registry.usesCustomRequestHeaderAuthorizer then
-          -- Validation and method lookup remain inside the serialized HPACK
-          -- transition.  Only the already-validated user callback is deferred,
-          -- so error precedence and connection-wide compression state are
-          -- identical to the synchronous transport path.
-          match Transport.encodeEarlyRequestRejectionFrames? registry state.outboundHpack
-              streamId headers.metadata state.outboundMaxFramePayloadLength with
-          | .error status => pure (.error status)
-          | .ok (some encoded) =>
-              pure (.ok (rejectStreamAtHeaders state streamId headers.hpack encoded.2
-                headers.endStream, .rejected encoded.1))
-          | .ok none =>
-              let method ← match Headers.validateUnaryRequestHeaders headers.metadata with
-                | .ok method => pure method
-                | .error status => return .error status
-              let entry ← match registry.findEntry? method with
-                | some entry => pure entry
-                | none =>
-                    return .error
-                      (Status.internal "validated request method disappeared from registry")
-              let cancelled ← IO.mkRef false
-              let deadlineChild ← IO.mkRef (none : Option DeadlineChild)
-              let active : ActiveAuthorization := {
-                streamId := streamId,
-                cancelled := cancelled,
-                deadlineChild := deadlineChild
-              }
-              let stream := {
-                stream with
-                requestMetadata := some headers.metadata,
-                deadline := deadline,
-                authorizedEntry? := none
-              }
-              let state := {
-                state with
-                hpack := headers.hpack,
-                streams := replaceStream state.streams stream,
-                activeAuthorizations := state.activeAuthorizations.push active
-              }
-              pure (.ok (state, .pending {
-                streamId := streamId,
-                entry := entry,
-                metadata := headers.metadata,
-                deadline := deadline,
-                endStream := headers.endStream,
-                scheduler := scheduler,
-                active := active
-              }))
-        else
-          match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
-              headers.metadata state.outboundMaxFramePayloadLength deadline with
-          | .error status => pure (.error status)
-          | .ok (.accept entry) =>
-              let stream := {
-                stream with
-                requestMetadata := some headers.metadata,
-                deadline := deadline,
-                authorizedEntry? := some entry
-              }
-              pure (.ok ({
-                state with
-                hpack := headers.hpack,
-                streams := replaceStream state.streams stream
-              }, .accepted))
-          | .ok (.reject frames outboundHpack) =>
-              pure (.ok (rejectStreamAtHeaders state streamId
-                headers.hpack outboundHpack headers.endStream, .rejected frames))
-      | none =>
-          match ← Transport.authorizeEarlyRequest registry state.outboundHpack streamId
-              headers.metadata state.outboundMaxFramePayloadLength deadline with
-          | .error status => pure (.error status)
-          | .ok (.accept entry) =>
-              let stream := {
-                stream with
-                requestMetadata := some headers.metadata,
-                deadline := deadline,
-                authorizedEntry? := some entry
-              }
-              pure (.ok ({
-                state with
-                hpack := headers.hpack,
-                streams := replaceStream state.streams stream
-              }, .accepted))
-          | .ok (.reject frames outboundHpack) =>
-              pure (.ok (rejectStreamAtHeaders state streamId
-                headers.hpack outboundHpack headers.endStream, .rejected frames))
+      match Transport.preflightEarlyRequest registry state.outboundHpack streamId
+          headers.metadata state.outboundMaxFramePayloadLength with
+      | .error status => pure (.error status)
+      | .ok (.reject frames outboundHpack) =>
+          pure (.ok (rejectStreamAtHeaders state streamId headers.hpack outboundHpack
+            headers.endStream, .rejected frames))
+      | .ok (.accept entry preflight) =>
+          -- Derive the absolute deadline exactly once, anchored to the frame
+          -- arrival that completed END_HEADERS, before any authorizer IO.
+          let deadline ←
+            Deadline.fromTimeoutAt? preflight.timeout stream.endHeadersReceivedAt
+          let authorizeNow : IO (Except Status (State × RequestHeaderAuthorization)) := do
+            match ← Transport.authorizePreflightedEarlyRequest registry state.outboundHpack
+                streamId headers.metadata entry state.outboundMaxFramePayloadLength deadline with
+            | .error status => pure (.error status)
+            | .ok (.accept authorizedEntry) =>
+                let stream := {
+                  stream with
+                  requestMetadata := some headers.metadata,
+                  requestPreflight := some preflight,
+                  deadline := deadline,
+                  authorizedEntry? := some authorizedEntry
+                }
+                pure (.ok ({
+                  state with
+                  hpack := headers.hpack,
+                  streams := replaceStream state.streams stream
+                }, .accepted))
+            | .ok (.reject frames outboundHpack) =>
+                pure (.ok (rejectStreamAtHeaders state streamId headers.hpack outboundHpack
+                  headers.endStream, .rejected frames))
+          match state.deadlineScheduler with
+          | some scheduler =>
+              if registry.usesCustomRequestHeaderAuthorizer then
+                let cancelled ← IO.mkRef false
+                let deadlineChild ← IO.mkRef (none : Option DeadlineChild)
+                let active : ActiveAuthorization := {
+                  streamId := streamId,
+                  cancelled := cancelled,
+                  deadlineChild := deadlineChild
+                }
+                let stream := {
+                  stream with
+                  requestMetadata := some headers.metadata,
+                  requestPreflight := some preflight,
+                  deadline := deadline,
+                  authorizedEntry? := none
+                }
+                let state := {
+                  state with
+                  hpack := headers.hpack,
+                  streams := replaceStream state.streams stream,
+                  activeAuthorizations := state.activeAuthorizations.push active
+                }
+                pure (.ok (state, .pending {
+                  streamId := streamId,
+                  entry := entry,
+                  metadata := headers.metadata,
+                  preflight := preflight,
+                  deadline := deadline,
+                  endStream := headers.endStream,
+                  scheduler := scheduler,
+                  active := active
+                }))
+              else
+                authorizeNow
+          | none => authorizeNow
 
 private def earlyRequestRejectionForStream? (registry : Registry) (state : State) (streamId : Nat) :
     IO (Except Status (State × Option SharedFrameResult)) := do
@@ -1427,11 +1401,9 @@ private def checkContentLength? (contentLength : Option Nat) (received : Nat) (e
   | none => none
   | some expected =>
       if exact then
-        if received != expected then
-          some (Status.invalidArgument
-            s!"content-length {expected} does not match request body size {received}")
-        else
-          none
+        match Headers.validateContentLengthValue contentLength received with
+        | .ok () => none
+        | .error status => some status
       else
         if received > expected then
           some (Status.invalidArgument
@@ -1490,6 +1462,9 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
   let metadata ← match stream.requestMetadata with
     | some metadata => pure metadata
     | none => throw (Status.internal "authorized request metadata was not retained")
+  let preflight ← match stream.requestPreflight with
+    | some preflight => pure preflight
+    | none => throw (Status.internal "authorized request preflight was not retained")
   let body ← (stream.frames.extract 1 stream.frames.size).foldlM
     (init := ByteArray.empty) fun body frame => do
       if frame.header.streamId != stream.streamId then
@@ -1504,7 +1479,8 @@ private def authorizedUnaryRequestForStream (state : State) (stream : StreamStat
     deadline := stream.deadline,
     body := body,
     hpack := state.hpack,
-    authorizedEntry? := some entry
+    authorizedEntry? := some entry,
+    preflight? := some preflight
   }
 
 private def detachStreamForDispatch (state : State) (streamId : Nat) :
@@ -1849,7 +1825,11 @@ private def commitPendingAuthorization (stateMutex : Std.Mutex State)
                   set state
                   pure (.ok { emitted := encoded.1 })
           | .ok entry =>
-              let stream := { stream with authorizedEntry? := some entry }
+              let stream := {
+                stream with
+                requestPreflight := some authorization.preflight,
+                authorizedEntry? := some entry
+              }
               let state := { state with streams := replaceStream state.streams stream }
               match requestStreamingDispatchForStream? state authorization.streamId with
               | .error status => pure (.error status)
@@ -2178,7 +2158,7 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
     | .ok producer => pure producer
     | .error status => return .error status
   let rawRequestStream := creditingRequestStream stateMutex emit dispatch.streamId producer.stream
-  let acceptsGzip := Headers.clientAcceptsGzip dispatch.metadata
+  let acceptsGzip := dispatch.preflight.clientAcceptsGzip
   let cancelled ← IO.mkRef false
   let registered ← IO.Promise.new
   let deadlineChild? ←
@@ -2310,8 +2290,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       | none =>
           match dispatch.kind with
           | .clientStreaming handler =>
-              let result ← registry.dispatchClientStreamingMessageStreamAsync
-                dispatch.metadata requestStream (some handler) dispatch.deadline
+              let result ← registry.dispatchManagedClientStreamingMessageStreamAsync
+                dispatch.metadata requestStream dispatch.preflight handler dispatch.deadline
                 deadlineRuntime?
               let encoded ← match result with
                 | .ok response => encodeUnary response
@@ -2324,8 +2304,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
                   abortStreamSharedUnlessCancelled cancelled stateMutex emit
                     dispatch.streamId ErrorCode.internalError
           | .bidirectionalStreaming handler =>
-              let result ← registry.dispatchBidirectionalStreamingMessageStreamAsync
-                dispatch.metadata requestStream (some handler) dispatch.deadline
+              let result ← registry.dispatchManagedBidirectionalStreamingMessageStreamAsync
+                dispatch.metadata requestStream dispatch.preflight handler dispatch.deadline
                 deadlineRuntime?
               let encoded ← match result with
                 | .ok (response, deadline) => encodeStreaming response deadline
@@ -2375,8 +2355,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
           state.activeRequestStreams.push {
             streamId := dispatch.streamId,
             producer := producer,
-            contentLength := dispatch.contentLength,
-            usesGzip := dispatch.usesGzip
+            contentLength := dispatch.preflight.contentLength,
+            usesGzip := dispatch.preflight.requestUsesGzip
           }
       set {
         state with
