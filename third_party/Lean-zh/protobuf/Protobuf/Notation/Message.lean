@@ -1513,9 +1513,11 @@ private def construct_member_getters (name : Ident) (push_name : String → Iden
             out := out.push hasGetter
   return out
 
-/-- PB-02's bounded direct-encoding subset. Every message still gets the
-`encodeDirect` API, but schemas outside this subset use the generic validated
-fallback. Keeping this predicate structural avoids message-name-specific
+/-- PB-02's bounded direct-encoding subset. Every message still gets an internal
+direct-plan hook, but schemas outside this subset use the generic validated
+fallback. Its generated name component contains `$`, which cannot occur in a
+protobuf identifier, so legal field projections cannot collide with the hook.
+Keeping this predicate structural avoids message-name-specific
 codecs while allowing the Widget/ListWidgetsResponse shape to bypass the
 intermediate `Message`/`Record`/nested `ByteArray` graph. -/
 private def directTypedFieldSupported (x : ProtoFieldMData) : Bool :=
@@ -1549,13 +1551,9 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
     (fields : Array ProtoFieldMData) (toMessageWithOptions : Ident)
     (mutMessages : NameSet) :
     CommandElabM (Array Command) := do
-  let directPlanWithOptionsId := push_name "directPlanWithOptions"
-  let directPlanId := push_name "directPlan"
-  let encodeDirectWithOptionsId := push_name "encodeDirectWithOptions"
-  let encodeDirectId := push_name "encodeDirect"
+  let directPlanWithOptionsId := push_name "_pb$directPlanWithOptions"
   let options ← mkIdent <$> mkFreshUserName `options
   let val ← mkIdent <$> mkFreshUserName `val
-  let plan ← mkIdent <$> mkFreshUserName `plan
   let msg ← mkIdent <$> mkFreshUserName `msg
 
   let directPlanWithOptions ←
@@ -1589,7 +1587,8 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
         | .repeated, none =>
             let childPlans ← mkIdent <$> mkFreshUserName `childPlans
             let childDirectPlanWithOptionsId :=
-              mkIdentFrom x.proto_type (x.proto_type.getId.str "directPlanWithOptions")
+              mkIdentFrom x.proto_type
+                (x.proto_type.getId.str "_pb$directPlanWithOptions")
             let childHasDirectPlan : Bool ←
               if mutMessages.contains x.proto_type.getId then
                 pure true
@@ -1648,19 +1647,7 @@ private def construct_direct_plan (name : Ident) (push_name : String → Ident)
           let $msg:ident := (← $toMessageWithOptions:ident $options:ident $val:ident)
           Protobuf.Encoding.Direct.Plan.ofMessage $msg:ident)
 
-  let directPlan ← `(partial def $directPlanId:ident : $name →
-      Except Protobuf.Encoding.ProtoError Protobuf.Encoding.Direct.Plan :=
-    $directPlanWithOptionsId:ident Protobuf.Encoding.EncodeOptions.default)
-  let encodeDirectWithOptions ← `(partial def $encodeDirectWithOptionsId:ident :
-      Protobuf.Encoding.EncodeOptions → $name →
-        Except Protobuf.Encoding.ProtoError ByteArray :=
-    fun $options:ident $val:ident => do
-      let $plan:ident := (← $directPlanWithOptionsId:ident $options:ident $val:ident)
-      return Protobuf.Encoding.Direct.Plan.run $plan:ident)
-  let encodeDirect ← `(partial def $encodeDirectId:ident : $name →
-      Except Protobuf.Encoding.ProtoError ByteArray :=
-    $encodeDirectWithOptionsId:ident Protobuf.Encoding.EncodeOptions.default)
-  return #[directPlanWithOptions, directPlan, encodeDirectWithOptions, encodeDirect]
+  return #[directPlanWithOptions]
 
 private def construct_encode (name : Ident) (push_name : String → Ident)
     (toMessageWithOptions : Ident) (directPlanWithOptions? : Option Ident) :
@@ -1720,7 +1707,7 @@ public def elabMessageDecCore (mutEnums mutOneofs messages : NameSet) : Syntax �
   let (_, decoder_rep, _, decoderRepWithOptions) ← construct_decoder_rep name push_name fromMessage' fromMessageWithOptions'
   let directPlanForEncode? :=
     if mdata.all directTypedFieldSupported then
-      some (push_name "directPlanWithOptions")
+      some (push_name "_pb$directPlanWithOptions")
     else
       none
   let (_, encode, _, encodeWithOptions) ←

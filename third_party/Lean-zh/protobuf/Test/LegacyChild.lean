@@ -9,13 +9,17 @@ open Protobuf Encoding
 namespace ImportedLegacy
 
 /-- A conventional protobuf message implementation that predates PB-02 and
-therefore intentionally has no `directPlanWithOptions` declaration. -/
+therefore intentionally has no `«_pb$directPlanWithOptions»` declaration. -/
 structure LegacyChild where
   id : UInt64 := 0
   label : String := ""
   «Unknown.Fields» : Std.HashMap Nat (Array ProtoVal) := {}
 
 instance : Inhabited LegacyChild := ⟨{}⟩
+
+/- An unrelated declaration with PB-02's discarded prototype name must not be
+mistaken for the generator's `$`-qualified cross-module hook. -/
+def LegacyChild.directPlanWithOptions : Nat := 7
 
 def LegacyChild.toMessageWithOptions (options : EncodeOptions)
     (value : LegacyChild) : Except ProtoError Message := do

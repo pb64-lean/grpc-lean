@@ -47,6 +47,16 @@ message ImportedLegacyList {
   repeated ImportedLegacy.LegacyChild children = 1;
 }
 
+/- These four legal protobuf field names matched PB-02's first helper names.
+The remaining internal hook uses a component containing `$`, so all projections
+and the adopted direct encoder can coexist. -/
+message DirectHelperNameCollision {
+  string directPlanWithOptions = 1;
+  string directPlan = 2;
+  string encodeDirectWithOptions = 3;
+  string encodeDirect = 4;
+}
+
 def ofExcept {α} (result : Except ProtoError α) : IO α := do
   match result with
   | .ok value => pure value
@@ -76,10 +86,9 @@ def legacyEncodeWithOptions {α}
     (options : EncodeOptions) (value : α) : Except ProtoError ByteArray := do
   return Binary.Put.run (Binary.put (← toMessageWithOptions options value))
 
-def assertAdopted (legacy adopted direct : Except ProtoError ByteArray)
+def assertGenerated (legacy adopted : Except ProtoError ByteArray)
     (context : String) : IO Unit := do
   assertSameOutcome legacy adopted s!"{context}: generated encode"
-  assertSameOutcome legacy direct s!"{context}: explicit direct encode"
 
 def widgetCorpus : Array Widget :=
   #[ default
@@ -103,18 +112,18 @@ def richUnknownFields : Std.HashMap Nat (Array ProtoVal) :=
 
 def testWidgetCorpus : IO Unit := do
   for widget in widgetCorpus do
-    assertAdopted
+    assertGenerated
       (legacyEncodeWithOptions Widget.toMessageWithOptions EncodeOptions.default widget)
-      (Widget.encode widget) (Widget.encodeDirect widget)
+      (Widget.encode widget)
       s!"widget id={widget.id}"
-    assertAdopted
+    assertGenerated
       (legacyEncodeWithOptions Widget.toMessageWithOptions
         EncodeOptions.withDeterministic widget)
       (Widget.encodeWithOptions EncodeOptions.withDeterministic widget)
-      (Widget.encodeDirectWithOptions EncodeOptions.withDeterministic widget)
       s!"deterministic widget id={widget.id}"
-    let plan ← ofExcept (Widget.directPlan widget)
-    let bytes ← ofExcept (Widget.encodeDirect widget)
+    let plan ← ofExcept (Widget.«_pb$directPlanWithOptions»
+      EncodeOptions.default widget)
+    let bytes ← ofExcept (Widget.encode widget)
     assertEq plan.size bytes.size s!"widget plan size id={widget.id}"
     let decoded ← ofExcept (Widget.decode bytes)
     let roundtrip ← ofExcept (Widget.encode decoded)
@@ -130,13 +139,13 @@ def testNestedLists : IO Unit := do
             owner_id := UInt64.ofNat (1000 + i) } }
      ]
   for list in lists do
-    assertAdopted
+    assertGenerated
       (legacyEncodeWithOptions ListWidgetsResponse.toMessageWithOptions
         EncodeOptions.default list)
-      (ListWidgetsResponse.encode list)
-      (ListWidgetsResponse.encodeDirect list) s!"list size={list.widgets.size}"
-    let plan ← ofExcept (ListWidgetsResponse.directPlan list)
-    let bytes ← ofExcept (ListWidgetsResponse.encodeDirect list)
+      (ListWidgetsResponse.encode list) s!"list size={list.widgets.size}"
+    let plan ← ofExcept (ListWidgetsResponse.«_pb$directPlanWithOptions»
+      EncodeOptions.default list)
+    let bytes ← ofExcept (ListWidgetsResponse.encode list)
     assertEq plan.size bytes.size s!"list plan size={list.widgets.size}"
     let decoded ← ofExcept (ListWidgetsResponse.decode bytes)
     assertEq decoded.widgets.size list.widgets.size
@@ -145,15 +154,14 @@ def testNestedLists : IO Unit := do
 def testUnknownFields : IO Unit := do
   let base := widgetCorpus[2]!
   let value : Widget := { base with «Unknown.Fields» := richUnknownFields }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions Widget.toMessageWithOptions
       EncodeOptions.withDeterministic value)
     (Widget.encodeWithOptions EncodeOptions.withDeterministic value)
-    (Widget.encodeDirectWithOptions EncodeOptions.withDeterministic value)
     "deterministic rich unknown fields"
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions Widget.toMessageWithOptions EncodeOptions.default value)
-    (Widget.encode value) (Widget.encodeDirect value)
+    (Widget.encode value)
     "native-order rich unknown fields"
 
   -- Legacy `wire_mapWithOptions` emits no records for an empty value array, so
@@ -162,18 +170,18 @@ def testUnknownFields : IO Unit := do
     base with
     «Unknown.Fields» := (Std.HashMap.emptyWithCapacity 1).insert 0 #[]
   }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions Widget.toMessageWithOptions EncodeOptions.default emptyInvalid)
-    (Widget.encode emptyInvalid) (Widget.encodeDirect emptyInvalid)
+    (Widget.encode emptyInvalid)
     "empty invalid unknown key"
 
   let invalidNumber : Widget := {
     base with
     «Unknown.Fields» := (Std.HashMap.emptyWithCapacity 1).insert 0 #[.VARINT 1]
   }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions Widget.toMessageWithOptions EncodeOptions.default invalidNumber)
-    (Widget.encode invalidNumber) (Widget.encodeDirect invalidNumber)
+    (Widget.encode invalidNumber)
     "invalid unknown field number"
 
   let invalidVarint : Widget := {
@@ -181,9 +189,9 @@ def testUnknownFields : IO Unit := do
     «Unknown.Fields» :=
       (Std.HashMap.emptyWithCapacity 1).insert 101 #[.VARINT UInt64.size]
   }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions Widget.toMessageWithOptions EncodeOptions.default invalidVarint)
-    (Widget.encode invalidVarint) (Widget.encodeDirect invalidVarint)
+    (Widget.encode invalidVarint)
     "overflowing unknown varint"
 
   -- Known fields (including nested messages) precede the parent's unknown
@@ -199,8 +207,8 @@ def testUnknownFields : IO Unit := do
   | .error .invalidVarint => pure ()
   | .error err => throw (IO.userError s!"nested first-error oracle changed: {err}")
   | .ok _ => throw (IO.userError "nested first-error oracle unexpectedly succeeded")
-  assertAdopted legacyParent (ListWidgetsResponse.encode invalidParent)
-    (ListWidgetsResponse.encodeDirect invalidParent) "nested child-before-parent error ordering"
+  assertGenerated legacyParent (ListWidgetsResponse.encode invalidParent)
+    "nested child-before-parent error ordering"
 
 def fallbackValue : FallbackEnvelope :=
   { count := -7
@@ -210,22 +218,20 @@ def fallbackValue : FallbackEnvelope :=
   }
 
 def testFallbackSemantics : IO Unit := do
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions FallbackEnvelope.toMessageWithOptions
       EncodeOptions.withDeterministic fallbackValue)
     (FallbackEnvelope.encodeWithOptions EncodeOptions.withDeterministic fallbackValue)
-    (FallbackEnvelope.encodeDirectWithOptions EncodeOptions.withDeterministic fallbackValue)
     "map/oneof fallback"
   let parent : FallbackList := { entries := #[fallbackValue, default] }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions FallbackList.toMessageWithOptions
       EncodeOptions.withDeterministic parent)
     (FallbackList.encodeWithOptions EncodeOptions.withDeterministic parent)
-    (FallbackList.encodeDirectWithOptions EncodeOptions.withDeterministic parent)
     "direct parent with fallback children"
-  let plan ← ofExcept (FallbackList.directPlanWithOptions
+  let plan ← ofExcept (FallbackList.«_pb$directPlanWithOptions»
     EncodeOptions.withDeterministic parent)
-  let bytes ← ofExcept (FallbackList.encodeDirectWithOptions
+  let bytes ← ofExcept (FallbackList.encodeWithOptions
     EncodeOptions.withDeterministic parent)
   assertEq plan.size bytes.size "fallback child plan size"
 
@@ -233,22 +239,33 @@ def testImportedChildren : IO Unit := do
   let generated : ImportedGeneratedList := {
     children := #[{ id := 7, label := "generated" }, { id := 128, label := "跨模块" }]
   }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions ImportedGeneratedList.toMessageWithOptions
       EncodeOptions.default generated)
     (ImportedGeneratedList.encode generated)
-    (ImportedGeneratedList.encodeDirect generated)
     "imported generated direct child"
 
   let legacy : ImportedLegacyList := {
     children := #[{ id := 9, label := "legacy" }, { id := 16384, label := "fallback" }]
   }
-  assertAdopted
+  assertGenerated
     (legacyEncodeWithOptions ImportedLegacyList.toMessageWithOptions
       EncodeOptions.default legacy)
     (ImportedLegacyList.encode legacy)
-    (ImportedLegacyList.encodeDirect legacy)
-    "imported conventional child without direct API"
+    "imported conventional child without direct hook"
+
+def testHelperNameCollision : IO Unit := do
+  let value : DirectHelperNameCollision :=
+    { directPlanWithOptions := "one"
+    , directPlan := "two"
+    , encodeDirectWithOptions := "three"
+    , encodeDirect := "four"
+    }
+  assertGenerated
+    (legacyEncodeWithOptions DirectHelperNameCollision.toMessageWithOptions
+      EncodeOptions.default value)
+    (DirectHelperNameCollision.encode value)
+    "direct helper name collision"
 
 def testDirectEncode : IO Unit := do
   testWidgetCorpus
@@ -256,6 +273,7 @@ def testDirectEncode : IO Unit := do
   testUnknownFields
   testFallbackSemantics
   testImportedChildren
+  testHelperNameCollision
 
 end DirectEncodeBazel
 

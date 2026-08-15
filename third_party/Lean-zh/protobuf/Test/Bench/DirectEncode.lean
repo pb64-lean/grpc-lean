@@ -91,10 +91,6 @@ def main (args : List String) : IO Unit := do
     | throw (IO.userError "direct encoder rejected benchmark corpus")
   unless legacyBytes == directBytes do
     throw (IO.userError "legacy and direct benchmark bytes differ")
-  let .ok explicitDirectBytes := ListWidgetsResponse.encodeDirect value
-    | throw (IO.userError "explicit direct encoder rejected benchmark corpus")
-  unless directBytes == explicitDirectBytes do
-    throw (IO.userError "adopted and explicit direct encoders differ")
 
   let warmupIterations := 200
   discard <| encodeRepeated legacyEncode value warmupIterations
