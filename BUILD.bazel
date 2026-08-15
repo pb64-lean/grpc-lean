@@ -234,6 +234,8 @@ lean_assurance_test(
         "Grpc.Http2.Connection.decodeActiveRequestData_conserves",
         "Grpc.Http2.Connection.takeRequestStreamCredit_conserves",
         "Grpc.Http2.Connection.flushOutbound_conserves",
+        "Grpc.Http2.Connection.queueOutbound_conserves",
+        "Grpc.Http2.Connection.queueOutbound_wellFormed",
         "Grpc.Http2.Connection.defaultStreamWindow_admits_max_message",
         "Grpc.Http2.Connection.inboundWindow_pos_of_incomplete",
         # Codec laws, every one the README names.
@@ -333,6 +335,8 @@ lean_assurance_test(
         "Grpc.Http2.Connection.decodeActiveRequestData_conserves": "∀ {registry : Grpc.Registry} {active active' : Grpc.Http2.Connection.ActiveRequestStream} {frame : Grpc.Http2.Frame} {messages : Array ByteArray} {close : Bool} (h : Grpc.Http2.Connection.decodeActiveRequestData registry active frame = Except.ok (active', messages, close)), Grpc.Http2.Connection.creditSum active'.pendingRequestCredits + active'.decodeState.buffered.size = Grpc.Http2.Connection.creditSum active.pendingRequestCredits + active.decodeState.buffered.size + frame.payload.size",
         "Grpc.Http2.Connection.takeRequestStreamCredit_conserves": "∀ (state : Grpc.Http2.Connection.State) (streamId : Nat), Grpc.Http2.Connection.inboundStreamWindow (Grpc.Http2.Connection.takeRequestStreamCredit state streamId).fst streamId = Grpc.Http2.Connection.inboundStreamWindow state streamId + (Grpc.Http2.Connection.takeRequestStreamCredit state streamId).snd",
         "Grpc.Http2.Connection.flushOutbound_conserves": "∀ (state : Grpc.Http2.Connection.State) (emitted : Array Grpc.Http2.Frame), (Grpc.Http2.Connection.flushOutbound state emitted).fst.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes (Grpc.Http2.Connection.flushOutbound state emitted).snd = state.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes emitted",
+        "Grpc.Http2.Connection.queueOutbound_conserves": "∀ (state : Grpc.Http2.Connection.State) (frames : Array Grpc.Http2.Frame), (Grpc.Http2.Connection.queueOutbound state frames).fst.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes (Grpc.Http2.Connection.queueOutbound state frames).snd = state.outboundConnectionWindow",
+        "Grpc.Http2.Connection.queueOutbound_wellFormed": "∀ (state : Grpc.Http2.Connection.State) (frames : Array Grpc.Http2.Frame), Grpc.Http2.Connection.WellFormed state → Grpc.Http2.Connection.WellFormed (Grpc.Http2.Connection.queueOutbound state frames).fst",
         "Grpc.Http2.Connection.defaultStreamWindow_admits_max_message": "Grpc.Message.prefixLength + Grpc.Message.defaultMaxDecompressedSize ≤ Grpc.Http2.Connection.defaultStreamWindow",
         "Grpc.Http2.Connection.inboundWindow_pos_of_incomplete": "∀ {state : Grpc.Http2.Connection.State} {streamId buffered messageWireSize : Nat} (hbalance : Grpc.Http2.Connection.inboundStreamWindow state streamId + buffered = state.inboundInitialStreamWindow) (hfits : messageWireSize ≤ state.inboundInitialStreamWindow) (hincomplete : buffered < messageWireSize), 0 < Grpc.Http2.Connection.inboundStreamWindow state streamId",
         "Grpc.Http2.Hpack.decodeHuffman_encodeHuffman": "∀ (bytes : ByteArray), Grpc.Http2.Hpack.decodeHuffman (Grpc.Http2.Hpack.encodeHuffman bytes) = Except.ok bytes",
@@ -564,6 +568,12 @@ lean_test(
 lean_test(
     name = "grpc_runtime_test",
     srcs = ["Test/GrpcRuntimeTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "outbound_queue_test",
+    srcs = ["Test/OutboundQueueTest.lean"],
     deps = [":grpc_lean"],
 )
 
