@@ -808,6 +808,14 @@ private def dataWindowUpdates (frame : Frame) : Except Status (Array Frame) := d
 private def dataFrameWithPayload (frame : Frame) (payload : ByteArray) : Frame :=
   { frame with header := { frame.header with length := payload.size }, payload := payload }
 
+/-- A partial DATA prefix is not the logical end of its stream.  Preserve every
+other standard or extension flag while clearing only the low END_STREAM bit;
+the queued suffix retains the original flags and therefore closes the stream
+when it is eventually emitted. -/
+private def withoutEndStream (frame : Frame) : Frame :=
+  { frame with header := { frame.header with
+      flags := clearFlag frame.header.flags FrameFlag.endStream } }
+
 /-- Low-level receive-window debit. A connection-window overrun is necessarily
 connection-fatal because the peer has lost track of shared credit. The public
 frame transitions intercept an otherwise valid open stream's *stream-only*
@@ -904,8 +912,6 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
           (state, emitted)
         else
           let sendSize := Nat.min available frame.payload.size
-          let sendPayload := frame.payload.extract 0 sendSize
-          let sentFrame := dataFrameWithPayload frame sendPayload
           let state := {
             state with
             outboundConnectionWindow := state.outboundConnectionWindow - sendSize
@@ -913,10 +919,16 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
           let state := setOutboundStreamWindow state frame.header.streamId
             (streamWindow - Int.ofNat sendSize)
           if sendSize == frame.payload.size then
+            -- Reuse an exact-fit payload.  `dataFrameWithPayload` still
+            -- normalizes the frame header for defensive direct callers, but
+            -- no longer copies every fully admitted DATA payload.
+            let sentFrame := dataFrameWithPayload frame frame.payload
             let state := { state with pendingOutbound := popFirstFrame state.pendingOutbound }
             let state := cleanupOutboundIfEndStream state sentFrame
             flushOutbound state (emitted.push sentFrame)
           else
+            let sendPayload := frame.payload.extract 0 sendSize
+            let sentFrame := dataFrameWithPayload (withoutEndStream frame) sendPayload
             let remaining := frame.payload.extract sendSize frame.payload.size
             let remainingFrame := dataFrameWithPayload frame remaining
             let state := {
@@ -929,8 +941,48 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
       simp only [cleanupOutboundIfEndStream_pendingOutbound, setOutboundStreamWindow]
       exact popFirstFrame_size_lt h
 
-private def queueOutbound (state : State) (frames : Array Frame) : State × Array Frame :=
-  flushOutbound { state with pendingOutbound := state.pendingOutbound.append frames }
+/- A batch emitted while the pending queue is empty normally fits both peer
+windows whole.  Preflight that case transactionally: a failed preflight leaves
+the original state available to the established partial-flush path, while a
+successful one can return the caller's immutable frame array directly. -/
+private def debitOutboundFrameDirect? (state : State) (frame : Frame) : Option State :=
+  if frame.header.frameType != FrameType.data then
+    some (cleanupOutboundIfEndStream state frame)
+  else if frame.header.length != frame.payload.size then
+    -- `flushOutbound` normalizes DATA lengths through `dataFrameWithPayload`.
+    -- Preserve that defensive behavior rather than returning a malformed
+    -- caller-owned frame directly.
+    none
+  else
+    let streamWindow := outboundStreamWindow state frame.header.streamId
+    let available := Nat.min state.outboundConnectionWindow streamWindow.toNat
+    -- Keep the existing zero-window behavior even for zero-length DATA.
+    if available == 0 || frame.payload.size > available then
+      none
+    else
+      let sendSize := frame.payload.size
+      let state := {
+        state with
+        outboundConnectionWindow := state.outboundConnectionWindow - sendSize
+      }
+      let state := setOutboundStreamWindow state frame.header.streamId
+        (streamWindow - Int.ofNat sendSize)
+      some (cleanupOutboundIfEndStream state frame)
+
+private def debitOutboundFramesDirect? (state : State) (frames : Array Frame) : Option State :=
+  frames.foldlM (init := state) debitOutboundFrameDirect?
+
+/-- Queue an ordered outbound frame batch and emit the prefix admitted by peer
+flow-control credit.  A wholly admitted batch on an empty queue is debited and
+returned directly; blocked or partial batches retain the established
+`flushOutbound` behavior. -/
+def queueOutbound (state : State) (frames : Array Frame) : State × Array Frame :=
+  if state.pendingOutbound.isEmpty then
+    match debitOutboundFramesDirect? state frames with
+    | some state => (state, frames)
+    | none => flushOutbound { state with pendingOutbound := frames }
+  else
+    flushOutbound { state with pendingOutbound := state.pendingOutbound.append frames }
 
 private def addOutboundConnectionWindow (kind : String) (current increment : Nat) :
     Except Status Nat := do
@@ -5070,6 +5122,92 @@ private theorem WellFormed.withOutboundStreamWindow {state : State} (h : WellFor
   outboundTable := h.outboundTable
   inboundTable := h.inboundTable
 
+private theorem WellFormed.withPendingOutbound {state : State} (h : WellFormed state)
+    (frames : Array Frame) : WellFormed { state with pendingOutbound := frames } where
+  streamIds := h.streamIds
+  pendingHeaders := h.pendingHeaders
+  outboundInitial := h.outboundInitial
+  outboundConnection := h.outboundConnection
+  outboundStreams := h.outboundStreams
+  outboundTable := h.outboundTable
+  inboundTable := h.inboundTable
+
+private theorem cleanupOutboundIfEndStream_wellFormed {state : State}
+    (h : WellFormed state) (frame : Frame) :
+    WellFormed (cleanupOutboundIfEndStream state frame) := by
+  have hs := cleanupOutboundIfEndStream_same state frame
+  exact h.ofFields
+    ⟨hs.1, Nat.le_of_eq hs.2.1, hs.2.2.1, hs.2.2.2.1, hs.2.2.2.2⟩
+    (cleanupOutboundIfEndStream_streams state frame)
+    (cleanupOutboundIfEndStream_lastClientStreamId state frame)
+
+private theorem debitOutboundFrameDirect?_wellFormed {state state' : State}
+    {frame : Frame} (hwf : WellFormed state)
+    (h : debitOutboundFrameDirect? state frame = some state') : WellFormed state' := by
+  unfold debitOutboundFrameDirect? at h
+  split at h
+  next =>
+    cases h
+    exact cleanupOutboundIfEndStream_wellFormed hwf frame
+  next =>
+    split at h
+    next => cases h
+    next =>
+      simp only at h
+      split at h
+      next => cases h
+      next =>
+        cases h
+        apply cleanupOutboundIfEndStream_wellFormed
+        apply WellFormed.withOutboundStreamWindow
+        · apply WellFormed.withOutboundConnection hwf
+          exact Nat.le_trans (Nat.sub_le _ _) hwf.outboundConnection
+        · exact sub_le_maxStreamId (outboundStreamWindow_le hwf frame.header.streamId)
+
+private theorem debitOutboundFramesDirectList?_wellFormed :
+    ∀ (frames : List Frame) {state state' : State},
+      frames.foldlM debitOutboundFrameDirect? state = some state' →
+      WellFormed state → WellFormed state' := by
+  intro frames
+  induction frames with
+  | nil =>
+      intro state state' h hwf
+      change some state = some state' at h
+      cases h
+      exact hwf
+  | cons frame frames ih =>
+      intro state state' h hwf
+      simp only [List.foldlM_cons] at h
+      cases hstep : debitOutboundFrameDirect? state frame with
+      | none => simp [hstep] at h
+      | some nextState =>
+          simp only [hstep, Option.bind_some] at h
+          exact ih h (debitOutboundFrameDirect?_wellFormed hwf hstep)
+
+private theorem debitOutboundFramesDirect?_wellFormed {state state' : State}
+    {frames : Array Frame} (hwf : WellFormed state)
+    (h : debitOutboundFramesDirect? state frames = some state') : WellFormed state' := by
+  unfold debitOutboundFramesDirect? at h
+  apply debitOutboundFramesDirectList?_wellFormed (frames := frames.toList)
+    (state := state) (state' := state')
+  · simpa only [Array.foldlM_toList] using h
+  · exact hwf
+
+/-- The exact-fit queue fast path, as well as its established partial-flush
+fallback, preserves the connection's structural and 31-bit flow-control
+invariant. -/
+theorem queueOutbound_wellFormed (state : State) (frames : Array Frame)
+    (h : WellFormed state) : WellFormed (queueOutbound state frames).1 := by
+  unfold queueOutbound
+  split
+  next =>
+    split
+    next state' hdirect => exact debitOutboundFramesDirect?_wellFormed h hdirect
+    next => exact flushOutbound_wellFormed (h.withPendingOutbound frames) #[]
+  next =>
+    exact flushOutbound_wellFormed
+      (h.withPendingOutbound (state.pendingOutbound.append frames)) #[]
+
 /-! ### SETTINGS and WINDOW_UPDATE -/
 
 private theorem adjustOutboundWindowStep_le {old new : Nat}
@@ -6227,15 +6365,18 @@ private theorem takeRequestStreamCredit_queued {state : State} {streamId : Nat}
 
 /-! ### Outbound conservation -/
 
+/-- Flow-controlled bytes in one frame: only DATA consumes peer credit. -/
+private def frameDataPayloadBytes (frame : Frame) : Nat :=
+  if frame.header.frameType == FrameType.data then frame.payload.size else 0
+
 /-- Flow-controlled bytes in a batch of frames: only DATA is flow-controlled. -/
 def dataPayloadBytes (frames : Array Frame) : Nat :=
-  frames.foldl (fun total frame =>
-    total + (if frame.header.frameType == FrameType.data then frame.payload.size else 0)) 0
+  frames.foldl (fun total frame => total + frameDataPayloadBytes frame) 0
 
 private theorem dataPayloadBytes_push (frames : Array Frame) (frame : Frame) :
     dataPayloadBytes (frames.push frame)
       = dataPayloadBytes frames
-        + (if frame.header.frameType == FrameType.data then frame.payload.size else 0) := by
+        + frameDataPayloadBytes frame := by
   simp only [dataPayloadBytes, Array.foldl_push]
 
 private theorem cleanupOutboundIfEndStream_outboundConnectionWindow (state : State)
@@ -6261,18 +6402,113 @@ theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
     rename_i ih
     rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
     clear ih
-    simp_all +zetaDelta
+    simp_all +zetaDelta [frameDataPayloadBytes]
     try omega
   case case4 =>
     rename_i ih
     rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
     clear ih
-    simp_all +zetaDelta [dataFrameWithPayload, setOutboundStreamWindow]
+    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, setOutboundStreamWindow]
     try omega
   case case5 =>
     rw [dataPayloadBytes_push]
-    simp_all +zetaDelta [dataFrameWithPayload, setOutboundStreamWindow]
+    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, withoutEndStream,
+      setOutboundStreamWindow]
     try omega
+
+private theorem debitOutboundFrameDirect?_conserves {state state' : State}
+    {frame : Frame} (h : debitOutboundFrameDirect? state frame = some state') :
+    state'.outboundConnectionWindow + frameDataPayloadBytes frame
+      = state.outboundConnectionWindow := by
+  unfold debitOutboundFrameDirect? at h
+  split at h
+  next =>
+    cases h
+    rw [cleanupOutboundIfEndStream_outboundConnectionWindow]
+    simp_all [frameDataPayloadBytes]
+  next =>
+    split at h
+    next => cases h
+    next =>
+      simp only at h
+      split at h
+      next => cases h
+      next =>
+        have hpayload : frame.payload.size ≤ Nat.min state.outboundConnectionWindow
+            (outboundStreamWindow state frame.header.streamId).toNat := by
+          simp_all only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or]
+          omega
+        have hfit : frame.payload.size ≤ state.outboundConnectionWindow :=
+          Nat.le_trans hpayload (Nat.min_le_left _ _)
+        cases h
+        rw [cleanupOutboundIfEndStream_outboundConnectionWindow]
+        simp_all +zetaDelta [frameDataPayloadBytes, setOutboundStreamWindow]
+
+private theorem dataPayloadBytesList_acc (frames : List Frame) (initial : Nat) :
+    frames.foldl (fun total frame => total + frameDataPayloadBytes frame) initial
+      = initial + frames.foldl (fun total frame => total + frameDataPayloadBytes frame) 0 := by
+  induction frames generalizing initial with
+  | nil => simp
+  | cons frame frames ih =>
+      simp only [List.foldl_cons]
+      rw [ih (initial := initial + frameDataPayloadBytes frame),
+        ih (initial := 0 + frameDataPayloadBytes frame)]
+      omega
+
+private theorem debitOutboundFramesDirectList?_conserves :
+    ∀ (frames : List Frame) {state state' : State},
+      frames.foldlM debitOutboundFrameDirect? state = some state' →
+      state'.outboundConnectionWindow
+          + frames.foldl (fun total frame => total + frameDataPayloadBytes frame) 0
+        = state.outboundConnectionWindow := by
+  intro frames
+  induction frames with
+  | nil =>
+      intro state state' h
+      change some state = some state' at h
+      cases h
+      simp
+  | cons frame frames ih =>
+      intro state state' h
+      simp only [List.foldlM_cons] at h
+      cases hstep : debitOutboundFrameDirect? state frame with
+      | none => simp [hstep] at h
+      | some nextState =>
+          simp only [hstep, Option.bind_some] at h
+          have htail := ih h
+          have hhead := debitOutboundFrameDirect?_conserves hstep
+          simp only [List.foldl_cons]
+          rw [dataPayloadBytesList_acc]
+          omega
+
+private theorem debitOutboundFramesDirect?_conserves {state state' : State}
+    {frames : Array Frame} (h : debitOutboundFramesDirect? state frames = some state') :
+    state'.outboundConnectionWindow + dataPayloadBytes frames
+      = state.outboundConnectionWindow := by
+  unfold debitOutboundFramesDirect? at h
+  have hlist := debitOutboundFramesDirectList?_conserves
+    (frames := frames.toList) (state := state) (state' := state')
+    (by simpa only [Array.foldlM_toList] using h)
+  simpa only [dataPayloadBytes, Array.foldl_toList] using hlist
+
+/-- Outbound conservation also covers the exact-fit queue fast path: every
+DATA byte returned for emission is debited once from the connection window,
+whether the batch bypasses the empty queue or falls back to `flushOutbound`. -/
+theorem queueOutbound_conserves (state : State) (frames : Array Frame) :
+    (queueOutbound state frames).1.outboundConnectionWindow
+        + dataPayloadBytes (queueOutbound state frames).2
+      = state.outboundConnectionWindow := by
+  unfold queueOutbound
+  split
+  next =>
+    split
+    next state' hdirect => exact debitOutboundFramesDirect?_conserves hdirect
+    next =>
+      simpa using (flushOutbound_conserves
+        { state with pendingOutbound := frames } #[])
+  next =>
+    simpa using (flushOutbound_conserves
+      { state with pendingOutbound := state.pendingOutbound.append frames } #[])
 
 /-! ### Deadlock freedom -/
 
