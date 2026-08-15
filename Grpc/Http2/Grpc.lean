@@ -275,8 +275,17 @@ private def dataFramesLoop (streamId offset maxSize : Nat) (payload : ByteArray)
       return frames
 
 def dataFrames (streamId : Nat) (payload : ByteArray)
-    (maxSize : Nat := defaultMaxFramePayloadLength) : Except Status (Array Frame) :=
-  dataFramesLoop streamId 0 maxSize payload #[]
+    (maxSize : Nat := defaultMaxFramePayloadLength) : Except Status (Array Frame) := do
+  if maxSize == 0 then
+    throw (Status.internal "HTTP/2 DATA frame max size must be positive")
+  else if payload.isEmpty then
+    pure #[]
+  else if payload.size <= maxSize then
+    -- Preserve a complete DATA payload instead of copying it through a
+    -- full-range `extract`.  Oversized payloads still use the splitter below.
+    pure #[dataFrame streamId payload]
+  else
+    dataFramesLoop streamId 0 maxSize payload #[]
 
 /-- Response headers, with `grpc-encoding: gzip` added when the response body
 is gzip-compressed. -/

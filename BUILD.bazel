@@ -578,6 +578,12 @@ lean_test(
 )
 
 lean_test(
+    name = "data_frames_test",
+    srcs = ["Test/DataFramesTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "reflection_descriptor_test",
     srcs = ["Test/ReflectionDescriptorTest.lean"],
     deps = [
