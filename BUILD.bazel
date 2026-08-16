@@ -672,6 +672,12 @@ lean_test(
     deps = [":grpc_lean"],
 )
 
+lean_test(
+    name = "header_normalize_name_test",
+    srcs = ["Test/HeaderNormalizeNameTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_binary(
     name = "hpack_benchmark",
     srcs = ["Benchmark/HpackBenchmark.lean"],
@@ -738,6 +744,13 @@ lean_binary(
 lean_binary(
     name = "metadata_ascii_benchmark",
     srcs = ["Benchmark/MetadataAsciiBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "header_normalize_name_benchmark",
+    srcs = ["Benchmark/HeaderNormalizeNameBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )
