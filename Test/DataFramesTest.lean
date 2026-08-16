@@ -67,6 +67,40 @@ def sameWireResult (left right : Except Status ByteArray) : Bool :=
   | .ok left, .ok right => left == right
   | _, _ => false
 
+def streamSignature (stream : Http2.Connection.StreamState) :
+    Nat × Array Http2.Frame × Option Nat × Option Nat :=
+  (stream.streamId, stream.frames, stream.endHeadersReceivedAt, stream.deadline)
+
+unsafe def testStreamRemoval : IO Unit := do
+  let streams : Array Http2.Connection.StreamState := #[
+    { streamId := 1, frames := #[legacyDataFrame 1 (payloadOfSize 1)] },
+    { streamId := 3, frames := #[legacyDataFrame 3 (payloadOfSize 3)],
+      endHeadersReceivedAt := some 30 },
+    { streamId := 3, frames := #[legacyDataFrame 3 (payloadOfSize 5)],
+      deadline := some 300 },
+    { streamId := 5, frames := #[legacyDataFrame 5 (payloadOfSize 7)] },
+    { streamId := 7, deadline := some 700 },
+    { streamId := 3, endHeadersReceivedAt := some 31, deadline := some 301 }
+  ]
+  let cases : Array (Array Http2.Connection.StreamState × Nat) := #[
+    (#[], 3),
+    (streams, 99),
+    (streams, 1),
+    (streams, 3),
+    (streams, 5),
+    (streams, 7)
+  ]
+  for (input, streamId) in cases do
+    let expected := input.filter (fun stream => stream.streamId != streamId)
+    let actual := Http2.Connection.removeStream input streamId
+    expect (actual.map streamSignature == expected.map streamSignature)
+      s!"stream removal changed retained values/order for id {streamId}"
+    expect (actual.size == expected.size)
+      s!"stream removal changed retained count for id {streamId}"
+    for index in [0:actual.size] do
+      expect (ptrEq actual[index]! expected[index]!)
+        s!"stream removal rebuilt retained state {index} for id {streamId}"
+
 def frame (frameType : Http2.FrameType) (flags : UInt8) (streamId : Nat)
     (payload : ByteArray) : Http2.Frame := {
   header := { length := payload.size, frameType, flags, streamId }
@@ -217,6 +251,7 @@ unsafe def main : IO Unit := do
   testZeroMax
   testExactFitReusesPayload
   testBatchEncoding
+  testStreamRemoval
   IO.println "DATA frame fast-path differential tests passed"
 
 end Test.DataFrames

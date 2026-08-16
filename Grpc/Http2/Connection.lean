@@ -474,8 +474,39 @@ def serverPrefaceBytes (maxConcurrentStreams : Option Nat := none)
 private def findStream? (streams : Array StreamState) (streamId : Nat) : Option StreamState :=
   streams.find? (fun stream => stream.streamId == streamId)
 
-def removeStream (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
+/-- Allocation-building stream-removal specification.  The executable path
+below is compared against this definition over empty, absent, duplicate, and
+ordered targets. -/
+private def removeStreamReference (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
   streams.filter (fun stream => stream.streamId != streamId)
+
+/-- Consuming order-preserving filter specialized to stream ids.  `eraseIdx`
+back-shifts and pops in place when the array is uniquely owned.  Continuing at
+the same index after an erase removes adjacent and non-adjacent duplicates, so
+this retains the reference filter's behavior without relying on `WellFormed`'s
+stream-id uniqueness.  Each step either retains or erases one original entry,
+which makes the original array size sufficient structural recursion fuel. -/
+private def removeStreamErasingFrom :
+    Nat → Array StreamState → Nat → Nat → Array StreamState
+  | 0, streams, _, _ => streams
+  | fuel + 1, streams, streamId, index =>
+      if h : index < streams.size then
+        if streams[index].streamId == streamId then
+          removeStreamErasingFrom fuel (streams.eraseIdx index h) streamId index
+        else
+          removeStreamErasingFrom fuel streams streamId (index + 1)
+      else
+        streams
+
+def removeStreamErasing (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
+  removeStreamErasingFrom streams.size streams streamId 0
+
+/-- Remove every state for `streamId` without reordering retained streams.
+The logical definition remains `Array.filter`; generated code uses the
+consuming erase implementation. -/
+@[implemented_by removeStreamErasing]
+def removeStream (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
+  removeStreamReference streams streamId
 
 private def appendStreamFrame (streams : Array StreamState) (frame : Frame) : Array StreamState :=
   (removeStream streams frame.header.streamId).push <|

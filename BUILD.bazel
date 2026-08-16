@@ -450,6 +450,7 @@ lean_assurance_test(
     expected_implemented_by = {
         "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
+        "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
     },
     expected_extern_declarations = {
