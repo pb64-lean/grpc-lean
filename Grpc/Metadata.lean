@@ -76,12 +76,61 @@ namespace Ascii
 def isLowercaseHeaderNameChar (c : Char) : Bool :=
   c.isLower || c.isDigit || c == '-' || c == '_' || c == '.'
 
+/-- Byte-level form of `isLowercaseHeaderNameChar`.  Every accepted character
+is one-byte ASCII, while every byte in a non-ASCII UTF-8 encoding is rejected. -/
+@[inline] private def isLowercaseHeaderNameByte (byte : UInt8) : Bool :=
+  (97 <= byte && byte <= 122) || (48 <= byte && byte <= 57) ||
+    byte == 45 || byte == 95 || byte == 46
+
+private def validHeaderNameBytesFrom (name : String) (index : Nat) : Bool :=
+  if h : index < name.utf8ByteSize then
+    let byte := name.getUTF8Byte ⟨index⟩ (by
+      simpa only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos] using h)
+    if isLowercaseHeaderNameByte byte then
+      validHeaderNameBytesFrom name (index + 1)
+    else
+      false
+  else
+    true
+termination_by name.utf8ByteSize - index
+
+/-- Allocation-free executable header-name validation over cached UTF-8
+bytes.  Empty names remain invalid. -/
+def validHeaderNameByteIndexed (name : String) : Bool :=
+  !name.isEmpty && validHeaderNameBytesFrom name 0
+
+/-- The character-level specification remains the logical definition used by
+proofs; generated code uses the differential-tested byte-indexed scan. -/
+@[implemented_by validHeaderNameByteIndexed]
 def validHeaderName (name : String) : Bool :=
   !name.isEmpty && name.all isLowercaseHeaderNameChar
 
 def isVisible (c : Char) : Bool :=
   let n := c.toNat
   0x20 <= n && n <= 0x7e
+
+private def visibleStringBytesFrom (value : String) (index : Nat) : Bool :=
+  if h : index < value.utf8ByteSize then
+    let byte := value.getUTF8Byte ⟨index⟩ (by
+      simpa only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos] using h)
+    if 0x20 <= byte && byte <= 0x7e then
+      visibleStringBytesFrom value (index + 1)
+    else
+      false
+  else
+    true
+termination_by value.utf8ByteSize - index
+
+/-- Allocation-free executable visible-ASCII validation over cached UTF-8
+bytes.  The empty string remains valid. -/
+def isVisibleStringByteIndexed (value : String) : Bool :=
+  visibleStringBytesFrom value 0
+
+/-- Character-level visible-ASCII specification.  Generated code uses the
+differential-tested byte-indexed scan. -/
+@[implemented_by isVisibleStringByteIndexed]
+def isVisibleString (value : String) : Bool :=
+  value.all isVisible
 
 end Ascii
 
@@ -501,7 +550,7 @@ def validateHeader (header : Header) : Except Status Unit := do
     match decodeBinaryHeaderValue header.name header.value with
     | .ok _ => pure ()
     | .error err => throw (Status.invalidArgument err)
-  else if header.value.all Ascii.isVisible then
+  else if Ascii.isVisibleString header.value then
     pure ()
   else
     throw (Status.invalidArgument s!"invalid ASCII gRPC metadata value for {header.name}")
