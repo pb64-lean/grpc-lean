@@ -719,6 +719,13 @@ lean_binary(
     deps = [":grpc_lean"],
 )
 
+lean_binary(
+    name = "stream_removal_benchmark",
+    srcs = ["Benchmark/StreamRemovalBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
 lean_test(
     name = "response_header_cache_test",
     srcs = ["Test/ResponseHeaderCacheTest.lean"],
