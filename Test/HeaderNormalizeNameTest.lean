@@ -98,6 +98,8 @@ private unsafe def testLowercaseIdentityObservation : IO Unit := do
     expect (normalized == raw) s!"lowercase identity value changed for {repr raw}"
     if ptrEq raw normalized then
       reused := reused + 1
+  expect (reused == cases.size) <|
+    s!"normalized lowercase names reused {reused}/{cases.size} input objects"
   IO.println <| s!"header normalization lowercase identity observation: " ++
     s!"reused={reused}/{cases.size}"
 

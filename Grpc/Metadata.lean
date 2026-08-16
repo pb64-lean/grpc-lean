@@ -18,6 +18,30 @@ abbrev Metadata := Array Header
 
 namespace Header
 
+@[inline] private def isAsciiNonUpperByte (byte : UInt8) : Bool :=
+  byte < 128 && !(65 <= byte && byte <= 90)
+
+private def isAsciiWithoutUpperFrom (name : String) (index : Nat) : Bool :=
+  if h : index < name.utf8ByteSize then
+    let byte := name.getUTF8Byte ⟨index⟩ (by
+      simpa only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos] using h)
+    if isAsciiNonUpperByte byte then
+      isAsciiWithoutUpperFrom name (index + 1)
+    else
+      false
+  else
+    true
+termination_by name.utf8ByteSize - index
+
+/-- Executable header-name normalization. Common already-normalized ASCII names
+retain their original String object; ASCII uppercase and every non-ASCII input
+fall back to the exact existing `String.toLower` behavior. -/
+def normalizeNameByteIndexed (name : String) : String :=
+  if isAsciiWithoutUpperFrom name 0 then name else name.toLower
+
+/-- Logical header-name normalization. Generated code first uses the
+differential-tested byte scan to reuse already-normalized ASCII names. -/
+@[implemented_by normalizeNameByteIndexed]
 def normalizeName (name : String) : String :=
   name.toLower
 
