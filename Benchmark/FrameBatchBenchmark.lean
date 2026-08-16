@@ -129,17 +129,25 @@ def main (args : List String) : IO Unit := do
   let rounds ← parsePositive "rounds" args[1]? 7
   unless rounds >= 3 && rounds % 2 == 1 do
     throw (IO.userError "rounds must be an odd integer of at least 3")
-  unless args.length <= 2 do
-    throw (IO.userError "usage: frame_batch_benchmark [iterations] [rounds]")
+  let selection? := args[2]?
+  if let some selection := selection? then
+    unless #["unary_128", "unary_16k", "unary_split"].contains selection do
+      throw (IO.userError s!"unknown benchmark selection: {selection}")
+  unless args.length <= 3 do
+    throw (IO.userError
+      "usage: frame_batch_benchmark [iterations] [rounds] [unary_128|unary_16k|unary_split]")
   let small ← makeFixture "unary_128" (unaryFrames #[128])
   let frameSized ← makeFixture "unary_16k"
     (unaryFrames #[Http2.defaultMaxFramePayloadLength])
   let split ← makeFixture "unary_split"
     (unaryFrames #[Http2.defaultMaxFramePayloadLength, 1024])
-  IO.println "benchmark=http2_frame_batch_v1 path=Connection.encodeFrames validation=pass"
+  let selection := selection?.getD "all"
+  IO.println <| "benchmark=http2_frame_batch_v1 path=Connection.encodeFrames " ++
+    s!"validation=pass selection={selection}"
   for fixture in #[small, frameSized, split] do
-    let mut samples := #[]
-    for _ in [0:rounds] do
-      samples := samples.push (← measureFixture fixture iterations)
-    report fixture iterations samples
+    if selection == "all" || selection == fixture.label then
+      let mut samples := #[]
+      for _ in [0:rounds] do
+        samples := samples.push (← measureFixture fixture iterations)
+      report fixture iterations samples
   IO.println "HTTP/2 frame-batch benchmark completed"
