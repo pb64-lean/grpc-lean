@@ -226,6 +226,43 @@ def encode (frame : Frame) : Except Status ByteArray := do
   let header ← encodeHeader frame.header
   pure (header.append frame.payload)
 
+/-!
+Batch emitters already own their destination buffer.  Encoding each frame to
+a temporary `header ++ payload` array and then appending that temporary to the
+batch copies every payload twice.  The helpers below retain `encode` as the
+public single-frame oracle while writing a validated batch directly into one
+pre-sized owner.
+-/
+@[inline] private def validateEncoding (frame : Frame) : Except Status Unit := do
+  if frame.header.length != frame.payload.size then
+    throw (Status.internal "HTTP/2 frame header length does not match payload size")
+  if frame.header.length > maxFramePayloadLength then
+    throw (Status.internal "HTTP/2 frame payload exceeds 24-bit length")
+  if frame.header.streamId > maxStreamId then
+    throw (Status.internal "HTTP/2 stream id exceeds 31-bit length")
+
+@[inline] private def appendEncodedUnchecked (out : ByteArray) (frame : Frame) : ByteArray :=
+  out
+    |>.push (UInt8.ofNat ((frame.header.length / 65536) % 256))
+    |>.push (UInt8.ofNat ((frame.header.length / 256) % 256))
+    |>.push (UInt8.ofNat (frame.header.length % 256))
+    |>.push frame.header.frameType.toUInt8
+    |>.push frame.header.flags
+    |>.push (UInt8.ofNat ((frame.header.streamId / 16777216) % 128))
+    |>.push (UInt8.ofNat ((frame.header.streamId / 65536) % 256))
+    |>.push (UInt8.ofNat ((frame.header.streamId / 256) % 256))
+    |>.push (UInt8.ofNat (frame.header.streamId % 256))
+    |>.append frame.payload
+
+/-- Encode a frame batch with one exact-capacity allocation and one payload
+copy per frame.  The validation pass fails before allocating the destination
+and preserves the first-error order of the legacy `foldlM Frame.encode` path. -/
+def encodeBatch (frames : Array Frame) : Except Status ByteArray := do
+  let capacity ← frames.foldlM (init := 0) fun total frame => do
+    validateEncoding frame
+    pure (total + frameHeaderSize + frame.payload.size)
+  pure (frames.foldl appendEncodedUnchecked (ByteArray.emptyWithCapacity capacity))
+
 structure DecodeState where
   buffered : ByteArray := ByteArray.empty
   frames : Array Frame := #[]

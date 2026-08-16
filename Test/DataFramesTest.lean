@@ -14,6 +14,12 @@ def payloadOfSize (size : Nat) : ByteArray :=
   (List.range size).foldl (fun payload value =>
     payload.push (UInt8.ofNat ((value * 37 + 11) % 251))) ByteArray.empty
 
+def zeroPayloadOfSize (size : Nat) : ByteArray := Id.run do
+  let mut payload := ByteArray.emptyWithCapacity size
+  for _ in [0:size] do
+    payload := payload.push 0
+  return payload
+
 def legacyDataFrame (streamId : Nat) (payload : ByteArray) : Http2.Frame := {
   header := {
     length := payload.size
@@ -48,6 +54,98 @@ def sameResult (left right : Except Status (Array Http2.Frame)) : Bool :=
 
 def joinedPayload (frames : Array Http2.Frame) : ByteArray :=
   frames.foldl (fun payload frame => payload.append frame.payload) ByteArray.empty
+
+/-- Pre-fusion batch encoder retained as a byte/error-order oracle. -/
+def legacyEncodeFrames (frames : Array Http2.Frame) : Except Status ByteArray :=
+  frames.foldlM (init := ByteArray.empty) fun out frame => do
+    let encoded ← Http2.Frame.encode frame
+    pure (out.append encoded)
+
+def sameWireResult (left right : Except Status ByteArray) : Bool :=
+  match left, right with
+  | .error left, .error right => left == right
+  | .ok left, .ok right => left == right
+  | _, _ => false
+
+def frame (frameType : Http2.FrameType) (flags : UInt8) (streamId : Nat)
+    (payload : ByteArray) : Http2.Frame := {
+  header := { length := payload.size, frameType, flags, streamId }
+  payload
+}
+
+def testBatchEncoding : IO Unit := do
+  let headers := frame .headers Http2.FrameFlag.endHeaders 1 (payloadOfSize 37)
+  let emptyData := frame .data 0 1 ByteArray.empty
+  let oneData := frame .data 0 3 (payloadOfSize 1)
+  let exactData := frame .data 0 5 (payloadOfSize Http2.defaultMaxFramePayloadLength)
+  let splitSizedData := frame .data Http2.FrameFlag.endStream 7
+    (payloadOfSize (Http2.defaultMaxFramePayloadLength + 1))
+  let trailers := frame .headers
+    (Http2.FrameFlag.combine #[Http2.FrameFlag.endHeaders, Http2.FrameFlag.endStream])
+    Http2.maxStreamId (payloadOfSize 19)
+  let batches : Array (Array Http2.Frame) := #[
+    #[],
+    #[emptyData],
+    #[oneData],
+    #[headers, exactData, trailers],
+    #[headers, oneData, splitSizedData, trailers]
+  ]
+  for frames in batches do
+    let legacy := legacyEncodeFrames frames
+    let fused := Http2.Frame.encodeBatch frames
+    let connection := Http2.Connection.encodeFrames frames
+    expect (sameWireResult legacy fused)
+      s!"batch encoder diverged for {frames.size} valid frames"
+    expect (sameWireResult legacy connection)
+      s!"connection batch encoder diverged for {frames.size} valid frames"
+    match legacy, fused with
+    | .ok expected, .ok actual =>
+      match Http2.Frame.decodeAll actual with
+      | .ok decoded => expect (decoded == frames) "fused batch did not decode to its frames"
+      | .error status => fail s!"fused batch failed to decode: {status.messageD}"
+      expect (actual == expected) "fused batch bytes changed after differential check"
+    | .error status, _ => fail s!"valid legacy batch failed: {status.messageD}"
+    | _, .error status => fail s!"valid fused batch failed: {status.messageD}"
+  let mismatch : Http2.Frame := {
+    header := { length := 2, frameType := .data, streamId := 1 }
+    payload := payloadOfSize 1
+  }
+  let mismatchBeforeStream : Http2.Frame := {
+    header := { length := 1, frameType := .data, streamId := Http2.maxStreamId + 1 }
+    payload := ByteArray.empty
+  }
+  let invalidStream : Http2.Frame := {
+    header := { length := 0, frameType := .headers, streamId := Http2.maxStreamId + 1 }
+  }
+  -- Construct the sole large boundary fixture without the temporary List used
+  -- by the small deterministic payload helper.  A matching 2^24-byte payload
+  -- reaches the header-length check and must still beat the invalid stream id.
+  let oversizedPayload := zeroPayloadOfSize (Http2.maxFramePayloadLength + 1)
+  let oversizedBeforeStream : Http2.Frame := {
+    header := {
+      length := oversizedPayload.size
+      frameType := .data
+      streamId := Http2.maxStreamId + 1
+    }
+    payload := oversizedPayload
+  }
+  let invalidBatches : Array (Array Http2.Frame) := #[
+    #[mismatch],
+    #[headers, mismatch, invalidStream],
+    #[mismatchBeforeStream],
+    #[oversizedBeforeStream],
+    #[headers, oversizedBeforeStream, invalidStream],
+    #[invalidStream],
+    #[headers, invalidStream, trailers]
+  ]
+  for frames in invalidBatches do
+    let legacy := legacyEncodeFrames frames
+    let fused := Http2.Frame.encodeBatch frames
+    let connection := Http2.Connection.encodeFrames frames
+    expect (sameWireResult legacy fused)
+      s!"batch encoder changed first error for {frames.size} invalid frames"
+    expect (sameWireResult legacy connection)
+      s!"connection encoder changed first error for {frames.size} invalid frames"
 
 def testPositiveCase (size streamId maxSize : Nat) : IO Unit := do
   let payload := payloadOfSize size
@@ -118,6 +216,7 @@ unsafe def main : IO Unit := do
   testBoundaryMatrix
   testZeroMax
   testExactFitReusesPayload
+  testBatchEncoding
   IO.println "DATA frame fast-path differential tests passed"
 
 end Test.DataFrames

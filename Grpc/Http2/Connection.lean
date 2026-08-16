@@ -4362,9 +4362,7 @@ def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) 
   Std.Async.Async.block (processBytesSharedWithOwned registry stateMutex chunk emit)
 
 def encodeFrames (frames : Array Frame) : Except Status ByteArray :=
-  frames.foldlM (init := ByteArray.empty) fun out frame => do
-    let bytes ← Frame.encode frame
-    pure (out.append bytes)
+  Frame.encodeBatch frames
 
 def expirePendingDeadlinesEncodedSharedWith (stateMutex : Std.Mutex State)
     (emit : ByteArray -> IO Unit) : IO (Except Status Unit) :=
