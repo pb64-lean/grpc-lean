@@ -712,6 +712,13 @@ lean_binary(
     deps = [":grpc_lean"],
 )
 
+lean_binary(
+    name = "frame_batch_benchmark",
+    srcs = ["Benchmark/FrameBatchBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
 lean_test(
     name = "response_header_cache_test",
     srcs = ["Test/ResponseHeaderCacheTest.lean"],
