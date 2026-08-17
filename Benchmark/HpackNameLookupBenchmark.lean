@@ -6,9 +6,10 @@ open Grpc
 # HPACK name-lookup normalization benchmark
 
 Compares the legacy lookup, which normalizes the query at every table probe,
-with the candidate that normalizes once before the static and dynamic scans.
-Fixture construction, exact comparison, and warmup stay outside the counted
-loop.  Run one mode and fixture per process under deterministic counters.
+with the production lookup that normalizes once before the static and dynamic
+scans. Fixture construction, exact comparison, and the selected mode's warmup
+stay outside the repeated measurement loop but remain in whole-process
+counters. Run one mode and fixture per process under deterministic counters.
 -/
 
 private def findNameInLegacy (entries : Array Header) (name : String)
@@ -82,11 +83,11 @@ private def fixture? : String → Option Fixture
     checksum := checksum + resultDigest (findNameLegacy state query)
   return checksum
 
-@[noinline] private def runHoisted (state : @& Http2.Hpack.State)
+@[noinline] private def runProduction (state : @& Http2.Hpack.State)
     (query : @& String) (iterations : Nat) : Nat := Id.run do
   let mut checksum := 0
   for _ in [0:iterations] do
-    checksum := checksum + resultDigest (findNameHoisted state query)
+    checksum := checksum + resultDigest (Http2.Hpack.findName? state query)
   return checksum
 
 private def parsePositive (label value : String) : IO Nat := do
@@ -101,24 +102,28 @@ def main (args : List String) : IO Unit := do
     | [mode, fixtureName, iterations] =>
       pure (mode, fixtureName, ← parsePositive "iterations" iterations)
     | _ => throw (IO.userError <|
-        "usage: hpack_name_lookup_benchmark (legacy|hoisted) " ++
+        "usage: hpack_name_lookup_benchmark (legacy|production) " ++
           "(early_static|middle_static|late_static|missing_lower|missing_upper|" ++
           "missing_unicode|dynamic_first|dynamic_last_upper) iterations")
   let some fixture := fixture? fixtureName
     | throw (IO.userError s!"unknown fixture: {fixtureName}")
   let expectedResult := findNameLegacy fixture.state fixture.query
-  unless findNameHoisted fixture.state fixture.query == expectedResult do
-    throw (IO.userError s!"{fixtureName}: hoisted/legacy result mismatch")
+  unless findNameHoisted fixture.state fixture.query == expectedResult &&
+      Http2.Hpack.findName? fixture.state fixture.query == expectedResult do
+    throw (IO.userError s!"{fixtureName}: production/legacy result mismatch")
   let expected := resultDigest expectedResult * iterations
   let warmupIterations := Nat.min iterations 1000
   let warmupExpected := resultDigest expectedResult * warmupIterations
-  unless runLegacy fixture.state fixture.query warmupIterations == warmupExpected &&
-      runHoisted fixture.state fixture.query warmupIterations == warmupExpected do
+  let warmupChecksum ← match mode with
+    | "legacy" => pure (runLegacy fixture.state fixture.query warmupIterations)
+    | "production" => pure (runProduction fixture.state fixture.query warmupIterations)
+    | _ => throw (IO.userError "mode must be legacy or production")
+  unless warmupChecksum == warmupExpected do
     throw (IO.userError s!"{fixtureName}: warmup checksum mismatch")
   let checksum ← match mode with
     | "legacy" => pure (runLegacy fixture.state fixture.query iterations)
-    | "hoisted" => pure (runHoisted fixture.state fixture.query iterations)
-    | _ => throw (IO.userError "mode must be legacy or hoisted")
+    | "production" => pure (runProduction fixture.state fixture.query iterations)
+    | _ => throw (IO.userError "mode must be legacy or production")
   unless checksum == expected do
     throw (IO.userError s!"checksum {checksum} != expected {expected}")
   IO.println <| s!"benchmark=hpack_name_lookup mode={mode} fixture={fixtureName} " ++
