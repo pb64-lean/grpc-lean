@@ -71,10 +71,50 @@ def singleton (name value : String) : Metadata :=
 @[expose] def get? (metadata : Metadata) (name : String) : Option String :=
   (getAll metadata name)[0]?
 
+private def getLastUSizeLoop (metadata : Metadata) (key : String)
+    (i : USize) (bound : i.toNat ≤ metadata.size) : Option String :=
+  if atStart : i = 0 then
+    none
+  else
+    have positive : 0 < i.toNat := by
+      have nonzero : i.toNat ≠ 0 := by
+        intro zero
+        apply atStart
+        exact USize.toNat_inj.mp (by simpa using zero)
+      omega
+    have oneLe : (1 : USize) ≤ i := by
+      rw [USize.le_iff_toNat_le]
+      simpa using positive
+    let previous := i - 1
+    have previousToNat : previous.toNat = i.toNat - 1 := by
+      simpa [previous] using USize.toNat_sub_of_le i 1 oneLe
+    have previousBound : previous.toNat < metadata.size := by
+      omega
+    let header := metadata.uget previous previousBound
+    if header.name == key then
+      some header.value
+    else
+      getLastUSizeLoop metadata key previous (Nat.le_of_lt previousBound)
+termination_by i.toNat
+decreasing_by
+  rw [USize.toNat_sub_of_le i 1 oneLe]
+  rw [USize.toNat_one]
+  omega
+
+private def getLastUSize (metadata : Metadata) (name : String) : Option String :=
+  let key := Header.normalizeName name
+  getLastUSizeLoop metadata key metadata.usize (by
+    simp only [Array.usize, Nat.toUSize_eq, USize.toNat_ofNat']
+    exact Nat.mod_le _ _)
+
 /-- Return the last value for a header name without materializing the complete
 array of matches. Header names use the same normalization and stored-name
-comparison as `getAll`. -/
-@[expose] def getLast? (metadata : Metadata) (name : String) : Option String :=
+comparison as `getAll`. The runtime implementation short-circuits a reverse
+scan with native indices and statically proved array bounds. Full-range
+coverage relies on Lean's documented runtime invariant that `Array.usize` is
+the exact size of every representable array. -/
+@[implemented_by getLastUSize, expose]
+def getLast? (metadata : Metadata) (name : String) : Option String :=
   let key := Header.normalizeName name
   metadata.findSomeRev? fun header =>
     if header.name == key then some header.value else none

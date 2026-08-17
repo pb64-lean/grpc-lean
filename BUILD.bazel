@@ -452,6 +452,7 @@ lean_assurance_test(
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
+        "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
@@ -764,6 +765,13 @@ lean_binary(
 lean_binary(
     name = "header_normalize_name_benchmark",
     srcs = ["Benchmark/HeaderNormalizeNameBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "metadata_get_last_benchmark",
+    srcs = ["Benchmark/MetadataGetLastBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )
