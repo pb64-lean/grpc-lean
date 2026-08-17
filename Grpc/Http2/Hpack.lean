@@ -541,15 +541,15 @@ private def findExactIn (entries : Array Header) (header : Header) (i start : Na
   termination_by entries.size - i
   decreasing_by omega
 
-private def findNameIn (entries : Array Header) (name : String) (i start : Nat) : Option Nat :=
+private def findNameIn (entries : Array Header) (key : String) (i start : Nat) : Option Nat :=
   if i >= entries.size then
     none
   else
     let entry := entries[i]!
-    if entry.name == Header.normalizeName name then
+    if entry.name == key then
       some (start + i)
     else
-      findNameIn entries name (i + 1) start
+      findNameIn entries key (i + 1) start
   termination_by entries.size - i
   decreasing_by omega
 
@@ -559,9 +559,10 @@ def findExact? (state : State) (header : Header) : Option Nat :=
   | none => findExactIn state.dynamic header 0 (staticEntries.size + 1)
 
 def findName? (state : State) (name : String) : Option Nat :=
-  match findNameIn staticEntries name 0 1 with
+  let key := Header.normalizeName name
+  match findNameIn staticEntries key 0 1 with
   | some index => some index
-  | none => findNameIn state.dynamic name 0 (staticEntries.size + 1)
+  | none => findNameIn state.dynamic key 0 (staticEntries.size + 1)
 
 structure DecodeResult where
   headers : Array Header
