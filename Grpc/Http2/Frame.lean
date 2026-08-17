@@ -275,7 +275,7 @@ private def parseFrame? (buffered : ByteArray) :
   if buffered.size < frameHeaderSize then
     .ok none
   else
-    match decodeHeader (buffered.extract 0 frameHeaderSize) with
+    match decodeHeader buffered with
     | .error status => .error status
     | .ok header =>
         if buffered.size < frameHeaderSize + header.length then
@@ -493,17 +493,10 @@ private theorem parseFrame?_encode {frame : Frame} {bs : ByteArray}
   have hsz : ((headerBytes frame.header ++ frame.payload) ++ rest).size
       = 9 + frame.payload.size + rest.size := by
     simp only [ByteArray.size_append, headerBytes_size]
-  have hextract9 : ((headerBytes frame.header ++ frame.payload) ++ rest).extract 0
-      frameHeaderSize = headerBytes frame.header := by
-    simp only [frameHeaderSize]
-    rw [ByteArray.extract_append, hAsz]
-    rw [show (0 : Nat) - (9 + frame.payload.size) = 0 from by omega,
-      show (9 : Nat) - (9 + frame.payload.size) = 0 from by omega]
-    rw [show rest.extract 0 0 = ByteArray.empty from by simp, ByteArray.append_empty]
-    exact ByteArray.extract_append_eq_left (by rw [headerBytes_size])
-  have hdec : decodeHeader (headerBytes frame.header) = .ok frame.header := by
-    have h := decodeHeader_encodeHeader_append hhb hft ByteArray.empty
-    rwa [ByteArray.append_empty] at h
+  have hdec : decodeHeader ((headerBytes frame.header ++ frame.payload) ++ rest)
+      = .ok frame.header := by
+    simpa only [ByteArray.append_assoc] using
+      decodeHeader_encodeHeader_append hhb hft (frame.payload ++ rest)
   have hpayload : ((headerBytes frame.header ++ frame.payload) ++ rest).extract
       frameHeaderSize (frameHeaderSize + frame.header.length) = frame.payload := by
     simp only [frameHeaderSize, hlen]
@@ -520,7 +513,7 @@ private theorem parseFrame?_encode {frame : Frame} {bs : ByteArray}
     exact ByteArray.extract_append_eq_right hAsz.symm (by rw [hAsz])
   unfold parseFrame?
   rw [if_neg (by simp only [frameHeaderSize, hsz]; omega)]
-  simp only [hextract9, hdec]
+  simp only [hdec]
   rw [if_neg (by simp only [frameHeaderSize, hsz, hlen]; omega)]
   rw [hpayload, hrest]
 
