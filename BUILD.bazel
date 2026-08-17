@@ -680,6 +680,12 @@ lean_test(
 )
 
 lean_test(
+    name = "metadata_get_last_test",
+    srcs = ["Test/MetadataGetLastTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "frame_header_decode_test",
     srcs = ["Test/FrameHeaderDecodeTest.lean"],
     deps = [":grpc_lean"],

@@ -71,6 +71,19 @@ def singleton (name value : String) : Metadata :=
 @[expose] def get? (metadata : Metadata) (name : String) : Option String :=
   (getAll metadata name)[0]?
 
+/-- Return the last value for a header name without materializing the complete
+array of matches. Header names use the same normalization and stored-name
+comparison as `getAll`. -/
+@[expose] def getLast? (metadata : Metadata) (name : String) : Option String :=
+  let key := Header.normalizeName name
+  metadata.findSomeRev? fun header =>
+    if header.name == key then some header.value else none
+
+/-- The reverse search is exactly the former `getAll`/`back?` composition. -/
+theorem getLast?_eq_getAll_back? (metadata : Metadata) (name : String) :
+    getLast? metadata name = (getAll metadata name).back? := by
+  simp [getLast?, getAll]
+
 def contains (metadata : Metadata) (name value : String) : Bool :=
   (getAll metadata name).contains value
 
