@@ -138,7 +138,7 @@ def decodeChunk (state : DecodeState) (chunk : ByteArray) : Except Status Decode
 
 def decodeAllWithLimit (maxDataSize? : Option Nat) (bytes : ByteArray) :
     Except Status (Array Message) := do
-  let state ← decodeChunkWithLimit maxDataSize? {} bytes
+  let state ← parseBuffered maxDataSize? bytes #[]
   if state.buffered.isEmpty then
     pure state.messages
   else
@@ -399,7 +399,7 @@ private theorem decodeChunkWithLimit_empty (maxDataSize? : Option Nat) (bytes : 
 theorem decodeAll_empty : decodeAll ByteArray.empty = .ok #[] := by
   unfold decodeAll decodeAllWithLimit
   simp only [bind, Except.bind, pure, Except.pure]
-  rw [decodeChunkWithLimit_empty, parseBuffered.eq_def]
+  rw [parseBuffered.eq_def]
   rfl
 
 /-- Residual-byte inversion: decoding `encode x ++ rest` under a limit that
@@ -413,7 +413,6 @@ theorem decodeAllWithLimit_encode_append {x : Message} {bs : ByteArray}
   have hchk := checkDataSize_le hlim
   unfold decodeAllWithLimit
   simp only [bind, Except.bind, pure, Except.pure, throw_eq]
-  rw [decodeChunkWithLimit_empty, decodeChunkWithLimit_empty]
   rw [parseBuffered_encode_append henc hchk rest #[]]
   rw [show (#[] : Array Message).push x = #[x] from rfl]
   rw [parseBuffered_acc maxDataSize? rest #[x]]
@@ -445,7 +444,6 @@ theorem decodeAllWithLimit_size_le {maxDataSize : Nat} {bytes : ByteArray}
     ∀ message ∈ messages, message.data.size ≤ maxDataSize := by
   unfold decodeAllWithLimit at h
   simp only [bind, Except.bind, pure, Except.pure, throw_eq] at h
-  rw [decodeChunkWithLimit_empty] at h
   split at h
   next => cases h
   next state hstate =>
