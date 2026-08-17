@@ -679,6 +679,12 @@ lean_test(
     deps = [":grpc_lean"],
 )
 
+lean_test(
+    name = "frame_header_decode_test",
+    srcs = ["Test/FrameHeaderDecodeTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_binary(
     name = "hpack_benchmark",
     srcs = ["Benchmark/HpackBenchmark.lean"],
@@ -752,6 +758,13 @@ lean_binary(
 lean_binary(
     name = "header_normalize_name_benchmark",
     srcs = ["Benchmark/HeaderNormalizeNameBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "frame_header_decode_benchmark",
+    srcs = ["Benchmark/FrameHeaderDecodeBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )
