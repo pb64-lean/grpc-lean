@@ -663,6 +663,12 @@ lean_test(
 )
 
 lean_test(
+    name = "hpack_name_lookup_test",
+    srcs = ["Test/HpackNameLookupTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "timeout_test",
     srcs = ["Test/TimeoutTest.lean"],
     deps = [":grpc_lean"],
@@ -765,6 +771,13 @@ lean_binary(
 lean_binary(
     name = "header_normalize_name_benchmark",
     srcs = ["Benchmark/HeaderNormalizeNameBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "hpack_name_lookup_benchmark",
+    srcs = ["Benchmark/HpackNameLookupBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )
