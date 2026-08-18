@@ -450,6 +450,7 @@ lean_assurance_test(
     expected_implemented_by = {
         "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
+        "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
         "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
@@ -765,6 +766,20 @@ lean_binary(
     name = "stream_removal_benchmark",
     srcs = ["Benchmark/StreamRemovalBenchmark.lean"],
     tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "stream_frame_append_benchmark",
+    srcs = ["Benchmark/StreamFrameAppendBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "stream_frame_append_test",
+    srcs = ["Benchmark/StreamFrameAppendBenchmark.lean"],
+    args = ["candidate", "present_first", "4", "1000", "0"],
     deps = [":grpc_lean"],
 )
 

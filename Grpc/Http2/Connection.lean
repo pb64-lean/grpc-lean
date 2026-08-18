@@ -508,11 +508,76 @@ consuming erase implementation. -/
 def removeStream (streams : Array StreamState) (streamId : Nat) : Array StreamState :=
   removeStreamReference streams streamId
 
-private def appendStreamFrame (streams : Array StreamState) (frame : Frame) : Array StreamState :=
+private def appendStreamFrameReference
+    (streams : Array StreamState) (frame : Frame) : Array StreamState :=
   (removeStream streams frame.header.streamId).push <|
     match findStream? streams frame.header.streamId with
     | some stream => { stream with frames := stream.frames.push frame }
     | none => { streamId := frame.header.streamId, frames := #[frame] }
+
+@[noinline] private def appendFoundStreamFrame
+    (streams : Array StreamState) (stream : StreamState) (frame : Frame) :
+    Array StreamState :=
+  streams.push { stream with frames := stream.frames.push frame }
+
+private def appendStreamFrameCandidate
+    (streams : Array StreamState) (frame : Frame) : Array StreamState :=
+  let streamId := frame.header.streamId
+  match findStream? streams streamId with
+  | some stream =>
+      -- Look up before consuming `streams`, so the executable erasing removal
+      -- can update a uniquely owned array in place.  Removal still deletes
+      -- every duplicate while the first matching state supplies the update.
+      let streams := removeStream streams streamId
+      appendFoundStreamFrame streams stream frame
+  | none =>
+      -- A failed lookup proves the defensive removal would be a no-op.
+      streams.push { streamId := streamId, frames := #[frame] }
+
+private theorem removeStream_eq_self_of_findStream?_eq_none
+    {streams : Array StreamState} {streamId : Nat}
+    (hfind : findStream? streams streamId = none) :
+    removeStream streams streamId = streams := by
+  unfold findStream? at hfind
+  unfold removeStream removeStreamReference
+  rw [Array.filter_eq_self]
+  intro stream hmem
+  have hne := (Array.find?_eq_none.mp hfind) stream hmem
+  simp only [beq_iff_eq] at hne
+  simpa [bne_iff_ne] using hne
+
+private theorem appendStreamFrameCandidate_eq_reference
+    (streams : Array StreamState) (frame : Frame) :
+    appendStreamFrameCandidate streams frame =
+      appendStreamFrameReference streams frame := by
+  unfold appendStreamFrameCandidate appendStreamFrameReference
+  split
+  next stream hfind => simp [hfind, appendFoundStreamFrame]
+  next hfind =>
+    simp [hfind, removeStream_eq_self_of_findStream?_eq_none hfind]
+
+/-- Append a frame to the first matching stream, remove every matching stream
+state, and move the updated state to the end.  A missing id appends a new
+state.  The proof-facing definition retains the former remove-then-find
+specification; generated code performs the proved lookup-first candidate. -/
+@[implemented_by appendStreamFrameCandidate]
+private def appendStreamFrame
+    (streams : Array StreamState) (frame : Frame) : Array StreamState :=
+  appendStreamFrameReference streams frame
+
+-- Keep these helpers `noinline`: they are ownership boundaries that let generated
+-- code transfer `state.streams` into the append without retaining it first.  A
+-- new HEADERS caller must compute its refusal decision before crossing the
+-- boundary; reading `state` afterwards would defeat that transfer.
+@[noinline] private def appendStreamFrameToState (state : State) (frame : Frame) : State :=
+  { state with streams := appendStreamFrame state.streams frame }
+
+@[noinline] private def appendNewStreamFrameToState (state : State) (frame : Frame)
+    (refusedInboundStreams : Array Nat) : State :=
+  { state with
+    lastClientStreamId := frame.header.streamId,
+    streams := appendStreamFrame state.streams frame,
+    refusedInboundStreams := refusedInboundStreams }
 
 private def replaceStream (streams : Array StreamState) (stream : StreamState) : Array StreamState :=
   (removeStream streams stream.streamId).push stream
@@ -2232,6 +2297,17 @@ private def decompressManagedUnaryBodyUntil
 
 namespace TestSupport
 
+/-- Exact former stream-frame append used as the focused differential oracle. -/
+@[noinline] def appendStreamFrameReferenceForBenchmark
+    (streams : Array StreamState) (frame : Frame) : Array StreamState :=
+  appendStreamFrameReference streams frame
+
+/-- Lookup-first stream-frame append used by production HEADERS and buffered
+unary DATA transitions. -/
+@[noinline] def appendStreamFrameCandidateForBenchmark
+    (streams : Array StreamState) (frame : Frame) : Array StreamState :=
+  appendStreamFrameCandidate streams frame
+
 /-- Benchmark seam for the exact dispatch-registration gate used by production
 dispatch tasks.  Keeping the adapter here avoids duplicating its task/promise
 behavior in measurement code. -/
@@ -3516,16 +3592,12 @@ private def processHeaders (registry : Registry) (state : State) (frame : Frame)
         | .error status => pure (.error status)
         | .ok (some rst) => pure (.ok (state, #[rst]))
         | .ok none =>
-            let state := {
-              state with
-              lastClientStreamId := frame.header.streamId,
-              streams := appendStreamFrame state.streams frame,
-              refusedInboundStreams :=
-                if (inboundStreamCapacityRefusal? state).isSome then
-                  pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
-                else
-                  state.refusedInboundStreams
-            }
+            let refusedInboundStreams :=
+              if (inboundStreamCapacityRefusal? state).isSome then
+                pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+              else
+                state.refusedInboundStreams
+            let state := appendNewStreamFrameToState state frame refusedInboundStreams
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
               | .error status => pure (.error status)
@@ -3559,16 +3631,12 @@ private def processHeadersWith (registry : Registry) (state : State) (frame : Fr
             | .error status => pure (.error status)
             | .ok () => pure (.ok state)
         | .ok none =>
-            let state := {
-              state with
-              lastClientStreamId := frame.header.streamId,
-              streams := appendStreamFrame state.streams frame,
-              refusedInboundStreams :=
-                if (inboundStreamCapacityRefusal? state).isSome then
-                  pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
-                else
-                  state.refusedInboundStreams
-            }
+            let refusedInboundStreams :=
+              if (inboundStreamCapacityRefusal? state).isSome then
+                pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+              else
+                state.refusedInboundStreams
+            let state := appendNewStreamFrameToState state frame refusedInboundStreams
             if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
               match ← authorizeRequestHeadersForStream registry state frame.header.streamId with
               | .error status => pure (.error status)
@@ -3670,7 +3738,7 @@ private def processData (registry : Registry) (state : State) (frame : Frame) :
               match stripPadding frame "DATA" with
               | .error status => pure (.error status)
               | .ok frame =>
-                let state := { state with streams := appendStreamFrame state.streams frame }
+                let state := appendStreamFrameToState state frame
                 if FrameFlag.has frame.header.flags FrameFlag.endStream then
                   match (← finalizeStream registry state frame.header.streamId) with
                   | .ok (state, frames) => pure (.ok (state, updates.append frames))
@@ -3707,7 +3775,7 @@ private def processDataWith (registry : Registry) (state : State) (frame : Frame
               match stripPadding frame "DATA" with
               | .error status => pure (.error status)
               | .ok frame =>
-                let state := { state with streams := appendStreamFrame state.streams frame }
+                let state := appendStreamFrameToState state frame
                 match ← emitFrameBatch emit updates with
                 | .error status => pure (.error status)
                 | .ok () =>
@@ -3854,16 +3922,13 @@ def prepareHeadersShared (state : State) (frame : Frame) :
       -- Over the concurrency limit the stream is still opened, so its field
       -- block reaches the HPACK decoder (RFC 9113 §4.3); it is marked for
       -- RST_STREAM(REFUSED_STREAM) the moment the block has been read.
-      pure ({
-        state with
-        lastClientStreamId := frame.header.streamId,
-        streams := appendStreamFrame state.streams frame,
-        refusedInboundStreams :=
-          if (inboundStreamCapacityRefusal? state).isSome then
-            pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
-          else
-            state.refusedInboundStreams
-      }, none)
+      let refusedInboundStreams :=
+        if (inboundStreamCapacityRefusal? state).isSome then
+          pushUniqueStreamId state.refusedInboundStreams frame.header.streamId
+        else
+          state.refusedInboundStreams
+      let state := appendNewStreamFrameToState state frame refusedInboundStreams
+      pure (state, none)
 
 private def processHeadersShared (registry : Registry) (state : State) (frame : Frame)
     (receivedAt : Option Nat := none) :
@@ -4079,11 +4144,8 @@ def processUnaryRequestData (state : State) (frame : Frame) :
           match stripPadding frame "DATA" with
           | .error status => .error status
           | .ok stripped =>
-            let buffered := {
-              replenishInboundDataWindow consumed frame with
-              streams := appendStreamFrame
-                (replenishInboundDataWindow consumed frame).streams stripped
-            }
+            let buffered := appendStreamFrameToState
+              (replenishInboundDataWindow consumed frame) stripped
             if FrameFlag.has stripped.header.flags FrameFlag.endStream then
               match detachStreamForDispatch buffered stripped.header.streamId with
               | .error status => .error status
@@ -5514,7 +5576,7 @@ private theorem mem_appendStreamFrame_of_found {streams : Array StreamState} {fr
     {old : StreamState} (hfind : findStream? streams frame.header.streamId = some old)
     {s : StreamState} (h : s ∈ appendStreamFrame streams frame) :
     s ∈ streams ∨ s = { old with frames := old.frames.push frame } := by
-  unfold appendStreamFrame at h
+  unfold appendStreamFrame appendStreamFrameReference at h
   rw [hfind] at h
   cases Array.mem_push.mp h with
   | inl hmem => exact Or.inl (mem_removeStream hmem)
@@ -5526,7 +5588,7 @@ private theorem mem_appendStreamFrame_of_new {streams : Array StreamState} {fram
     (hfind : findStream? streams frame.header.streamId = none)
     {s : StreamState} (h : s ∈ appendStreamFrame streams frame) :
     s ∈ streams ∨ s = { streamId := frame.header.streamId, frames := #[frame] } := by
-  unfold appendStreamFrame at h
+  unfold appendStreamFrame appendStreamFrameReference at h
   rw [hfind] at h
   cases Array.mem_push.mp h with
   | inl hmem => exact Or.inl (mem_removeStream hmem)
@@ -6575,6 +6637,7 @@ theorem prepareHeadersShared_wellFormed {state : State} {frame : Frame}
           next =>
             -- Whether or not the stream is marked for refusal, the stream table
             -- and every field `WellFormed` constrains take the same shape.
+            unfold appendNewStreamFrameToState at heq
             split at heq <;>
               (cases heq
                exact {
