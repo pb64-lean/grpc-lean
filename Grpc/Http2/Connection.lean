@@ -2279,22 +2279,6 @@ private def emitCommittedUnaryTerminal (emit : Array Frame -> IO Unit)
       | .ok () => pure (.ok true)
       | .error status => pure (.error status)
 
-/-- Decompression is part of managed unary execution, but it stays off the
-successful request's clock-read path.  If an error finishes at/after the
-absolute boundary, local self-expiry must beat that earlier-phase status even
-when the scheduler callback is delayed. -/
-private def decompressManagedUnaryBodyUntil
-    (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray)
-    (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
-    BaseIO (Except Status ByteArray) := do
-  match Message.decompressBody usesGzip maxDataSize? body with
-  | .ok body => pure (.ok body)
-  | .error status =>
-      if deadline <= (← now) then
-        pure (.error Deadline.exceededStatus)
-      else
-        pure (.error status)
-
 namespace TestSupport
 
 /-- Exact former stream-frame append used as the focused differential oracle. -/
@@ -2314,12 +2298,6 @@ behavior in measurement code. -/
 def waitUntilDispatchRegisteredForBenchmark
     (registered : IO.Promise Unit) : Std.Async.Async Unit :=
   waitUntilDispatchRegistered registered
-
-/-- Exact production error-path seam for managed unary decompression. -/
-def decompressManagedUnaryBodyUntilForBenchmark
-    (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray)
-    (deadline : Nat) (now : BaseIO Nat) : BaseIO (Except Status ByteArray) :=
-  decompressManagedUnaryBodyUntil usesGzip maxDataSize? body deadline now
 
 /-- Exact production primitives owned by one managed deadline benchmark call.
 The benchmark retains `task` before invoking `publish`, matching the dispatch
@@ -2660,13 +2638,9 @@ private def spawnManagedUnaryTerminalDispatch (registry : Registry)
       if ← cancelled.get then
         cancelUnaryTerminal owner
       else if (← unaryTerminalPhase owner) == .open then
-        let result ← match ← decompressManagedUnaryBodyUntil
-            managed.preflight.requestUsesGzip registry.maxReceiveMessageSize
-            detached.request.body managed.deadline with
-          | .error status => pure (.error status)
-          | .ok body =>
-              registry.dispatchManagedUnaryInlineUntilAsync detached.request.metadata
-                body managed.preflight managed.handler managed.deadline
+        let result ← registry.dispatchManagedUnaryTransportBodyInlineUntilAsync
+          detached.request.metadata detached.request.body managed.preflight
+          managed.handler managed.deadline
         let kind := match result with
           | .error status =>
               if status.code == Code.deadlineExceeded then

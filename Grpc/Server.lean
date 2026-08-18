@@ -766,20 +766,23 @@ private def withDeadlineUntil (deadline? : Option Nat) (stream : MessageStream �
     cancel := stream.cancel
   }
 
-private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (headerDeadline : Option Nat := none)
-    (trustedPreflight? : Option Headers.RequestPreflight := none) :
-    GrpcM UnaryRequest := do
-  let (method, timeout, deadline?) ← match trustedPreflight? with
+private def decodeUnaryRequestHeaders (metadata : Metadata) (bodySize : Nat)
+    (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight) :
+    GrpcM (MethodName × Option Timeout × Option Nat) := do
+  match trustedPreflight? with
     | none => do
         let method ← GrpcM.ofExcept (Headers.validateUnaryRequestHeaders metadata)
         let timeout ← GrpcM.ofExcept (Headers.timeout? metadata)
-        GrpcM.ofExcept (Headers.validateContentLength metadata body.size)
+        GrpcM.ofExcept (Headers.validateContentLength metadata bodySize)
         pure (method, timeout, ← deadlineForTimeout timeout headerDeadline)
     | some preflight => do
-        GrpcM.ofExcept (Headers.validateContentLengthValue preflight.contentLength body.size)
+        GrpcM.ofExcept (Headers.validateContentLengthValue preflight.contentLength bodySize)
         pure (preflight.method, preflight.timeout, headerDeadline)
-  let messages : Array Message ← GrpcM.ofExcept (Message.decodeAllWithLimit registry.maxReceiveMessageSize body)
+
+private def unaryRequestFromIdentityMessages (metadata : Metadata)
+    (method : MethodName) (timeout : Option Timeout) (deadline? : Option Nat)
+    (messages : Array Message) : GrpcM UnaryRequest := do
   if messages.size != 1 then
     throw (Status.invalidArgument s!"unary request expected one message, got {messages.size}")
   let message : Message := messages[0]!
@@ -792,6 +795,42 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
     deadline := deadline?,
     data := message.data
   }
+
+private def decodeUnaryRequestFromIdentityMessages (metadata : Metadata)
+    (bodySize : Nat) (messages : Array Message)
+    (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM UnaryRequest := do
+  let (method, timeout, deadline?) ←
+    decodeUnaryRequestHeaders metadata bodySize headerDeadline trustedPreflight?
+  unaryRequestFromIdentityMessages metadata method timeout deadline? messages
+
+private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM UnaryRequest := do
+  let (method, timeout, deadline?) ←
+    decodeUnaryRequestHeaders metadata body.size headerDeadline trustedPreflight?
+  let messages : Array Message ←
+    GrpcM.ofExcept (Message.decodeAllWithLimit registry.maxReceiveMessageSize body)
+  unaryRequestFromIdentityMessages metadata method timeout deadline? messages
+
+/-- Validate/decompress one transport aggregate and consume its first framing
+pass directly when it is already entirely identity-framed. Compressed bodies
+retain the established normalize/re-encode/body-decode path. -/
+private def decodeUnaryTransportBody (registry : Registry) (metadata : Metadata)
+    (usesGzip : Bool) (body : ByteArray)
+    (headerDeadline : Option Nat := none)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM UnaryRequest := do
+  let prepared ← GrpcM.ofExcept <|
+    Message.prepareBody usesGzip registry.maxReceiveMessageSize body
+  match prepared with
+  | .identity messages =>
+      decodeUnaryRequestFromIdentityMessages metadata body.size messages
+        headerDeadline trustedPreflight?
+  | .rewritten normalized =>
+      decodeUnaryRequest registry metadata normalized headerDeadline trustedPreflight?
 
 private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata)
     (body : ByteArray) (headerDeadline : Option Nat := none)
@@ -891,11 +930,8 @@ private def runPreparedDispatch (prepared : PreparedDispatch α)
         pure (.error status)
     | .ok value => pure (.ok value)
 
-private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (body : ByteArray)
-    (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
-    (trustedPreflight? : Option Headers.RequestPreflight := none) :
-    GrpcM (PreparedDispatch UnaryResponse) := do
-  let request ← decodeUnaryRequest registry metadata body headerDeadline trustedPreflight?
+private def prepareUnaryRequestDispatch (registry : Registry) (request : UnaryRequest)
+    (handler? : Option UnaryHandler) : GrpcM (PreparedDispatch UnaryResponse) := do
   let handler ← match handler? with
     | some handler => pure handler
     | none =>
@@ -908,6 +944,22 @@ private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (bo
       let response ← handler request
       validateUnaryResponse registry response
   }
+
+private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (body : ByteArray)
+    (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM (PreparedDispatch UnaryResponse) := do
+  let request ← decodeUnaryRequest registry metadata body headerDeadline trustedPreflight?
+  prepareUnaryRequestDispatch registry request handler?
+
+private def prepareUnaryTransportBodyDispatch (registry : Registry)
+    (metadata : Metadata) (usesGzip : Bool) (body : ByteArray)
+    (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
+    (trustedPreflight? : Option Headers.RequestPreflight := none) :
+    GrpcM (PreparedDispatch UnaryResponse) := do
+  let request ← decodeUnaryTransportBody registry metadata usesGzip body
+    headerDeadline trustedPreflight?
+  prepareUnaryRequestDispatch registry request handler?
 
 private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata : Metadata)
     (body : ByteArray) (handler? : Option ServerStreamingStreamHandler)
@@ -994,6 +1046,24 @@ def dispatchUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteA
   | .error status => pure (.error status)
   | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
 
+/-- Transport unary dispatch with request decompression. The message encoding
+is derived from the request metadata, and the raw aggregate is validated
+against this registry's receive limit. Successful all-identity requests
+transfer the first decoded message array into unary preparation. -/
+def dispatchUnaryTransportBodyAsync (registry : Registry) (metadata : Metadata)
+    (body : ByteArray)
+    (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none)
+    (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match Headers.requestUsesGzip metadata with
+  | .error status => pure (.error status)
+  | .ok usesGzip =>
+      match ← runHandler
+          (prepareUnaryTransportBodyDispatch registry metadata usesGzip body handler?
+            headerDeadline) with
+      | .error status => pure (.error status)
+      | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
+
 /-- Managed-transport dispatch for a request whose original metadata has
 already produced the supplied preflight and authorized handler capability. -/
 def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
@@ -1004,6 +1074,34 @@ def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body 
       (prepareUnaryDispatch registry metadata body (some handler) deadline (some preflight)) with
   | .error status => pure (.error status)
   | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
+
+/-- Managed-transport counterpart of `dispatchUnaryTransportBodyAsync` using
+the retained preflight and authorized handler capability. -/
+def dispatchManagedUnaryTransportBodyAsync (registry : Registry)
+    (metadata : Metadata) (body : ByteArray)
+    (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
+    (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler
+      (prepareUnaryTransportBodyDispatch registry metadata
+        preflight.requestUsesGzip body (some handler) deadline (some preflight)) with
+  | .error status => pure (.error status)
+  | .ok prepared => runPreparedDispatchAsync prepared (runtime? := runtime?)
+
+/-- Shared exact-deadline bracket after a unary request has been decoded. -/
+private def dispatchManagedUnaryRequestInlineUntilAsync (registry : Registry)
+    (request : UnaryRequest) (handler : UnaryHandler) (deadline : Nat)
+    (now : BaseIO Nat) : Std.Async.Async (Except Status UnaryResponse) := do
+  if deadline <= (← now) then
+    pure (.error Deadline.exceededStatus)
+  else
+    let result ← runHandler do
+      let response ← handler request
+      validateUnaryResponse registry response
+    if deadline <= (← now) then
+      pure (.error Deadline.exceededStatus)
+    else
+      pure result
 
 /-- Run one trusted managed-unary handler inline against a required absolute
 monotonic deadline.  `now` is read immediately before and after the arbitrary
@@ -1030,16 +1128,27 @@ def dispatchManagedUnaryInlineUntilAsync (registry : Registry) (metadata : Metad
       else
         pure (.error status)
   | .ok request =>
+      dispatchManagedUnaryRequestInlineUntilAsync registry request handler deadline now
+
+/-- Connection-owner managed unary dispatch from the raw transport aggregate.
+Framing, decompression, cached-header, cardinality, and handler errors preserve
+the exact deadline precedence and clock brackets of the former two-stage path,
+while an identity body is parsed only once. -/
+def dispatchManagedUnaryTransportBodyInlineUntilAsync (registry : Registry)
+    (metadata : Metadata) (body : ByteArray)
+    (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
+    (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
+    Std.Async.Async (Except Status UnaryResponse) := do
+  match ← runHandler
+      (decodeUnaryTransportBody registry metadata preflight.requestUsesGzip body
+        (some deadline) (some preflight)) with
+  | .error status =>
       if deadline <= (← now) then
         pure (.error Deadline.exceededStatus)
       else
-        let result ← runHandler do
-          let response ← handler request
-          validateUnaryResponse registry response
-        if deadline <= (← now) then
-          pure (.error Deadline.exceededStatus)
-        else
-          pure result
+        pure (.error status)
+  | .ok request =>
+      dispatchManagedUnaryRequestInlineUntilAsync registry request handler deadline now
 
 def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none)

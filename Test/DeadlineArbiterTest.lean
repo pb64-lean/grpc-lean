@@ -208,18 +208,24 @@ private def testInlineDecodeErrorAtDeadlineSelfExpires : IO Unit := do
   expect ((← observed) == #[100])
     "decode-error self-expiry did not read the exact boundary once"
 
-/-- Production decompression errors use the same local boundary rule without
-adding a clock read to successful decompression. -/
-private def testDecompressionErrorAtDeadlineSelfExpires : IO Unit := do
+/-- Production transport framing errors use the same local boundary rule
+without entering the handler. -/
+private def testTransportFramingErrorAtDeadlineSelfExpires : IO Unit := do
   let malformed := ByteArray.mk #[0xff, 0x00, 0x01]
+  let handlerCalls ← IO.mkRef 0
+  let handler : UnaryHandler := fun _ => do
+    handlerCalls.modify (fun calls => calls + 1)
+    pure { status := Status.ok }
   let (now, observed) ← scriptedClock #[100]
-  let result ←
-    Http2.Connection.TestSupport.decompressManagedUnaryBodyUntilForBenchmark
-      false none malformed 100 now
+  let result ← Std.Async.Async.block <|
+    Registry.empty.dispatchManagedUnaryTransportBodyInlineUntilAsync
+      metadata malformed preflight handler 100 now
   discard <| expectStatus result .deadlineExceeded
-    "decompression error at exact deadline self-expiry"
+    "transport framing error at exact deadline self-expiry"
+  expect ((← handlerCalls.get) == 0)
+    "transport framing self-expiry entered arbitrary handler IO"
   expect ((← observed) == #[100])
-    "decompression-error self-expiry did not read the exact boundary once"
+    "transport framing self-expiry did not read the exact boundary once"
 
 /-- A response wins once, releases scheduler custody, and ignores both late
 expiry and late scheduler-failure callbacks. -/
@@ -512,7 +518,7 @@ def run : IO Unit := do
   testInlinePostHandlerExactDeadlineSelfExpiry
   testInlineExactDeadlineSuppressesHandler
   testInlineDecodeErrorAtDeadlineSelfExpires
-  testDecompressionErrorAtDeadlineSelfExpires
+  testTransportFramingErrorAtDeadlineSelfExpires
   testBeforeDeadlineSuccessAndLateExpiry
   testExpiryWhileHandlerBlocked
   testClaimedExpiryRetainsLosingOuter

@@ -742,6 +742,13 @@ lean_binary(
 )
 
 lean_binary(
+    name = "unary_identity_decode_reuse_benchmark",
+    srcs = ["Benchmark/UnaryIdentityDecodeReuseBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
     name = "unary_body_benchmark",
     srcs = ["Benchmark/UnaryBodyBenchmark.lean"],
     tags = ["manual"],
@@ -853,6 +860,12 @@ lean_library(
 lean_test(
     name = "unary_call_test",
     srcs = ["Test/UnaryCallTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "unary_identity_decode_reuse_test",
+    srcs = ["Test/UnaryIdentityDecodeReuseTest.lean"],
     deps = [":grpc_lean"],
 )
 

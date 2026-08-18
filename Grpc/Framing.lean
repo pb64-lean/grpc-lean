@@ -573,6 +573,44 @@ def gzipped (data : ByteArray) : Message :=
   else
     { data := data }
 
+/-- Result of validating and normalizing a complete aggregate request body.
+
+The common all-identity case retains the exact messages produced by the first
+framing pass so a unary transport can consume them without parsing the same
+body again. A body containing at least one compressed message retains the
+historical re-encoded identity body instead. Public dispatch entry points
+still accept and validate raw bodies; this carrier is not an authorization or
+input-validation capability. -/
+inductive BodyPreparation where
+  | identity (messages : Array Message)
+  | rewritten (body : ByteArray)
+
+def BodyPreparation.body : BodyPreparation → ByteArray → ByteArray
+  | .identity _, original => original
+  | .rewritten body, _ => body
+
+private def rewriteCompressedBody (usesGzip : Bool) (maxDataSize? : Option Nat)
+    (messages : Array Message) : Except Status ByteArray := do
+  let maxSize := maxDataSize?.getD defaultMaxDecompressedSize
+  messages.foldlM (init := ByteArray.empty) fun out message => do
+    let message ← decompress usesGzip maxSize message
+    let encoded ← encode message
+    pure (out.append encoded)
+
+/-- Validate and normalize a complete aggregate body while retaining the
+first framing result when every message already has the identity flag.
+
+This has the same three-phase error order as `decompressBody`: validate every
+frame first, then decompress/re-encode left-to-right if any frame is marked
+compressed, leaving unary cardinality checks to the downstream dispatcher. -/
+def prepareBody (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray) :
+    Except Status BodyPreparation := do
+  let messages ← decodeAllWithLimit maxDataSize? body
+  if messages.all (fun message => message.compressed == .identity) then
+    pure (.identity messages)
+  else
+    pure (.rewritten (← rewriteCompressedBody usesGzip maxDataSize? messages))
+
 /-- Decode a length-prefixed request body, decompress any gzip-compressed
 messages, and re-encode with identity flags so downstream handlers see plain
 payloads. Bodies with no compressed messages pass through unchanged. -/
@@ -582,11 +620,24 @@ def decompressBody (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArr
   if messages.all (fun message => message.compressed == .identity) then
     pure body
   else
-    let maxSize := maxDataSize?.getD defaultMaxDecompressedSize
-    messages.foldlM (init := ByteArray.empty) fun out message => do
-      let message ← decompress usesGzip maxSize message
-      let encoded ← encode message
-      pure (out.append encoded)
+    rewriteCompressedBody usesGzip maxDataSize? messages
+
+/-- `prepareBody` is a cache-carrying form of `decompressBody`, not a new
+normalization policy.  Forgetting its retained identity messages yields the
+exact public body result. -/
+theorem prepareBody_body (usesGzip : Bool) (maxDataSize? : Option Nat)
+    (body : ByteArray) :
+    (prepareBody usesGzip maxDataSize? body).map (fun prepared => prepared.body body)
+      = decompressBody usesGzip maxDataSize? body := by
+  unfold prepareBody decompressBody
+  cases hdecode : decodeAllWithLimit maxDataSize? body with
+  | error status => rfl
+  | ok messages =>
+      simp only [bind, Except.bind]
+      split
+      next => rfl
+      next =>
+        cases hrewrite : rewriteCompressedBody usesGzip maxDataSize? messages <;> rfl
 
 end Message
 

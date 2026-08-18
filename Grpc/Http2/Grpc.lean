@@ -832,6 +832,11 @@ def encodeServerStreamingStreamResponseFrames (state : Hpack.State) (streamId : 
   | .error status => pure (.error status)
   | .ok state => pure (.ok (← framesRef.get, state))
 
+private def decompressRequestBodyFromMetadata (registry : @& Registry)
+    (metadata : @& Metadata) (body : @& ByteArray) : Except Status ByteArray := do
+  let usesGzip ← Headers.requestUsesGzip metadata
+  Message.decompressBody usesGzip registry.maxReceiveMessageSize body
+
 def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : Hpack.State)
     (request : UnaryRequestFrames) (emit : Array Frame -> IO Unit)
     (maxDataFrameSize : Nat := defaultMaxFramePayloadLength)
@@ -878,24 +883,19 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
     messages := { recv? := pure none },
     status := status
   }
-  let decompressBodyWith (usesGzip : Bool) : Except Status ByteArray :=
-    Message.decompressBody usesGzip registry.maxReceiveMessageSize request.body
-  let decompressBodyFromMetadata : Except Status ByteArray := do
-    let usesGzip ← Headers.requestUsesGzip request.metadata
-    decompressBodyWith usesGzip
   let runEntry (entry : MethodEntry) :
       Std.Async.Async (Except Status UnaryDispatchStateResult) := do
-    match decompressBodyFromMetadata with
-    | .error status => encodeUnary { status := status, data := ByteArray.empty }
-    | .ok body =>
-      match entry.dispatchHandler with
-      | .unary handler =>
-          match (← registry.dispatchUnaryAsync
-              request.metadata body (some handler) request.deadline runtime?) with
-          | .ok response => encodeUnary response
-          | .error status =>
-              encodeUnary { status := status, data := ByteArray.empty }
-      | .serverStreaming handler =>
+    match entry.dispatchHandler with
+    | .unary handler =>
+        match (← registry.dispatchUnaryTransportBodyAsync request.metadata
+            request.body (some handler) request.deadline runtime?) with
+        | .ok response => encodeUnary response
+        | .error status =>
+            encodeUnary { status := status, data := ByteArray.empty }
+    | .serverStreaming handler =>
+        match decompressRequestBodyFromMetadata registry request.metadata request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchServerStreamingStreamAsync
               request.metadata body (some handler) request.deadline runtime?) with
           | .ok (response, deadline) => encodeStreaming response deadline
@@ -905,13 +905,19 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
               -- already-selected terminal status; starting another race at
               -- the expired instant would overwrite the original join handle.
               encodeStreaming (emptyStreamingResponse status) none
-      | .clientStreaming handler =>
+    | .clientStreaming handler =>
+        match decompressRequestBodyFromMetadata registry request.metadata request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchClientStreamingAsync
               request.metadata body (some handler) request.deadline runtime?) with
           | .ok response => encodeUnary response
           | .error status =>
               encodeUnary { status := status, data := ByteArray.empty }
-      | .bidirectionalStreaming handler =>
+    | .bidirectionalStreaming handler =>
+        match decompressRequestBodyFromMetadata registry request.metadata request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchBidirectionalStreamingStreamAsync
               request.metadata body (some handler) request.deadline runtime?) with
           | .ok (response, deadline) => encodeStreaming response deadline
@@ -919,28 +925,37 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
               encodeStreaming (emptyStreamingResponse status) none
   let runManagedEntry (entry : MethodEntry) (preflight : Headers.RequestPreflight) :
       Std.Async.Async (Except Status UnaryDispatchStateResult) := do
-    match decompressBodyWith preflight.requestUsesGzip with
-    | .error status => encodeUnary { status := status, data := ByteArray.empty }
-    | .ok body =>
-      match entry.dispatchHandler with
-      | .unary handler =>
-          match (← registry.dispatchManagedUnaryAsync request.metadata body preflight
-              handler request.deadline runtime?) with
-          | .ok response => encodeUnary response
-          | .error status =>
-              encodeUnary { status := status, data := ByteArray.empty }
-      | .serverStreaming handler =>
+    match entry.dispatchHandler with
+    | .unary handler =>
+        match (← registry.dispatchManagedUnaryTransportBodyAsync request.metadata
+            request.body preflight handler request.deadline runtime?) with
+        | .ok response => encodeUnary response
+        | .error status =>
+            encodeUnary { status := status, data := ByteArray.empty }
+    | .serverStreaming handler =>
+        match Message.decompressBody preflight.requestUsesGzip
+            registry.maxReceiveMessageSize request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchManagedServerStreamingStreamAsync
               request.metadata body preflight handler request.deadline runtime?) with
           | .ok (response, deadline) => encodeStreaming response deadline
           | .error status => encodeStreaming (emptyStreamingResponse status) none
-      | .clientStreaming handler =>
+    | .clientStreaming handler =>
+        match Message.decompressBody preflight.requestUsesGzip
+            registry.maxReceiveMessageSize request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchManagedClientStreamingAsync request.metadata body
               preflight handler request.deadline runtime?) with
           | .ok response => encodeUnary response
           | .error status =>
               encodeUnary { status := status, data := ByteArray.empty }
-      | .bidirectionalStreaming handler =>
+    | .bidirectionalStreaming handler =>
+        match Message.decompressBody preflight.requestUsesGzip
+            registry.maxReceiveMessageSize request.body with
+        | .error status => encodeUnary { status := status, data := ByteArray.empty }
+        | .ok body =>
           match (← registry.dispatchManagedBidirectionalStreamingStreamAsync
               request.metadata body preflight handler request.deadline runtime?) with
           | .ok (response, deadline) => encodeStreaming response deadline
@@ -966,7 +981,7 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
         | .ok method =>
             match registry.findEntry? method with
             | none =>
-                match decompressBodyFromMetadata with
+                match decompressRequestBodyFromMetadata registry request.metadata request.body with
                 | .error status =>
                     encodeUnary { status := status, data := ByteArray.empty }
                 | .ok _ =>
