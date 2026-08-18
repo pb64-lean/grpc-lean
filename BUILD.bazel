@@ -450,10 +450,12 @@ lean_assurance_test(
     expected_implemented_by = {
         "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
+        "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
         "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
         "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
+        "Grpc.Metadata.headerListEntrySize": "Grpc.Metadata.headerListEntrySizeCandidate",
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
@@ -695,6 +697,12 @@ lean_test(
 )
 
 lean_test(
+    name = "header_size_accounting_test",
+    srcs = ["Test/HeaderSizeAccountingTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "frame_header_decode_test",
     srcs = ["Test/FrameHeaderDecodeTest.lean"],
     deps = [":grpc_lean"],
@@ -822,6 +830,13 @@ lean_binary(
 lean_binary(
     name = "metadata_get_last_benchmark",
     srcs = ["Benchmark/MetadataGetLastBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "header_size_accounting_benchmark",
+    srcs = ["Benchmark/HeaderSizeAccountingBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )

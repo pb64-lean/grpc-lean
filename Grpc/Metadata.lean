@@ -130,8 +130,24 @@ def contains (metadata : Metadata) (name value : String) : Bool :=
 def append (left right : Metadata) : Metadata :=
   right.foldl (fun acc header => acc.push header) left
 
-def headerListEntrySize (header : Header) : Nat :=
+private def headerListEntrySizeReference (header : Header) : Nat :=
   header.name.toUTF8.size + header.value.toUTF8.size + 32
+
+private def headerListEntrySizeCandidate (header : Header) : Nat :=
+  header.name.utf8ByteSize + header.value.utf8ByteSize + 32
+
+private theorem headerListEntrySizeCandidate_eq_reference (header : Header) :
+    headerListEntrySizeCandidate header = headerListEntrySizeReference header := by
+  unfold headerListEntrySizeCandidate headerListEntrySizeReference
+  rw [String.toUTF8_eq_toByteArray, String.toUTF8_eq_toByteArray,
+    String.size_toByteArray, String.size_toByteArray]
+
+/-- HTTP/2 header-list accounting.  The logical definition retains the former
+byte-array sizes; generated code reads each string's cached UTF-8 byte size
+without allocating a temporary `ByteArray`. -/
+@[implemented_by headerListEntrySizeCandidate]
+def headerListEntrySize (header : Header) : Nat :=
+  headerListEntrySizeReference header
 
 def headerListSize (metadata : Metadata) : Nat :=
   metadata.foldl (fun total header => total + headerListEntrySize header) 0

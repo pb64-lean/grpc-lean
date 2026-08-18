@@ -462,8 +462,24 @@ def staticEntries : Array Header :=
 def staticTableSize : Nat :=
   staticEntries.size
 
-def entrySize (header : Header) : Nat :=
+private def entrySizeReference (header : Header) : Nat :=
   header.name.toUTF8.size + header.value.toUTF8.size + 32
+
+private def entrySizeCandidate (header : Header) : Nat :=
+  header.name.utf8ByteSize + header.value.utf8ByteSize + 32
+
+private theorem entrySizeCandidate_eq_reference (header : Header) :
+    entrySizeCandidate header = entrySizeReference header := by
+  unfold entrySizeCandidate entrySizeReference
+  rw [String.toUTF8_eq_toByteArray, String.toUTF8_eq_toByteArray,
+    String.size_toByteArray, String.size_toByteArray]
+
+/-- RFC 7541 dynamic-table accounting.  The logical definition retains the
+former byte-array sizes; generated code reads each string's cached UTF-8 byte
+size without allocating a temporary `ByteArray`. -/
+@[implemented_by entrySizeCandidate]
+def entrySize (header : Header) : Nat :=
+  entrySizeReference header
 
 def dynamicSize (entries : Array Header) : Nat :=
   entries.foldl (fun size header => size + entrySize header) 0
