@@ -1003,6 +1003,103 @@ private def replenishInboundDataWindow (state : State) (frame : Frame) : State :
     let state := { state with inboundConnectionWindow := state.inboundConnectionWindow + size }
     setInboundStreamWindow state frame.header.streamId (streamWindow + size)
 
+/-- Exact former unary receive-window topology: debit both windows, then credit
+both back before the stripped DATA frame is buffered.  This remains the
+proof-facing oracle for the fused implementation below. -/
+private def consumeAndReplenishInboundDataWindowReference
+    (state : State) (frame : Frame) : Except Status State := do
+  let consumed ← consumeInboundDataWindow state frame
+  pure (replenishInboundDataWindow consumed frame)
+
+@[inline] private def inboundStreamWindowIn
+    (windows : Array InboundStreamWindow) (initialWindow streamId : Nat) : Nat :=
+  match findInboundStreamWindow? windows streamId with
+  | some window => window.window
+  | none => initialWindow
+
+private theorem inboundStreamWindowIn_eq (state : State) (streamId : Nat) :
+    inboundStreamWindowIn state.inboundStreamWindows
+      state.inboundInitialStreamWindow streamId =
+        inboundStreamWindow state streamId := by
+  rfl
+
+/-- Validate the same connection and stream receive-window bounds, in the same
+order, but write the canonical stream-window entry only once.  A successful
+nonempty debit followed immediately by its matching credit leaves the
+connection window unchanged; it still removes duplicate stream entries and
+appends the first matching (or default) value exactly as the reference does.
+The lookup takes only projected fields, so generated code need not retain the
+whole `State` merely to inspect a stream window before consuming it. -/
+private def consumeAndReplenishInboundDataWindowCandidate
+    (state : State) (frame : Frame) : Except Status State :=
+  let size := frame.payload.size
+  if size == 0 then
+    .ok state
+  else if size > state.inboundConnectionWindow then
+    .error (Status.internal "HTTP/2 DATA frame exceeds connection flow-control window")
+  else
+    let streamId := frame.header.streamId
+    let streamWindow := inboundStreamWindowIn state.inboundStreamWindows
+      state.inboundInitialStreamWindow streamId
+    if size > streamWindow then
+      .error (Status.internal "HTTP/2 DATA frame exceeds stream flow-control window")
+    else
+      .ok (setInboundStreamWindow state streamId streamWindow)
+
+private theorem findInboundStreamWindow?_remove
+    (windows : Array InboundStreamWindow) (streamId : Nat) :
+    findInboundStreamWindow? (removeInboundStreamWindow windows streamId) streamId = none := by
+  unfold findInboundStreamWindow? removeInboundStreamWindow
+  rw [Array.find?_eq_none]
+  intro window hmem
+  have hne := (Array.mem_filter.mp hmem).2
+  simp only [bne_iff_ne, ne_eq] at hne
+  simpa using hne
+
+private theorem inboundStreamWindow_set
+    (state : State) (streamId window : Nat) :
+    inboundStreamWindow (setInboundStreamWindow state streamId window) streamId = window := by
+  unfold inboundStreamWindow setInboundStreamWindow
+  show (match findInboundStreamWindow?
+      ((removeInboundStreamWindow state.inboundStreamWindows streamId).push
+        { streamId := streamId, window := window }) streamId with
+    | some found => found.window
+    | none => state.inboundInitialStreamWindow) = window
+  unfold findInboundStreamWindow?
+  rw [Array.find?_push]
+  rw [show Array.find? (fun found => found.streamId == streamId)
+      (removeInboundStreamWindow state.inboundStreamWindows streamId) = none from
+    findInboundStreamWindow?_remove state.inboundStreamWindows streamId]
+  simp
+
+private theorem consumeAndReplenishInboundDataWindowCandidate_eq_reference
+    (state : State) (frame : Frame) :
+    consumeAndReplenishInboundDataWindowCandidate state frame =
+      consumeAndReplenishInboundDataWindowReference state frame := by
+  unfold consumeAndReplenishInboundDataWindowCandidate
+  simp only [inboundStreamWindowIn_eq]
+  unfold consumeAndReplenishInboundDataWindowReference consumeInboundDataWindow
+  simp only [bind, Except.bind, pure, Except.pure]
+  split
+  next => simp_all [replenishInboundDataWindow]
+  next hsize =>
+    split
+    next => rfl
+    next hconnection =>
+      split
+      next => rfl
+      next hstream =>
+        have hconnectionLe : frame.payload.size ≤ state.inboundConnectionWindow := by
+          omega
+        have hstreamLe : frame.payload.size ≤
+            inboundStreamWindow state frame.header.streamId := by
+          omega
+        have hconnectionRestore := Nat.sub_add_cancel hconnectionLe
+        have hstreamRestore := Nat.sub_add_cancel hstreamLe
+        simp_all [replenishInboundDataWindow, inboundStreamWindow_set]
+        simp_all [setInboundStreamWindow, removeInboundStreamWindow,
+          Array.filter_filter]
+
 private def cleanupOutboundIfEndStream (state : State) (frame : Frame) : State :=
   if FrameFlag.has frame.header.flags FrameFlag.endStream then
     { state with outboundStreamWindows := removeOutboundStreamWindow state.outboundStreamWindows frame.header.streamId }
@@ -2459,6 +2556,16 @@ private def emitCommittedUnaryTerminal (emit : Array Frame -> IO Unit)
       | .error status => pure (.error status)
 
 namespace TestSupport
+
+/-- Exact debit-then-credit unary receive-window topology. -/
+@[noinline] def consumeAndReplenishInboundDataWindowReferenceForBenchmark
+    (state : State) (frame : Frame) : Except Status State :=
+  consumeAndReplenishInboundDataWindowReference state frame
+
+/-- Fused unary receive-window validation and canonicalizing update. -/
+@[noinline] def consumeAndReplenishInboundDataWindowCandidateForBenchmark
+    (state : State) (frame : Frame) : Except Status State :=
+  consumeAndReplenishInboundDataWindowCandidate state frame
 
 /-- Exact former queue-and-flush topology used as the focused differential
 oracle: append incoming frames to existing pending work, then start with an
@@ -4296,7 +4403,7 @@ private def resetClosedStreamData (state : State) (frame : Frame) :
 /-- DATA for a unary request: the body is buffered on the stream and both
 windows are credited immediately, since the whole request is dispatched at
 END_STREAM. -/
-def processUnaryRequestData (state : State) (frame : Frame) :
+private def processUnaryRequestDataReference (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) :=
   match findStream? state.streams frame.header.streamId with
   | none => .error (Status.internal "HTTP/2 DATA frame arrived before request HEADERS")
@@ -4322,6 +4429,70 @@ def processUnaryRequestData (state : State) (frame : Frame) :
                   .ok (detachedState, { emitted := updates, detached := some detached })
             else
               .ok (buffered, { emitted := updates })
+
+private def processUnaryRequestDataCandidate (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) :=
+  match findStream? state.streams frame.header.streamId with
+  | none => .error (Status.internal "HTTP/2 DATA frame arrived before request HEADERS")
+  | some stream =>
+    if !streamHeaderComplete stream then
+      .error (Status.internal "HTTP/2 DATA frame arrived before END_HEADERS")
+    else
+      match consumeAndReplenishInboundDataWindowCandidate state frame with
+      | .error status => .error status
+      | .ok replenished =>
+        match dataWindowUpdates frame with
+        | .error status => .error status
+        | .ok updates =>
+          match stripPadding frame "DATA" with
+          | .error status => .error status
+          | .ok stripped =>
+            let buffered := appendStreamFrameToState replenished stripped
+            if FrameFlag.has stripped.header.flags FrameFlag.endStream then
+              match detachStreamForDispatch buffered stripped.header.streamId with
+              | .error status => .error status
+              | .ok (detachedState, detached) =>
+                  .ok (detachedState, { emitted := updates, detached := some detached })
+            else
+              .ok (buffered, { emitted := updates })
+
+private theorem processUnaryRequestDataCandidate_eq_reference
+    (state : State) (frame : Frame) :
+    processUnaryRequestDataCandidate state frame =
+      processUnaryRequestDataReference state frame := by
+  unfold processUnaryRequestDataCandidate processUnaryRequestDataReference
+  rw [consumeAndReplenishInboundDataWindowCandidate_eq_reference]
+  unfold consumeAndReplenishInboundDataWindowReference
+  simp only [bind, Except.bind, pure, Except.pure]
+  split
+  next => rfl
+  next =>
+    split
+    next => rfl
+    next =>
+      cases hconsume : consumeInboundDataWindow state frame <;>
+        simp
+
+/-- Unary DATA retains the former debit-then-credit transition as its logical
+definition. Generated code uses the fused, exactly equivalent window update. -/
+@[implemented_by processUnaryRequestDataCandidate]
+def processUnaryRequestData (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) :=
+  processUnaryRequestDataReference state frame
+
+namespace TestSupport
+
+/-- Exact former unary DATA transition for focused differential checks. -/
+@[noinline] def processUnaryRequestDataReferenceForBenchmark
+    (state : State) (frame : Frame) : Except Status (State × SharedFrameResult) :=
+  processUnaryRequestDataReference state frame
+
+/-- Production unary DATA candidate with the fused receive-window update. -/
+@[noinline] def processUnaryRequestDataCandidateForBenchmark
+    (state : State) (frame : Frame) : Except Status (State × SharedFrameResult) :=
+  processUnaryRequestDataCandidate state frame
+
+end TestSupport
 
 def processDataShared (registry : Registry) (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) :=
@@ -6549,7 +6720,7 @@ to a stream that is already past END_HEADERS, so no header block reopens. -/
 private theorem processUnaryRequestData_wellFormed {state : State} {frame : Frame}
     {res : State × SharedFrameResult} (h : WellFormed state)
     (heq : processUnaryRequestData state frame = .ok res) : WellFormed res.1 := by
-  unfold processUnaryRequestData at heq
+  unfold processUnaryRequestData processUnaryRequestDataReference at heq
   split at heq
   next => cases heq
   next stream hfind =>
@@ -6906,31 +7077,6 @@ theorems say the arithmetic is *exact*.
   has caught up.
 -/
 
-private theorem findInboundStreamWindow?_remove (windows : Array InboundStreamWindow)
-    (streamId : Nat) :
-    findInboundStreamWindow? (removeInboundStreamWindow windows streamId) streamId = none := by
-  unfold findInboundStreamWindow? removeInboundStreamWindow
-  rw [Array.find?_eq_none]
-  intro x hx
-  have hne := (Array.mem_filter.mp hx).2
-  simp only [bne_iff_ne, ne_eq] at hne
-  simpa using hne
-
-private theorem inboundStreamWindow_set (state : State) (streamId window : Nat) :
-    inboundStreamWindow (setInboundStreamWindow state streamId window) streamId = window := by
-  unfold inboundStreamWindow setInboundStreamWindow
-  show (match findInboundStreamWindow?
-      ((removeInboundStreamWindow state.inboundStreamWindows streamId).push
-        { streamId := streamId, window := window }) streamId with
-    | some w => w.window
-    | none => state.inboundInitialStreamWindow) = window
-  unfold findInboundStreamWindow?
-  rw [Array.find?_push]
-  rw [show Array.find? (fun w => w.streamId == streamId)
-      (removeInboundStreamWindow state.inboundStreamWindows streamId) = none from
-    findInboundStreamWindow?_remove state.inboundStreamWindows streamId]
-  simp
-
 /-- A DATA frame debits both receive windows by exactly its payload size; the
 `Nat` equations also witness that neither subtraction truncated. -/
 theorem consumeInboundDataWindow_conserves {state state' : State} {frame : Frame}
@@ -7036,7 +7182,7 @@ theorem processUnaryRequestData_windows {state : State} {frame : Frame}
       ∧ (res.2.detached = none →
           inboundStreamWindow res.1 frame.header.streamId
             = inboundStreamWindow state frame.header.streamId) := by
-  unfold processUnaryRequestData at heq
+  unfold processUnaryRequestData processUnaryRequestDataReference at heq
   split at heq
   next => cases heq
   next =>

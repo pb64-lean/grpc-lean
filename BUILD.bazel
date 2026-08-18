@@ -453,6 +453,7 @@ lean_assurance_test(
         "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
         "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
         "Grpc.Http2.Connection.flushOutbound": "Grpc.Http2.Connection.flushOutboundCandidate",
+        "Grpc.Http2.Connection.processUnaryRequestData": "Grpc.Http2.Connection.processUnaryRequestDataCandidate",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
         "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
@@ -585,6 +586,12 @@ lean_test(
 lean_test(
     name = "outbound_queue_test",
     srcs = ["Test/OutboundQueueTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "inbound_window_fusion_test",
+    srcs = ["Test/InboundWindowFusionTest.lean"],
     deps = [":grpc_lean"],
 )
 
@@ -797,6 +804,20 @@ lean_test(
     name = "outbound_flush_test",
     srcs = ["Benchmark/OutboundFlushBenchmark.lean"],
     args = ["candidate", "unary_128", "1000", "10"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "inbound_window_round_trip_benchmark",
+    srcs = ["Benchmark/InboundWindowRoundTripBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "inbound_window_round_trip_benchmark_test",
+    srcs = ["Benchmark/InboundWindowRoundTripBenchmark.lean"],
+    args = ["candidate", "present_first_1_exact", "1000", "10"],
     deps = [":grpc_lean"],
 )
 
