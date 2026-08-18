@@ -456,6 +456,7 @@ lean_assurance_test(
         "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
+        "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
     },
     expected_extern_declarations = {
@@ -749,6 +750,13 @@ lean_binary(
 )
 
 lean_binary(
+    name = "message_encode_benchmark",
+    srcs = ["Benchmark/MessageEncodeBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
     name = "unary_body_benchmark",
     srcs = ["Benchmark/UnaryBodyBenchmark.lean"],
     tags = ["manual"],
@@ -866,6 +874,12 @@ lean_test(
 lean_test(
     name = "unary_identity_decode_reuse_test",
     srcs = ["Test/UnaryIdentityDecodeReuseTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "message_encode_test",
+    srcs = ["Test/MessageEncodeTest.lean"],
     deps = [":grpc_lean"],
 )
 

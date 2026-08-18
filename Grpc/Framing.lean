@@ -1,6 +1,7 @@
 module
 
 public import Grpc.Status
+import Grpc.Bytes
 import Zlib.Gzip
 
 public section
@@ -53,7 +54,10 @@ private def readUInt32BE (bytes : ByteArray) (offset : Nat) : Nat :=
     + bytes[offset + 2]!.toNat * 256
     + bytes[offset + 3]!.toNat
 
-def encode (message : Message) : Except Status ByteArray :=
+private theorem append_eq (a b : ByteArray) : a.append b = a ++ b := rfl
+
+/- The former compositional encoder remains the logical definition. -/
+private def encodeReference (message : Message) : Except Status ByteArray :=
   let len := message.data.size
   if len > maxWireLength then
     .error (Status.internal "gRPC message exceeds 32-bit wire length")
@@ -62,6 +66,66 @@ def encode (message : Message) : Except Status ByteArray :=
       |>.push message.compressed.toUInt8
       |>.append (uint32BE len)
       |>.append message.data
+
+/- Append a 32-bit big-endian length directly to an owned destination. -/
+private def appendUInt32BE (out : ByteArray) (n : Nat) : ByteArray :=
+  out
+    |>.push (UInt8.ofNat ((n / 16777216) % 256))
+    |>.push (UInt8.ofNat ((n / 65536) % 256))
+    |>.push (UInt8.ofNat ((n / 256) % 256))
+    |>.push (UInt8.ofNat (n % 256))
+
+/- The production encoder allocates the exact final wire buffer, writes the
+five-byte prefix into it, and copies the payload once. -/
+private def encodeCandidate (message : Message) : Except Status ByteArray :=
+  let len := message.data.size
+  if len > maxWireLength then
+    .error (Status.internal "gRPC message exceeds 32-bit wire length")
+  else
+    let out := ByteArray.emptyWithCapacity (prefixLength + len)
+    let out := out.push message.compressed.toUInt8
+    .ok ((appendUInt32BE out len).append message.data)
+
+private theorem appendUInt32BE_append_left (pre out : ByteArray) (n : Nat) :
+    appendUInt32BE (pre ++ out) n = pre ++ appendUInt32BE out n := by
+  simp only [appendUInt32BE]
+  rw [Bytes.append_push, Bytes.append_push, Bytes.append_push, Bytes.append_push]
+
+private theorem appendUInt32BE_eq_append (out : ByteArray) (n : Nat) :
+    appendUInt32BE out n = out ++ uint32BE n := by
+  have h := appendUInt32BE_append_left out ByteArray.empty n
+  rw [ByteArray.append_empty] at h
+  simpa only [show appendUInt32BE ByteArray.empty n = uint32BE n from rfl] using h
+
+private theorem emptyWithCapacity_eq_empty (capacity : Nat) :
+    ByteArray.emptyWithCapacity capacity = ByteArray.empty := by
+  rfl
+
+private theorem encodeCandidate_eq_reference (message : Message) :
+    encodeCandidate message = encodeReference message := by
+  simp only [encodeCandidate, encodeReference]
+  split
+  next => rfl
+  next =>
+    rw [emptyWithCapacity_eq_empty, appendUInt32BE_eq_append]
+    simp only [append_eq]
+
+/-- Encode one length-prefixed gRPC message. The proof-facing definition keeps
+the former compositional encoder; generated code writes the exact wire bytes
+into one final buffer. -/
+@[implemented_by encodeCandidate]
+def encode (message : Message) : Except Status ByteArray :=
+  encodeReference message
+
+/-- Messages whose payload cannot be represented by the four-byte wire length
+fail with the protocol's exact encoder status.  This law covers the otherwise
+impractical-to-materialize `maxWireLength + 1` boundary. -/
+theorem encode_exceeds_maxWireLength (message : Message)
+    (h : message.data.size > maxWireLength) :
+    encode message =
+      .error (Status.internal "gRPC message exceeds 32-bit wire length") := by
+  simp only [encode, encodeReference]
+  rw [if_pos h]
 
 structure DecodeState where
   buffered : ByteArray := ByteArray.empty
@@ -161,8 +225,6 @@ guarantee for `decodeAllWithLimit`:
   returns a message whose payload exceeds the limit.
 -/
 
-private theorem append_eq (a b : ByteArray) : a.append b = a ++ b := rfl
-
 private theorem throw_eq (e : Status) {α : Type} :
     (throw e : Except Status α) = .error e := rfl
 
@@ -175,7 +237,7 @@ private theorem map_ok {α β : Type} (f : α -> β) (v : α) :
 private theorem encode_ok {x : Message} {bs : ByteArray} (h : encode x = .ok bs) :
     x.data.size ≤ maxWireLength
       ∧ bs = ByteArray.empty.push x.compressed.toUInt8 ++ uint32BE x.data.size ++ x.data := by
-  simp only [encode] at h
+  simp only [encode, encodeReference] at h
   split at h
   next => cases h
   next hle => cases h; exact ⟨by omega, rfl⟩
