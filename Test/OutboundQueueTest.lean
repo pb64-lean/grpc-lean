@@ -45,6 +45,337 @@ def stateWith (connectionWindow initialStreamWindow : Nat)
   pendingOutbound := pending
 }
 
+structure StreamProjection where
+  streamId : Nat
+  frames : Array Frame
+  requestMetadata : Option Metadata
+  requestPreflight : Option Headers.RequestPreflight
+  authorized : Bool
+  endHeadersReceivedAt : Option Nat
+  deadline : Option Nat
+  deriving DecidableEq
+
+/-- A deliberately explicit pure projection of connection state.  The outbound
+queue is allowed to change only connection credit, stream credit, and the
+pending queue, but retaining the surrounding fields here makes the
+differential corpus catch accidental record-update damage as well.  Opaque IO
+owners are represented by their ordered stream ids and scheduler presence. -/
+structure StateProjection where
+  closing : Bool
+  prefaceReceived : Bool
+  clientSettingsReceived : Bool
+  prefaceBuffer : ByteArray
+  decoderBuffered : ByteArray
+  decoderFrames : Array Frame
+  hpackDynamic : Array Header
+  hpackMaxSize : Nat
+  hpackMaxAllowedSize : Nat
+  hpackPendingSizeUpdate : Option Nat
+  outboundHpackDynamic : Array Header
+  outboundHpackMaxSize : Nat
+  outboundHpackMaxAllowedSize : Nat
+  outboundHpackPendingSizeUpdate : Option Nat
+  lastClientStreamId : Nat
+  outboundGoAwayLastStreamId : Option Nat
+  outboundConnectionWindow : Nat
+  outboundInitialStreamWindow : Nat
+  outboundMaxFramePayloadLength : Nat
+  inboundMaxFramePayloadLength : Nat
+  inboundConnectionWindow : Nat
+  inboundInitialStreamWindow : Nat
+  inboundMaxConcurrentStreams : Option Nat
+  inboundMaxHeaderListSize : Option Nat
+  inboundStreamWindows : Array (Nat × Nat)
+  outboundStreamWindows : Array (Nat × Int)
+  pendingOutbound : Array Frame
+  streams : Array StreamProjection
+  ignoredInboundStreams : Array Nat
+  resetInboundStreams : Array Nat
+  resetHeaderBlock : Option Frame
+  refusedInboundStreams : Array Nat
+  activeRequestStreamIds : Array Nat
+  activeDispatchStreamIds : Array Nat
+  activeAuthorizationStreamIds : Array Nat
+  pendingDispatchPublications : Array Nat
+  pendingKeepalivePing : Option ByteArray
+  deadlineSchedulerPresent : Bool
+  deriving DecidableEq
+
+def projectStream (stream : StreamState) : StreamProjection := {
+  streamId := stream.streamId
+  frames := stream.frames
+  requestMetadata := stream.requestMetadata
+  requestPreflight := stream.requestPreflight
+  authorized := stream.authorizedEntry?.isSome
+  endHeadersReceivedAt := stream.endHeadersReceivedAt
+  deadline := stream.deadline
+}
+
+def projectState (state : State) : StateProjection := {
+  closing := state.closing
+  prefaceReceived := state.prefaceReceived
+  clientSettingsReceived := state.clientSettingsReceived
+  prefaceBuffer := state.prefaceBuffer
+  decoderBuffered := state.decoder.buffered
+  decoderFrames := state.decoder.frames
+  hpackDynamic := state.hpack.dynamic
+  hpackMaxSize := state.hpack.maxSize
+  hpackMaxAllowedSize := state.hpack.maxAllowedSize
+  hpackPendingSizeUpdate := state.hpack.pendingSizeUpdate
+  outboundHpackDynamic := state.outboundHpack.dynamic
+  outboundHpackMaxSize := state.outboundHpack.maxSize
+  outboundHpackMaxAllowedSize := state.outboundHpack.maxAllowedSize
+  outboundHpackPendingSizeUpdate := state.outboundHpack.pendingSizeUpdate
+  lastClientStreamId := state.lastClientStreamId
+  outboundGoAwayLastStreamId := state.outboundGoAwayLastStreamId
+  outboundConnectionWindow := state.outboundConnectionWindow
+  outboundInitialStreamWindow := state.outboundInitialStreamWindow
+  outboundMaxFramePayloadLength := state.outboundMaxFramePayloadLength
+  inboundMaxFramePayloadLength := state.inboundMaxFramePayloadLength
+  inboundConnectionWindow := state.inboundConnectionWindow
+  inboundInitialStreamWindow := state.inboundInitialStreamWindow
+  inboundMaxConcurrentStreams := state.inboundMaxConcurrentStreams
+  inboundMaxHeaderListSize := state.inboundMaxHeaderListSize
+  inboundStreamWindows := state.inboundStreamWindows.map fun entry =>
+    (entry.streamId, entry.window)
+  outboundStreamWindows := state.outboundStreamWindows.map fun entry =>
+    (entry.streamId, entry.window)
+  pendingOutbound := state.pendingOutbound
+  streams := state.streams.map projectStream
+  ignoredInboundStreams := state.ignoredInboundStreams
+  resetInboundStreams := state.resetInboundStreams
+  resetHeaderBlock := state.resetHeaderBlock
+  refusedInboundStreams := state.refusedInboundStreams
+  activeRequestStreamIds := state.activeRequestStreams.map (fun stream => stream.streamId)
+  activeDispatchStreamIds := state.activeDispatches.map (fun dispatch => dispatch.streamId)
+  activeAuthorizationStreamIds := state.activeAuthorizations.map (fun authorization =>
+    authorization.streamId)
+  pendingDispatchPublications := state.pendingDispatchPublications
+  pendingKeepalivePing := state.pendingKeepalivePing
+  deadlineSchedulerPresent := state.deadlineScheduler.isSome
+}
+
+/-- Populate unrelated fields with non-default sentinels so that a malformed
+whole-state update cannot pass merely because all of those fields were empty. -/
+def differentialStateWith (connectionWindow initialStreamWindow : Nat)
+    (windows : Array OutboundStreamWindow := #[])
+    (pending : Array Frame := #[]) : State := {
+  (stateWith connectionWindow initialStreamWindow windows pending) with
+  closing := true
+  prefaceReceived := true
+  clientSettingsReceived := true
+  prefaceBuffer := bytes [0x50, 0x52, 0x45]
+  decoder := {
+    buffered := bytes [0x44, 0x45, 0x43]
+    frames := #[frame .settings 0 (bytes [0x01])]
+  }
+  hpack := {
+    dynamic := #[Header.of "x-inbound-sentinel" "keep"]
+    maxSize := 31
+    maxAllowedSize := 63
+    pendingSizeUpdate := some 7
+  }
+  outboundHpack := {
+    dynamic := #[Header.of "x-outbound-sentinel" "keep"]
+    maxSize := 17
+    maxAllowedSize := 33
+    pendingSizeUpdate := some 5
+  }
+  lastClientStreamId := 91
+  outboundGoAwayLastStreamId := some 89
+  outboundMaxFramePayloadLength := 8192
+  inboundMaxFramePayloadLength := 4096
+  inboundConnectionWindow := 777
+  inboundInitialStreamWindow := 555
+  inboundMaxConcurrentStreams := some 13
+  inboundMaxHeaderListSize := some 2048
+  inboundStreamWindows := #[{ streamId := 91, window := 444 }]
+  streams := #[{
+    streamId := 91
+    frames := #[headers 91]
+    requestMetadata := some #[Header.of "x-stream-sentinel" "keep"]
+    endHeadersReceivedAt := some 123
+    deadline := some 456
+  }]
+  ignoredInboundStreams := #[81, 83]
+  resetInboundStreams := #[85]
+  resetHeaderBlock := some (frame .continuation 85 (bytes [0x52]))
+  refusedInboundStreams := #[87]
+  pendingDispatchPublications := #[91, 93]
+  pendingKeepalivePing := some (bytes [0x50, 0x49, 0x4e, 0x47])
+}
+
+structure DifferentialCase where
+  name : String
+  state : State
+  incoming : Array Frame
+
+def controlFrames (count : Nat) : Array Frame :=
+  (List.range count).foldl (init := #[]) fun controls index =>
+    let frameType := if index % 2 == 0 then FrameType.ping else FrameType.settings
+    controls.push (frame frameType 0 (bytes [index, index + 1]))
+
+def differentialCases : List DifferentialCase := [
+  {
+    name := "empty pending and incoming"
+    state := differentialStateWith 8 8
+    incoming := #[]
+  },
+  {
+    name := "pending-only control"
+    state := differentialStateWith 8 8 #[] #[frame .ping 0 (bytes [1])]
+    incoming := #[]
+  },
+  {
+    name := "common HEADERS DATA trailers"
+    state := differentialStateWith 20 20
+    incoming := #[headers 1, data 1 (bytes [1, 2, 3]), headers 1 true]
+  },
+  {
+    name := "sixty-four control frames"
+    state := differentialStateWith 8 8
+    incoming := controlFrames 64
+  },
+  {
+    name := "ACK-bit controls and unknown extension"
+    state := differentialStateWith 8 8 #[
+      { streamId := 0, window := (3 : Int) },
+      { streamId := 0, window := (5 : Int) },
+      { streamId := 1, window := (7 : Int) }
+    ]
+    incoming := #[
+      frame .settings 0 ByteArray.empty 0x1,
+      frame .ping 0 (bytes [1, 2, 3, 4, 5, 6, 7, 8]) 0x1,
+      frame (.unknown 0xfe) 0 (bytes [0xfe, 0xed]) 0x1
+    ]
+  },
+  {
+    name := "trailers followed by controls"
+    state := differentialStateWith 8 8 #[{ streamId := 1, window := (8 : Int) }]
+    incoming := #[headers 1, data 1 (bytes [4, 5]), headers 1 true] ++ controlFrames 8
+  },
+  {
+    name := "exact-fit DATA"
+    state := differentialStateWith 3 3 #[{ streamId := 1, window := (3 : Int) }]
+    incoming := #[data 1 (bytes [6, 7, 8]) FrameFlag.endStream]
+  },
+  {
+    name := "connection-partial DATA"
+    state := differentialStateWith 2 8 #[{ streamId := 1, window := (8 : Int) }]
+    incoming := #[data 1 (bytes [9, 10, 11, 12]) FrameFlag.endStream, headers 1 true]
+  },
+  {
+    name := "stream-partial DATA"
+    state := differentialStateWith 8 8 #[{ streamId := 1, window := (2 : Int) }]
+    incoming := #[data 1 (bytes [13, 14, 15, 16]) FrameFlag.endStream, headers 1 true]
+  },
+  {
+    name := "zero connection window blocks"
+    state := differentialStateWith 0 8 #[{ streamId := 1, window := (8 : Int) }]
+    incoming := #[data 1 (bytes [17]), headers 1 true]
+  },
+  {
+    name := "zero stream window blocks"
+    state := differentialStateWith 8 8 #[{ streamId := 1, window := (0 : Int) }]
+    incoming := #[data 1 (bytes [18]), headers 1 true]
+  },
+  {
+    name := "negative stream window blocks"
+    state := differentialStateWith 8 8 #[{ streamId := 1, window := (-3 : Int) }]
+    incoming := #[headers 1, data 1 (bytes [19]), headers 1 true]
+  },
+  {
+    name := "zero-length DATA blocks at zero credit"
+    state := differentialStateWith 0 8 #[{ streamId := 1, window := (8 : Int) }]
+    incoming := #[data 1 ByteArray.empty, headers 1 true]
+  },
+  {
+    name := "zero-length DATA emits at positive credit"
+    state := differentialStateWith 1 1 #[{ streamId := 1, window := (1 : Int) }]
+    incoming := #[data 1 ByteArray.empty, headers 1 true]
+  },
+  {
+    name := "existing pending preserves FIFO"
+    state := differentialStateWith 12 12
+      #[{ streamId := 3, window := (12 : Int) }, { streamId := 1, window := (12 : Int) }]
+      #[headers 3, data 3 (bytes [20, 21])]
+    incoming := #[headers 1, data 1 (bytes [22, 23]), headers 1 true]
+  },
+  {
+    name := "blocked existing pending retains incoming suffix"
+    state := differentialStateWith 12 12
+      #[{ streamId := 3, window := (0 : Int) }]
+      #[data 3 (bytes [24])]
+    incoming := controlFrames 4
+  },
+  {
+    name := "mismatched exact DATA header length"
+    state := differentialStateWith 2 2 #[{ streamId := 1, window := (2 : Int) }]
+    incoming := #[data 1 (bytes [25, 26]) 0 (some 99)]
+  },
+  {
+    name := "mismatched partial DATA header length"
+    state := differentialStateWith 2 4 #[{ streamId := 1, window := (4 : Int) }]
+    incoming := #[data 1 (bytes [27, 28, 29, 30]) FrameFlag.endStream (some 99)]
+  },
+  {
+    name := "interleaved stream DATA"
+    state := differentialStateWith 8 8 #[
+      { streamId := 1, window := (4 : Int) },
+      { streamId := 3, window := (4 : Int) }
+    ]
+    incoming := #[
+      data 1 (bytes [31, 32]),
+      data 3 (bytes [33, 34]),
+      data 1 (bytes [35, 36]),
+      data 3 (bytes [37, 38]),
+      headers 1 true,
+      headers 3 true
+    ]
+  },
+  {
+    name := "END_STREAM then same stream"
+    state := differentialStateWith 3 2 #[{ streamId := 1, window := (1 : Int) }]
+    incoming := #[
+      data 1 (bytes [39]) FrameFlag.endStream,
+      data 1 (bytes [40, 41]),
+      headers 1 true
+    ]
+  },
+  {
+    name := "duplicate stream windows"
+    state := differentialStateWith 8 8 #[
+      { streamId := 1, window := (3 : Int) },
+      { streamId := 1, window := (7 : Int) },
+      { streamId := 3, window := (2 : Int) }
+    ]
+    incoming := #[data 1 (bytes [42, 43]), data 3 (bytes [44, 45])]
+  },
+  {
+    name := "duplicate windows with END_STREAM reuse"
+    state := differentialStateWith 3 2 #[
+      { streamId := 1, window := (1 : Int) },
+      { streamId := 1, window := (9 : Int) }
+    ]
+    incoming := #[
+      data 1 (bytes [46]) FrameFlag.endStream,
+      data 1 (bytes [47, 48]),
+      headers 1 true
+    ]
+  }
+]
+
+def testDifferentialCorpus : IO Unit := do
+  for testCase in differentialCases do
+    let reference :=
+      TestSupport.queueOutboundReferenceForBenchmark testCase.state testCase.incoming
+    let candidate :=
+      TestSupport.queueOutboundCandidateForBenchmark testCase.state testCase.incoming
+    expect (decide (projectState reference.1 = projectState candidate.1))
+      s!"outbound cursor state mismatch: {testCase.name}"
+    expect (decide (reference.2 = candidate.2))
+      s!"outbound cursor emitted-frame mismatch: {testCase.name}"
+
 def testNormalBatch : IO Unit := do
   let payload := bytes [1, 2, 3]
   let frames := #[headers 1, data 1 payload, headers 1 true]
@@ -152,6 +483,21 @@ def testZeroLengthData : IO Unit := do
   expect positiveResult.1.outboundStreamWindows.isEmpty
     "terminal headers after zero-length DATA should clean up the stream"
 
+/-- A queue blocked before its first DATA frame must be returned by identity.
+This guards the cursor boundary against turning the reference path's O(1)
+backpressure result into a full `Array.extract 0 size` copy. -/
+unsafe def testBlockedPendingIdentity : IO Unit := do
+  let pending := #[
+    data 1 (bytes [61, 62, 63]),
+    headers 1 true,
+    frame (.unknown 0xfe) 1 (bytes [64])
+  ]
+  let result := flushOutbound <|
+    stateWith 0 8 #[{ streamId := 1, window := (8 : Int) }] pending
+  expect result.2.isEmpty "zero-credit direct flush should emit no frames"
+  expect (ptrEq pending result.1.pendingOutbound)
+    "zero-credit direct flush should retain the original pending array"
+
 def testExistingPendingOrdering : IO Unit := do
   let pending := data 3 (bytes [21])
   let incoming := #[headers 1, data 1 (bytes [22]), headers 1 true]
@@ -238,12 +584,14 @@ def testMismatchedHeaderNormalization : IO Unit := do
     "header normalization should preserve the complete exact-fit payload"
 
 unsafe def main : IO Unit := do
+  testDifferentialCorpus
   testNormalBatch
   testExactFit
   testOneByteShortConnection
   testOneByteShortStream
   testNegativeStreamWindow
   testZeroLengthData
+  testBlockedPendingIdentity
   testExistingPendingOrdering
   testLaterDataBlocksAfterEarlierEmission
   testMultipleAndInterleavedData

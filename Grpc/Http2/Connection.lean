@@ -1020,7 +1020,21 @@ private theorem popFirstFrame_size_lt {frames : Array Frame} {frame : Frame}
   simp only [popFirstFrame, Array.size_extract]
   omega
 
-def flushOutbound (state : State) (emitted : Array Frame := #[]) :
+@[inline] private def debitOutboundWindows (state : State) (streamId : Nat)
+    (streamWindow : Int) (sendSize : Nat) : State :=
+  let state := {
+    state with
+    outboundConnectionWindow := state.outboundConnectionWindow - sendSize
+  }
+  setOutboundStreamWindow state streamId (streamWindow - Int.ofNat sendSize)
+
+private theorem debitOutboundWindows_pendingOutbound (state : State) (streamId : Nat)
+    (streamWindow : Int) (sendSize : Nat) :
+    (debitOutboundWindows state streamId streamWindow sendSize).pendingOutbound =
+      state.pendingOutbound := by
+  rfl
+
+private def flushOutboundReference (state : State) (emitted : Array Frame := #[]) :
     State × Array Frame :=
   match h : state.pendingOutbound[0]? with
   | none => (state, emitted)
@@ -1028,7 +1042,7 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
       if frame.header.frameType != FrameType.data then
         let state := { state with pendingOutbound := popFirstFrame state.pendingOutbound }
         let state := cleanupOutboundIfEndStream state frame
-        flushOutbound state (emitted.push frame)
+        flushOutboundReference state (emitted.push frame)
       else
         let streamWindow := outboundStreamWindow state frame.header.streamId
         let streamWindowAvailable := streamWindow.toNat
@@ -1037,12 +1051,7 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
           (state, emitted)
         else
           let sendSize := Nat.min available frame.payload.size
-          let state := {
-            state with
-            outboundConnectionWindow := state.outboundConnectionWindow - sendSize
-          }
-          let state := setOutboundStreamWindow state frame.header.streamId
-            (streamWindow - Int.ofNat sendSize)
+          let state := debitOutboundWindows state frame.header.streamId streamWindow sendSize
           if sendSize == frame.payload.size then
             -- Reuse an exact-fit payload.  `dataFrameWithPayload` still
             -- normalizes the frame header for defensive direct callers, but
@@ -1050,7 +1059,7 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
             let sentFrame := dataFrameWithPayload frame frame.payload
             let state := { state with pendingOutbound := popFirstFrame state.pendingOutbound }
             let state := cleanupOutboundIfEndStream state sentFrame
-            flushOutbound state (emitted.push sentFrame)
+            flushOutboundReference state (emitted.push sentFrame)
           else
             let sendPayload := frame.payload.extract 0 sendSize
             let sentFrame := dataFrameWithPayload (withoutEndStream frame) sendPayload
@@ -1063,8 +1072,178 @@ def flushOutbound (state : State) (emitted : Array Frame := #[]) :
   termination_by state.pendingOutbound.size
   decreasing_by
     all_goals
-      simp only [cleanupOutboundIfEndStream_pendingOutbound, setOutboundStreamWindow]
+      simp only [cleanupOutboundIfEndStream_pendingOutbound,
+        debitOutboundWindows_pendingOutbound]
       exact popFirstFrame_size_lt h
+
+/-- Cursor-based executable outbound flushing.  Consumed frames remain in the
+original array while `index` advances, so a run of admitted frames does not
+copy progressively shorter queue suffixes.  The residual queue is materialized
+only at the blocked, partial, or exhausted boundary. -/
+@[inline] private def finishOutboundCursorState
+    (state : State) (frames : Array Frame) (index : Nat) : State :=
+  if index = 0 then
+    state
+  else
+    { state with pendingOutbound := frames.extract index frames.size }
+
+private def flushOutboundCursor :
+    (fuel : Nat) → (state : State) → (frames : Array Frame) → (index : Nat) →
+      index + fuel = frames.size → state.pendingOutbound = frames →
+      Array Frame → State × Array Frame
+  | 0, state, frames, index, _, _, emitted =>
+      (finishOutboundCursorState state frames index, emitted)
+  | fuel + 1, state, frames, index, hcursor, hpending, emitted =>
+      have hindex : index < frames.size := by omega
+      let frame := frames[index]
+      if frame.header.frameType != FrameType.data then
+        let nextState := cleanupOutboundIfEndStream state frame
+        have hnextPending : nextState.pendingOutbound = frames := by
+          simpa only [nextState, cleanupOutboundIfEndStream_pendingOutbound] using hpending
+        flushOutboundCursor fuel nextState frames (index + 1) (by omega)
+          hnextPending (emitted.push frame)
+      else
+        let streamWindow := outboundStreamWindow state frame.header.streamId
+        let streamWindowAvailable := streamWindow.toNat
+        let available := Nat.min state.outboundConnectionWindow streamWindowAvailable
+        if available == 0 then
+          (finishOutboundCursorState state frames index, emitted)
+        else
+          let sendSize := Nat.min available frame.payload.size
+          let debitedState := debitOutboundWindows state frame.header.streamId streamWindow sendSize
+          if sendSize == frame.payload.size then
+            let sentFrame := dataFrameWithPayload frame frame.payload
+            let nextState := cleanupOutboundIfEndStream debitedState sentFrame
+            have hdebitedPending : debitedState.pendingOutbound = frames := by
+              simpa only [debitedState, debitOutboundWindows_pendingOutbound] using hpending
+            have hnextPending : nextState.pendingOutbound = frames := by
+              simpa only [nextState, cleanupOutboundIfEndStream_pendingOutbound]
+                using hdebitedPending
+            flushOutboundCursor fuel nextState frames (index + 1) (by omega)
+              hnextPending (emitted.push sentFrame)
+          else
+            let sendPayload := frame.payload.extract 0 sendSize
+            let sentFrame := dataFrameWithPayload (withoutEndStream frame) sendPayload
+            let remaining := frame.payload.extract sendSize frame.payload.size
+            let remainingFrame := dataFrameWithPayload frame remaining
+            let pending :=
+              #[remainingFrame].append (frames.extract (index + 1) frames.size)
+            ({ debitedState with pendingOutbound := pending }, emitted.push sentFrame)
+
+private def flushOutboundCandidate (state : State) (emitted : Array Frame := #[]) :
+    State × Array Frame :=
+  flushOutboundCursor state.pendingOutbound.size state state.pendingOutbound 0 (by omega) rfl emitted
+
+private theorem popFirstFrame_extract (frames : Array Frame) (index : Nat)
+    (hindex : index ≤ frames.size) :
+    popFirstFrame (frames.extract index frames.size) =
+      frames.extract (index + 1) frames.size := by
+  unfold popFirstFrame
+  rw [Array.extract_extract, Array.size_extract]
+  simp only [Nat.min_self]
+  have : index + (frames.size - index) = frames.size := by omega
+  rw [this, Nat.min_self]
+
+private theorem finishOutboundCursorState_eq (state : State) (frames : Array Frame)
+    (index : Nat) (hpending : state.pendingOutbound = frames) :
+    finishOutboundCursorState state frames index =
+      { state with pendingOutbound := frames.extract index frames.size } := by
+  unfold finishOutboundCursorState
+  split
+  next hzero =>
+    subst index
+    simp only [Array.extract_size]
+    rw [← hpending]
+  next _ => rfl
+
+private theorem replaceCursorFrame_eq_replaceFirstFrame (frames : Array Frame)
+    (index : Nat) (frame : Frame) (hindex : index < frames.size) :
+    #[frame].append (frames.extract (index + 1) frames.size) =
+      replaceFirstFrame (frames.extract index frames.size) frame := by
+  unfold replaceFirstFrame
+  change #[frame].append (frames.extract (index + 1) frames.size) =
+    #[frame].append (popFirstFrame (frames.extract index frames.size))
+  rw [popFirstFrame_extract frames index (Nat.le_of_lt hindex)]
+
+private theorem outboundStreamWindow_pendingOutbound (state : State)
+    (pending : Array Frame) (streamId : Nat) :
+    outboundStreamWindow { state with pendingOutbound := pending } streamId =
+      outboundStreamWindow state streamId := by
+  rfl
+
+private theorem debitOutboundWindows_pendingOutbound_override (state : State)
+    (pending : Array Frame) (streamId : Nat) (streamWindow : Int) (sendSize : Nat) :
+    debitOutboundWindows { state with pendingOutbound := pending }
+        streamId streamWindow sendSize =
+      { debitOutboundWindows state streamId streamWindow sendSize with
+        pendingOutbound := pending } := by
+  rfl
+
+private theorem cleanupOutboundIfEndStream_pendingOutbound_override
+    (state : State) (pending : Array Frame) (frame : Frame) :
+    cleanupOutboundIfEndStream { state with pendingOutbound := pending } frame =
+      { cleanupOutboundIfEndStream state frame with pendingOutbound := pending } := by
+  unfold cleanupOutboundIfEndStream
+  split <;> rfl
+
+private theorem flushOutboundCursor_eq_reference :
+    ∀ (fuel : Nat) (state : State) (frames : Array Frame) (index : Nat)
+      (hcursor : index + fuel = frames.size) (hpending : state.pendingOutbound = frames)
+      (emitted : Array Frame),
+      flushOutboundCursor fuel state frames index hcursor hpending emitted =
+        flushOutboundReference
+          { state with pendingOutbound := frames.extract index frames.size } emitted := by
+  intro fuel
+  induction fuel with
+  | zero =>
+      intro state frames index hcursor hpending emitted
+      have hindex : frames.size ≤ index := by omega
+      have hempty : frames.extract index frames.size = #[] := by
+        rw [Array.extract_eq_empty_iff]
+        simpa using hindex
+      rw [flushOutboundCursor, finishOutboundCursorState_eq state frames index hpending,
+        hempty, flushOutboundReference]
+      rfl
+  | succ fuel ih =>
+      intro state frames index hcursor hpending emitted
+      have hindex : index < frames.size := by omega
+      have hget : frames[index]? = some frames[index] :=
+        Array.getElem?_eq_getElem hindex
+      have hremaining : 0 < frames.size - index := by omega
+      have hsuffix : (frames.extract index frames.size)[0]? = some frames[index] := by
+        rw [Array.getElem?_extract]
+        simp [hremaining, hget]
+      rw [flushOutboundCursor, flushOutboundReference, hsuffix]
+      simp only
+      split
+      · rw [ih]
+        · simp only [popFirstFrame_extract frames index (Nat.le_of_lt hindex),
+            cleanupOutboundIfEndStream_pendingOutbound_override]
+      · simp only [outboundStreamWindow_pendingOutbound]
+        split
+        · rw [finishOutboundCursorState_eq state frames index hpending]
+        · split
+          · rw [ih]
+            · simp only [debitOutboundWindows_pendingOutbound_override,
+                popFirstFrame_extract frames index (Nat.le_of_lt hindex),
+                cleanupOutboundIfEndStream_pendingOutbound_override]
+          · simp only [debitOutboundWindows_pendingOutbound_override,
+              replaceCursorFrame_eq_replaceFirstFrame frames index _ hindex]
+
+private theorem flushOutboundCandidate_eq_reference (state : State)
+    (emitted : Array Frame) :
+    flushOutboundCandidate state emitted = flushOutboundReference state emitted := by
+  unfold flushOutboundCandidate
+  rw [flushOutboundCursor_eq_reference]
+  simp only [Array.extract_size]
+
+/-- Proof-facing outbound flushing retains the structurally recursive queue
+specification.  Its executable implementation is switched to the cursor only
+after `flushOutboundCandidate_eq_reference` proves exact result equality. -/
+@[implemented_by flushOutboundCandidate]
+def flushOutbound (state : State) (emitted : Array Frame := #[]) :
+    State × Array Frame :=
+  flushOutboundReference state emitted
 
 /-- Queue an ordered outbound frame batch and emit the prefix admitted by peer
 flow-control credit.  New frames are appended after any existing pending work,
@@ -2280,6 +2459,22 @@ private def emitCommittedUnaryTerminal (emit : Array Frame -> IO Unit)
       | .error status => pure (.error status)
 
 namespace TestSupport
+
+/-- Exact former queue-and-flush topology used as the focused differential
+oracle: append incoming frames to existing pending work, then start with an
+empty emitted batch. -/
+@[noinline] def queueOutboundReferenceForBenchmark
+    (state : State) (frames : Array Frame) : State × Array Frame :=
+  flushOutboundReference
+    { state with pendingOutbound := state.pendingOutbound.append frames } #[]
+
+/-- Cursor queue-and-flush topology used by production `queueOutbound`, kept
+noinline so differential tests and benchmarks can compare the same call
+boundary against `queueOutboundReferenceForBenchmark`. -/
+@[noinline] def queueOutboundCandidateForBenchmark
+    (state : State) (frames : Array Frame) : State × Array Frame :=
+  flushOutboundCandidate
+    { state with pendingOutbound := state.pendingOutbound.append frames } #[]
 
 /-- Exact former stream-frame append used as the focused differential oracle. -/
 @[noinline] def appendStreamFrameReferenceForBenchmark
@@ -4976,10 +5171,12 @@ private theorem flushOutbound_fields (state : State) (emitted : Array Frame) :
     (flushOutbound state emitted).1.streams = state.streams
       ∧ (flushOutbound state emitted).1.activeRequestStreams = state.activeRequestStreams
       ∧ (flushOutbound state emitted).1.lastClientStreamId = state.lastClientStreamId := by
-  fun_induction flushOutbound state emitted <;>
+  unfold flushOutbound
+  fun_induction flushOutboundReference state emitted <;>
     simp_all +zetaDelta [cleanupOutboundIfEndStream_streams,
       cleanupOutboundIfEndStream_activeRequestStreams,
-      cleanupOutboundIfEndStream_lastClientStreamId, setOutboundStreamWindow]
+      cleanupOutboundIfEndStream_lastClientStreamId, debitOutboundWindows,
+      setOutboundStreamWindow]
 
 private theorem applyInitialWindowSize_ok {state state' : State} {value : Nat}
     (h : applyInitialWindowSize state value = .ok state') :
@@ -5728,7 +5925,8 @@ private theorem flushOutbound_bounded : ∀ (state : State) (emitted : Array Fra
       ∧ (∀ w ∈ (flushOutbound state emitted).1.outboundStreamWindows,
           w.window ≤ (maxStreamId : Int)) := by
   intro state emitted
-  fun_induction flushOutbound state emitted
+  unfold flushOutbound
+  fun_induction flushOutboundReference state emitted
   case case1 => intro hinit hconn hwin; exact ⟨hinit, hconn, hwin⟩
   case case3 => intro hinit hconn hwin; exact ⟨hinit, hconn, hwin⟩
   case case2 =>
@@ -5745,7 +5943,8 @@ private theorem flushOutbound_bounded : ∀ (state : State) (emitted : Array Fra
     rename_i ih
     intro hinit hconn hwin
     have hbound := outboundStreamWindow_le' hinit hwin
-    refine ih ?_ ?_ ?_ <;> simp +zetaDelta only [cleanupOutboundIfEndStream] <;> split
+    refine ih ?_ ?_ ?_ <;>
+      simp +zetaDelta only [cleanupOutboundIfEndStream, debitOutboundWindows] <;> split
     · exact hinit
     · exact hinit
     · exact Nat.le_trans (Nat.sub_le _ _) hconn
@@ -5757,8 +5956,9 @@ private theorem flushOutbound_bounded : ∀ (state : State) (emitted : Array Fra
   case case5 =>
     intro hinit hconn hwin
     have hbound := outboundStreamWindow_le' hinit hwin
-    exact ⟨hinit, Nat.le_trans (Nat.sub_le _ _) hconn,
-      setOutboundStreamWindow_bounded hwin (sub_le_maxStreamId (hbound _))⟩
+    simpa only [debitOutboundWindows] using
+      ⟨hinit, Nat.le_trans (Nat.sub_le _ _) hconn,
+        setOutboundStreamWindow_bounded hwin (sub_le_maxStreamId (hbound _))⟩
 
 private theorem cleanupOutboundIfEndStream_outboundHpack (state : State) (frame : Frame) :
     (cleanupOutboundIfEndStream state frame).outboundHpack = state.outboundHpack := by
@@ -5771,9 +5971,10 @@ private theorem cleanupOutboundIfEndStream_hpack (state : State) (frame : Frame)
 private theorem flushOutbound_tables (state : State) (emitted : Array Frame) :
     (flushOutbound state emitted).1.outboundHpack = state.outboundHpack
       ∧ (flushOutbound state emitted).1.hpack = state.hpack := by
-  fun_induction flushOutbound state emitted <;>
+  unfold flushOutbound
+  fun_induction flushOutboundReference state emitted <;>
     simp_all +zetaDelta [cleanupOutboundIfEndStream_outboundHpack,
-      cleanupOutboundIfEndStream_hpack, setOutboundStreamWindow]
+      cleanupOutboundIfEndStream_hpack, debitOutboundWindows, setOutboundStreamWindow]
 
 private theorem flushOutbound_wellFormed {state : State} (h : WellFormed state)
     (emitted : Array Frame) : WellFormed (flushOutbound state emitted).1 := by
@@ -7029,7 +7230,8 @@ theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
         + dataPayloadBytes (flushOutbound state emitted).2
       = state.outboundConnectionWindow + dataPayloadBytes emitted := by
   intro state emitted
-  fun_induction flushOutbound state emitted
+  unfold flushOutbound
+  fun_induction flushOutboundReference state emitted
   case case1 => rfl
   case case3 => rfl
   case case2 =>
@@ -7042,12 +7244,13 @@ theorem flushOutbound_conserves : ∀ (state : State) (emitted : Array Frame),
     rename_i ih
     rw [ih, cleanupOutboundIfEndStream_outboundConnectionWindow, dataPayloadBytes_push]
     clear ih
-    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, setOutboundStreamWindow]
+    simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, debitOutboundWindows,
+      setOutboundStreamWindow]
     try omega
   case case5 =>
     rw [dataPayloadBytes_push]
     simp_all +zetaDelta [frameDataPayloadBytes, dataFrameWithPayload, withoutEndStream,
-      setOutboundStreamWindow]
+      debitOutboundWindows, setOutboundStreamWindow]
     try omega
 
 /-- Queue-level outbound conservation follows directly from the single flush

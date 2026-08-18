@@ -452,6 +452,7 @@ lean_assurance_test(
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
         "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
         "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
+        "Grpc.Http2.Connection.flushOutbound": "Grpc.Http2.Connection.flushOutboundCandidate",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
         "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
         "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
@@ -782,6 +783,20 @@ lean_binary(
     name = "frame_batch_benchmark",
     srcs = ["Benchmark/FrameBatchBenchmark.lean"],
     tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "outbound_flush_benchmark",
+    srcs = ["Benchmark/OutboundFlushBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "outbound_flush_test",
+    srcs = ["Benchmark/OutboundFlushBenchmark.lean"],
+    args = ["candidate", "unary_128", "1000", "10"],
     deps = [":grpc_lean"],
 )
 
