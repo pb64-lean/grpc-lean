@@ -312,8 +312,225 @@ private def parseBuffered (buffered : ByteArray) (frames : Array Frame) :
   termination_by buffered.size
   decreasing_by exact parseFrame?_rest_size h
 
+/-! The proof-facing decoder above recursively parses progressively shorter
+buffer slices.  The executable cursor below retains the original buffer and
+advances an offset, so each complete frame copies only its payload and the
+terminal residual suffix is copied at most once. -/
+
+@[inline] private def finishDecodeCursor (source : ByteArray) (offset : Nat)
+    (frames : Array Frame) : DecodeState :=
+  if offset = 0 then
+    { buffered := source, frames := frames }
+  else
+    { buffered := source.extract offset source.size, frames := frames }
+
+@[inline] private def decodeHeaderAt (source : ByteArray) (offset : Nat) : FrameHeader :=
+  {
+    length := readUInt24BE source offset,
+    frameType := FrameType.ofUInt8 source[offset + 3]!,
+    flags := source[offset + 4]!,
+    streamId := readUInt32BE source (offset + 5) % (maxStreamId + 1)
+  }
+
+private def parseBufferedCursor (source : ByteArray) (offset : Nat)
+    (frames : Array Frame) : Except Status DecodeState :=
+  if source.size < offset + frameHeaderSize then
+    .ok (finishDecodeCursor source offset frames)
+  else
+    let header := decodeHeaderAt source offset
+    let next := offset + frameHeaderSize + header.length
+    if source.size < next then
+      .ok (finishDecodeCursor source offset frames)
+    else
+      parseBufferedCursor source next (frames.push {
+        header := header,
+        payload := source.extract (offset + frameHeaderSize) next
+      })
+  termination_by source.size - offset
+  decreasing_by
+    simp_all +zetaDelta only [frameHeaderSize]
+    omega
+
+private def decodeChunkCandidate (state : DecodeState) (chunk : ByteArray) :
+    Except Status DecodeState :=
+  let source := state.buffered.append chunk
+  parseBufferedCursor source 0 #[]
+
+private theorem finishDecodeCursor_eq (source : ByteArray) (offset : Nat)
+    (frames : Array Frame) :
+    finishDecodeCursor source offset frames = {
+      buffered := source.extract offset source.size,
+      frames := frames
+    } := by
+  unfold finishDecodeCursor
+  split
+  next hzero => subst offset; simp
+  next => rfl
+
+private theorem get!_extract_suffix {source : ByteArray} {offset i : Nat}
+    (h : offset + i < source.size) :
+    (source.extract offset source.size)[i]! = source[offset + i]! := by
+  have hi : i < (source.extract offset source.size).size := by
+    simp only [ByteArray.size_extract, Nat.min_self]
+    omega
+  rw [getElem!_pos (source.extract offset source.size) i hi,
+    getElem!_pos source (offset + i) h, ByteArray.getElem_extract]
+
+private theorem readUInt24BE_extract_suffix (source : ByteArray) (offset : Nat)
+    (h : offset + 3 ≤ source.size) :
+    readUInt24BE (source.extract offset source.size) 0 =
+      readUInt24BE source offset := by
+  unfold readUInt24BE
+  rw [get!_extract_suffix (i := 0) (by omega),
+    get!_extract_suffix (i := 1) (by omega),
+    get!_extract_suffix (i := 2) (by omega)]
+  simp only [Nat.add_zero]
+
+private theorem readUInt32BE_extract_suffix (source : ByteArray) (offset : Nat)
+    (h : offset + 9 ≤ source.size) :
+    readUInt32BE (source.extract offset source.size) 5 =
+      readUInt32BE source (offset + 5) := by
+  unfold readUInt32BE
+  rw [get!_extract_suffix (i := 5) (by omega),
+    get!_extract_suffix (i := 6) (by omega),
+    get!_extract_suffix (i := 7) (by omega),
+    get!_extract_suffix (i := 8) (by omega)]
+
+private theorem decodeHeader_extract_suffix (source : ByteArray) (offset : Nat)
+    (h : offset + frameHeaderSize ≤ source.size) :
+    decodeHeader (source.extract offset source.size) =
+      .ok (decodeHeaderAt source offset) := by
+  unfold decodeHeader
+  rw [if_neg]
+  · unfold decodeHeaderAt
+    rw [readUInt24BE_extract_suffix source offset (by
+        simp only [frameHeaderSize] at h
+        omega),
+      get!_extract_suffix (i := 3) (by
+        simp only [frameHeaderSize] at h
+        omega),
+      get!_extract_suffix (i := 4) (by
+        simp only [frameHeaderSize] at h
+        omega),
+      readUInt32BE_extract_suffix source offset (by
+        simpa only [frameHeaderSize] using h)]
+    rfl
+  · simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+    simp only [frameHeaderSize] at h
+    omega
+
+private theorem extract_extract_suffix {source : ByteArray} {offset start stop : Nat}
+    (h : offset + stop ≤ source.size) :
+    (source.extract offset source.size).extract start stop =
+      source.extract (offset + start) (offset + stop) := by
+  rw [ByteArray.extract_extract, Nat.min_eq_left h]
+
+private theorem extract_suffix_to_end {source : ByteArray} {offset start : Nat}
+    (h : offset ≤ source.size) :
+    (source.extract offset source.size).extract start
+        (source.extract offset source.size).size =
+      source.extract (offset + start) source.size := by
+  rw [ByteArray.extract_extract, ByteArray.size_extract, Nat.min_self]
+  have hsize : offset + (source.size - offset) = source.size := by omega
+  rw [hsize, Nat.min_self]
+
+private theorem parseBufferedCursor_eq_reference (source : ByteArray) (offset : Nat)
+    (frames : Array Frame) :
+    parseBufferedCursor source offset frames =
+      parseBuffered (source.extract offset source.size) frames := by
+  fun_induction parseBufferedCursor source offset frames
+  next hshort =>
+    rw [finishDecodeCursor_eq, parseBuffered.eq_def]
+    unfold parseFrame?
+    rw [if_pos]
+    simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+    simp only [frameHeaderSize] at hshort
+    omega
+  next hheader header next hincomplete =>
+    rename_i offset frames
+    have hheaderBound : offset + frameHeaderSize ≤ source.size := by omega
+    rw [finishDecodeCursor_eq, parseBuffered.eq_def]
+    unfold parseFrame?
+    rw [if_neg]
+    · rw [decodeHeader_extract_suffix source offset hheaderBound]
+      simp only
+      rw [if_pos]
+      simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+      simp_all +zetaDelta only [frameHeaderSize]
+      omega
+    · simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+      simp only [frameHeaderSize] at hheader
+      omega
+  next hheader header next hcomplete ih =>
+    rename_i offset frames
+    have hheaderBound : offset + frameHeaderSize ≤ source.size := by omega
+    have hoffset : offset ≤ source.size := by
+      simp only [frameHeaderSize] at hheader
+      omega
+    have hpayload :
+        (source.extract offset source.size).extract frameHeaderSize
+            (frameHeaderSize + header.length) =
+          source.extract (offset + frameHeaderSize) next := by
+      rw [extract_extract_suffix]
+      · simp only [next, Nat.add_assoc]
+      · simp_all +zetaDelta only [frameHeaderSize]
+        omega
+    have hrest :
+        (source.extract offset source.size).extract
+            (frameHeaderSize + header.length)
+            (source.extract offset source.size).size =
+          source.extract next source.size := by
+      rw [extract_suffix_to_end hoffset]
+      simp only [next, Nat.add_assoc]
+    rw [parseBuffered.eq_def]
+    unfold parseFrame?
+    rw [if_neg]
+    · rw [decodeHeader_extract_suffix source offset hheaderBound]
+      simp only
+      rw [if_neg]
+      · rw [hpayload, hrest]
+        exact ih
+      · simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+        simp_all +zetaDelta only [frameHeaderSize]
+        omega
+    · simp only [ByteArray.size_extract, Nat.min_self, frameHeaderSize]
+      simp only [frameHeaderSize] at hheader
+      omega
+
+@[implemented_by decodeChunkCandidate]
 def decodeChunk (state : DecodeState) (chunk : ByteArray) : Except Status DecodeState :=
   parseBuffered (state.buffered.append chunk) #[]
+
+namespace TestSupport
+
+/-- Exact pre-cursor decoder retained for differential benchmarks. -/
+@[noinline] def decodeChunkReferenceForBenchmark (state : DecodeState)
+    (chunk : ByteArray) : Except Status DecodeState :=
+  parseBuffered (state.buffered.append chunk) #[]
+
+/-- Executable cursor decoder retained as a direct differential seam. -/
+@[noinline] def decodeChunkCandidateForBenchmark (state : DecodeState)
+    (chunk : ByteArray) : Except Status DecodeState :=
+  decodeChunkCandidate state chunk
+
+end TestSupport
+
+/-- The executable offset cursor has exactly the result of the annotated
+logical decoder for every state and chunk. -/
+theorem decodeChunkCandidate_eq_decodeChunk (state : DecodeState) (chunk : ByteArray) :
+    TestSupport.decodeChunkCandidateForBenchmark state chunk =
+      decodeChunk state chunk := by
+  unfold TestSupport.decodeChunkCandidateForBenchmark decodeChunkCandidate decodeChunk
+  rw [parseBufferedCursor_eq_reference]
+  simp only [ByteArray.extract_zero_size]
+
+/-- The benchmark seams retain the same total equality independently of the
+production implementation selection. -/
+theorem decodeChunkCandidate_eq_reference (state : DecodeState) (chunk : ByteArray) :
+    TestSupport.decodeChunkCandidateForBenchmark state chunk =
+      TestSupport.decodeChunkReferenceForBenchmark state chunk := by
+  rw [decodeChunkCandidate_eq_decodeChunk]
+  rfl
 
 def decodeAll (bytes : ByteArray) : Except Status (Array Frame) := do
   let state ← decodeChunk {} bytes

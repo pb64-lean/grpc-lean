@@ -451,6 +451,7 @@ lean_assurance_test(
         "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
         "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
+        "Grpc.Http2.Frame.decodeChunk": "Grpc.Http2.Frame.decodeChunkCandidate",
         "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
         "Grpc.Http2.Connection.flushOutbound": "Grpc.Http2.Connection.flushOutboundCandidate",
         "Grpc.Http2.Connection.processUnaryRequestData": "Grpc.Http2.Connection.processUnaryRequestDataCandidate",
@@ -716,6 +717,12 @@ lean_test(
     deps = [":grpc_lean"],
 )
 
+lean_test(
+    name = "frame_parser_cursor_test",
+    srcs = ["Test/FrameParserCursorTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_binary(
     name = "hpack_benchmark",
     srcs = ["Benchmark/HpackBenchmark.lean"],
@@ -881,6 +888,20 @@ lean_binary(
     name = "frame_header_decode_benchmark",
     srcs = ["Benchmark/FrameHeaderDecodeBenchmark.lean"],
     tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "frame_parser_cursor_benchmark",
+    srcs = ["Benchmark/FrameParserCursorBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "frame_parser_cursor_benchmark_test",
+    srcs = ["Benchmark/FrameParserCursorBenchmark.lean"],
+    args = ["candidate", "unary_three", "100", "10"],
     deps = [":grpc_lean"],
 )
 
