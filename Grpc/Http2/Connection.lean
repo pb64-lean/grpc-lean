@@ -1721,7 +1721,7 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
                   headers.endStream, .rejected frames))
           match state.deadlineScheduler with
           | some scheduler =>
-              if registry.usesCustomRequestHeaderAuthorizer then
+              if registry.usesEffectfulRequestHeaderResolution entry then
                 let cancelled ← IO.mkRef false
                 let deadlineChild ← IO.mkRef (none : Option DeadlineChild)
                 let active : ActiveAuthorization := {
@@ -2344,7 +2344,11 @@ private def runPendingAuthorization (registry : Registry)
     | .error status => pure (.error status)
     | .ok (.reject status) => pure (.error status)
     | .ok (.accept handler) =>
-        pure (.ok { authorization.entry with handler := handler })
+        pure (.ok {
+          authorization.entry with
+          handler := handler
+          requestHeaderHandlerResolver := .registered
+        })
 
 /-- Commit an authorization result against current connection state.  The
 outbound HPACK encoder is intentionally read only now—not when the callback

@@ -64,6 +64,61 @@ def main : IO Unit := do
   Grpc.Server.wait server
 ```
 
+### Method-local authentication
+
+An authenticated method can resolve its principal from the completed request
+headers without adding that principal to the protobuf request.  The resolver
+runs at `END_HEADERS`, before request DATA is accepted, and the selected
+handler closes over an `Authenticated Principal` capability:
+
+```lean
+def authenticator : Grpc.RequestAuthenticator Principal := .pure fun metadata =>
+  match metadata.getLast? "authorization" with
+  | some bearer => resolveBearer bearer       -- Except Grpc.Status Principal
+  | none => .error (Grpc.Status.error .unauthenticated "missing bearer token")
+
+def registry : Grpc.Registry :=
+  Grpc.Registry.empty.registerAuthenticatedUnaryCodec
+    createWidgetMethod authenticator CreateWidgetRequest.decode Widget.encode
+    fun principal request =>
+      createWidget principal.value request
+```
+
+`Authenticated` has a public `value` projection and a private constructor, so
+ordinary handlers can consume the established principal but cannot mint the
+capability. `RequestAuthenticator.pure` is for bounded, non-blocking token
+checks and remains on the inline header path. `RequestAuthenticator.effectful`
+accepts a `GrpcM` lookup; only methods using it enter the connection-owned,
+deadline-bounded cancellation path. Unrelated public and pure-authenticated
+methods retain their fast paths.
+
+Authenticated `*Codec` and `*CodecWithContext` variants exist for unary and
+both aggregate (`Array`) and incremental (`MessageStream`) forms of all
+streaming shapes. The lower-level `Registry.registerAuthenticated` accepts an
+arbitrary shape-indexed raw handler. Resolution composes in this order:
+method-local authentication, `withPureRequestHeaderAuthorizer` or
+`withRequestHeaderAuthorizer`, then every `withHandlerInterceptor` wrapper.
+Use `withHandlerInterceptor` for logging, tracing, or policy wrappers that
+must see the effective capability handler; `mapEntries` only rewrites the
+registered fallback and can therefore be bypassed by a resolved handler.
+
+Generated and hand-written multi-method services should preflight their whole
+method-name array with `Registry.ensureMethodsAvailable`, then append every
+ordinary and authenticated entry only after that check succeeds. This rejects
+both an existing registry collision and a duplicate inside the new batch,
+making mixed-service registration all-or-nothing. For individual protected
+methods, `registerAuthenticatedChecked` and every authenticated codec's
+`...Checked` variant return `Except DuplicateMethod Registry`. The original
+unchecked registrations remain for source compatibility but must not be used
+with names that have not already been atomically preflighted.
+
+The method-local resolver belongs to the HTTP/2 `END_HEADERS` lifecycle.
+Low-level in-memory `Registry.dispatch*` helpers deliberately retain their
+legacy behavior and do not run header callbacks; an authenticated entry used
+through them reaches its `UNAUTHENTICATED` fail-closed fallback. Tests or
+adapters that bypass HTTP/2 must call `authorizeRequestHeaders` themselves and
+pass the accepted shape-specific handler to the dispatch helper.
+
 Entry points: `serve` (managed accept loop with connection registry, keepalive,
 and shutdown bookkeeping), `serveTls`, `serveForever`/`acceptOne` (unmanaged),
 and `serveClient`/`serveClientWithState` for bring-your-own-socket or shared

@@ -103,6 +103,20 @@ abbrev TypedClientStreamingStreamContextHandler (α β : Type) :=
 abbrev TypedBidirectionalStreamingStreamContextHandler (α β : Type) :=
   RequestContext -> MessageStream α -> GrpcM (MessageStream β)
 
+/-- A value established from authenticated request metadata.  The constructor
+is private: application handlers can inspect `value`, but only grpc-lean's
+request-authentication registration path can mint the capability. -/
+structure Authenticated (α : Type) where
+  private mk ::
+  value : α
+
+/-- Resolve an application principal from a completed request header block.
+Pure authenticators run inline; effectful authenticators participate in the
+call's cancellation and deadline lifecycle. -/
+inductive RequestAuthenticator (α : Type) where
+  | pure (authenticate : Metadata -> Except Status α)
+  | effectful (authenticate : Metadata -> GrpcM α)
+
 /--
 The seven RPC shapes a registered method handler may have.  The `*Stream`
 shapes consume or produce incremental `MessageStream`s; the others use
@@ -133,12 +147,32 @@ runtime check.
   | .bidirectionalStreaming => BidirectionalStreamingHandler
   | .bidirectionalStreamingStream => BidirectionalStreamingStreamHandler
 
+/-- Method-local resolution of the handler selected at `END_HEADERS`.  An
+authenticated registration uses this resolver to capture its authenticated
+principal in the exact handler that later receives request DATA. -/
+inductive RequestHeaderHandlerResolver (shape : RpcShape) where
+  | registered
+  | pure (resolve : Metadata -> Except Status (Handler shape))
+  | effectful (resolve : Metadata -> GrpcM (Handler shape))
+
+namespace RequestHeaderHandlerResolver
+
+def isEffectful : RequestHeaderHandlerResolver shape -> Bool
+  | .effectful _ => true
+  | _ => false
+
+end RequestHeaderHandlerResolver
+
 /-- A registered RPC method: a name, a shape, and a handler of exactly that
 shape.  A handler of the wrong shape for the entry is unrepresentable. -/
 structure MethodEntry where
   name : MethodName
   shape : RpcShape
   handler : Handler shape
+  /-- A shape-preserving handler resolver local to this method.  The default
+  retains the historical registered-handler fast path. -/
+  requestHeaderHandlerResolver :
+    optParam (RequestHeaderHandlerResolver shape) (.registered) := .registered
 
 /-- The handler of `entry` at `shape`, when `entry` has that shape. -/
 def MethodEntry.handlerFor? (entry : MethodEntry) (shape : RpcShape) :
@@ -181,6 +215,11 @@ while it runs.  Throwing a `Status` is equivalent to returning `.reject`.
 abbrev RequestHeaderAuthorizer :=
   (entry : MethodEntry) -> Metadata -> GrpcM (AuthorizationResult entry)
 
+/-- A shape-preserving interceptor applied to the effective handler after
+method-local resolution and registry-global request authorization. -/
+abbrev HandlerInterceptor :=
+  (entry : MethodEntry) -> Handler entry.shape -> Handler entry.shape
+
 /-- Registration rejected because the method name is already registered. -/
 structure DuplicateMethod where
   name : MethodName
@@ -195,6 +234,7 @@ structure Registry where
   private pureRequestHeaderAuthorizer : Option PureRequestHeaderAuthorizer := none
   private requestHeaderAuthorizer : RequestHeaderAuthorizer := fun entry _ =>
     pure (.accept entry.handler)
+  private handlerInterceptors : Array HandlerInterceptor := #[]
   entries : Array MethodEntry := #[]
   /-- Lets the transport keep the zero-overhead registered-handler fast path
   while deadline-racing only user-installed authorization IO. -/
@@ -236,6 +276,13 @@ def withPureRequestHeaderAuthorizer (registry : Registry)
     customRequestHeaderAuthorizer := false
   }
 
+/-- Append an interceptor for the effective handler selected for each call.
+Unlike rewriting `entry.handler` with `mapEntries`, this also wraps handlers
+created by method-local authentication or a global header authorizer. -/
+def withHandlerInterceptor (registry : Registry)
+    (interceptor : HandlerInterceptor) : Registry :=
+  { registry with handlerInterceptors := registry.handlerInterceptors.push interceptor }
+
 /-- Whether header authorization contains user IO that must share the call's
 deadline.  The backing fields are private so installing a callback cannot
 silently bypass this invariant; use `withRequestHeaderAuthorizer` or
@@ -249,10 +296,68 @@ def pureRequestHeaderAuthorizer? (registry : Registry) :
     Option PureRequestHeaderAuthorizer :=
   registry.pureRequestHeaderAuthorizer
 
-/-- Run the installed request-header authorizer for a looked-up entry. -/
+/-- Whether resolving this entry requires user `IO`.  This is entry-aware:
+effectful method authentication does not move unrelated methods off the pure
+header path. -/
+def usesEffectfulRequestHeaderResolution (registry : Registry)
+    (entry : MethodEntry) : Bool :=
+  registry.customRequestHeaderAuthorizer ||
+    entry.requestHeaderHandlerResolver.isEffectful
+
+private def interceptHandler (registry : Registry) (entry : MethodEntry)
+    (handler : Handler entry.shape) : Handler entry.shape :=
+  registry.handlerInterceptors.foldl (fun handler interceptor =>
+    interceptor entry handler) handler
+
+private def authorizePureResolvedHandler (registry : Registry) (entry : MethodEntry)
+    (metadata : Metadata) (handler : Handler entry.shape) : AuthorizationResult entry :=
+  let resolvedEntry := {
+    entry with
+    handler := handler
+    requestHeaderHandlerResolver := .registered
+  }
+  let globalDecision := match registry.pureRequestHeaderAuthorizer with
+    | some authorizer => authorizer resolvedEntry metadata
+    | none => AuthorizationResult.acceptRegistered resolvedEntry
+  match globalDecision with
+  | .reject status => .reject status
+  | .accept handler => .accept (registry.interceptHandler entry handler)
+
+/-- The complete bounded-pure resolver for one entry, when both its local
+resolver and the registry-global authorizer are pure. -/
+def pureRequestHeaderAuthorizerFor? (registry : Registry) (entry : MethodEntry) :
+    Option (Metadata -> AuthorizationResult entry) :=
+  if registry.customRequestHeaderAuthorizer then
+    none
+  else
+    match entry.requestHeaderHandlerResolver with
+    | .registered =>
+        match registry.pureRequestHeaderAuthorizer with
+        | none => none
+        | some _ => some fun metadata =>
+            registry.authorizePureResolvedHandler entry metadata entry.handler
+    | .pure resolve => some fun metadata =>
+        match resolve metadata with
+        | .error status => .reject status
+        | .ok handler => registry.authorizePureResolvedHandler entry metadata handler
+    | .effectful _ => none
+
+/-- Run method-local handler resolution, the installed registry-global
+authorizer, and effective-handler interceptors, in that order. -/
 def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)
-    (metadata : Metadata) : GrpcM (AuthorizationResult entry) :=
-  registry.requestHeaderAuthorizer entry metadata
+    (metadata : Metadata) : GrpcM (AuthorizationResult entry) := do
+  let handler ← match entry.requestHeaderHandlerResolver with
+    | .registered => pure entry.handler
+    | .pure resolve => GrpcM.ofExcept (resolve metadata)
+    | .effectful resolve => resolve metadata
+  let resolvedEntry := {
+    entry with
+    handler := handler
+    requestHeaderHandlerResolver := .registered
+  }
+  match ← registry.requestHeaderAuthorizer resolvedEntry metadata with
+  | .reject status => pure (.reject status)
+  | .accept handler => pure (.accept (registry.interceptHandler entry handler))
 
 /-- Append a method entry.  Lookup is first-match-wins, so an entry never
 shadows an earlier registration of the same name. -/
@@ -267,10 +372,30 @@ def registerChecked (registry : Registry) (entry : MethodEntry) :
   | some _ => .error { name := entry.name }
   | none => .ok (registry.register entry)
 
+private def firstUnavailableMethod? (registry : Registry) :
+    List MethodName -> List MethodName -> Option MethodName
+  | [], _ => none
+  | name :: remaining, seen =>
+      if registry.entries.any (fun entry => entry.name == name) || seen.contains name then
+        some name
+      else
+        firstUnavailableMethod? registry remaining (name :: seen)
+
+/-- Check that every method in a prospective registration batch is absent
+from this registry and occurs only once in the batch.  Success returns the
+unchanged registry so generated service registration can preflight its whole
+method set before applying a pure append pipeline. -/
+def ensureMethodsAvailable (registry : Registry) (names : Array MethodName) :
+    Except DuplicateMethod Registry :=
+  match firstUnavailableMethod? registry names.toList [] with
+  | some name => .error { name := name }
+  | none => .ok registry
+
 /-- Transform every registered entry, keeping the installed request-header
-authorizer and its custom flag intact.  This is the server-interceptor idiom:
-after all services are registered, rewrite each entry wholesale, for example
-wrapping every handler with cross-cutting authorization.  Mapping keeps
+authorizer and its custom flag intact.  This is useful for structural entry
+changes and for wrapping registered fallback handlers.  To wrap the effective
+handler selected by method-local authentication or global authorization, use
+`withHandlerInterceptor`.  Mapping keeps
 registration order and entry count, so first-match-wins lookup resolves the
 same position as before.  `Registry.WellFormed` (name uniqueness) is
 preserved when `f` preserves each entry's `name`
@@ -304,6 +429,393 @@ def registerBidirectionalStreaming (registry : Registry) (name : MethodName)
 def registerBidirectionalStreamingStream (registry : Registry) (name : MethodName)
     (handler : BidirectionalStreamingStreamHandler) : Registry :=
   registry.register { name := name, shape := .bidirectionalStreamingStream, handler := handler }
+
+private def unauthenticatedHandler : (shape : RpcShape) -> Handler shape
+  | .unary => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .serverStreaming => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .serverStreamingStream => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .clientStreaming => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .clientStreamingStream => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .bidirectionalStreaming => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+  | .bidirectionalStreamingStream => fun _ =>
+      throw (Status.error .unauthenticated
+        "authenticated method was dispatched without resolving request headers")
+
+private def authenticatedHandlerResolver (authenticator : RequestAuthenticator principal)
+    (handler : Authenticated principal -> Handler shape) :
+    RequestHeaderHandlerResolver shape :=
+  match authenticator with
+  | .pure authenticate => .pure fun metadata =>
+      (authenticate metadata).map fun principal => handler ⟨principal⟩
+  | .effectful authenticate => .effectful fun metadata => do
+      let principal ← authenticate metadata
+      pure (handler ⟨principal⟩)
+
+private def authenticatedMethodEntry (name : MethodName) (shape : RpcShape)
+    (authenticator : RequestAuthenticator principal)
+    (handler : Authenticated principal -> Handler shape) : MethodEntry := {
+  name := name
+  shape := shape
+  handler := unauthenticatedHandler shape
+  requestHeaderHandlerResolver := authenticatedHandlerResolver authenticator handler
+}
+
+/-- Register a shape-indexed handler whose effective implementation is created
+only after its request metadata authenticates successfully.  The registered
+raw handler is deliberately fail-closed. -/
+def registerAuthenticated (registry : Registry) (name : MethodName) (shape : RpcShape)
+    (authenticator : RequestAuthenticator principal)
+    (handler : Authenticated principal -> Handler shape) : Registry :=
+  registry.register (authenticatedMethodEntry name shape authenticator handler)
+
+/-- Checked authenticated registration.  A duplicate leaves the input
+registry unchanged and returns the colliding method name. -/
+def registerAuthenticatedChecked (registry : Registry) (name : MethodName) (shape : RpcShape)
+    (authenticator : RequestAuthenticator principal)
+    (handler : Authenticated principal -> Handler shape) : Except DuplicateMethod Registry :=
+  registry.registerChecked (authenticatedMethodEntry name shape authenticator handler)
+
+/-- Register an authenticated unary protobuf codec handler with request
+context. Authentication completes at `END_HEADERS`, before decoding DATA. -/
+def registerAuthenticatedUnaryCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α -> GrpcM β) : Registry :=
+  registry.registerAuthenticated name .unary authenticator fun principal request => do
+    let input ← GrpcM.ofExcept <|
+      match decode request.data with
+      | .ok value => .ok value
+      | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let output ← handler (RequestContext.ofUnaryRequest request) principal input
+    let data ← GrpcM.ofExcept <|
+      match encode output with
+      | .ok value => .ok value
+      | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+
+def registerAuthenticatedUnaryCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM β) : Registry :=
+  registry.registerAuthenticatedUnaryCodecWithContext name authenticator decode encode
+    (fun _ principal input => handler principal input)
+
+def registerAuthenticatedServerStreamingCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α -> GrpcM (Array β)) : Registry :=
+  registry.registerAuthenticated name .serverStreaming authenticator fun principal request => do
+    let input ← GrpcM.ofExcept <|
+      match decode request.data with
+      | .ok value => .ok value
+      | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler (RequestContext.ofUnaryRequest request) principal input
+    let messages ← outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+
+def registerAuthenticatedServerStreamingCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM (Array β)) : Registry :=
+  registry.registerAuthenticatedServerStreamingCodecWithContext name authenticator decode encode
+    (fun _ principal input => handler principal input)
+
+def registerAuthenticatedServerStreamingStreamCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α ->
+      GrpcM (MessageStream β)) : Registry :=
+  registry.registerAuthenticated name .serverStreamingStream authenticator fun principal request => do
+    let input ← GrpcM.ofExcept <|
+      match decode request.data with
+      | .ok value => .ok value
+      | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler (RequestContext.ofUnaryRequest request) principal input
+    let messages := outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+
+def registerAuthenticatedServerStreamingStreamCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM (MessageStream β)) : Registry :=
+  registry.registerAuthenticatedServerStreamingStreamCodecWithContext
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedClientStreamingCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> Array α -> GrpcM β) : Registry :=
+  registry.registerAuthenticated name .clientStreaming authenticator fun principal request => do
+    let inputs ← request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let output ← handler (RequestContext.ofClientStreamingRequest request) principal inputs
+    let data ← GrpcM.ofExcept <|
+      match encode output with
+      | .ok value => .ok value
+      | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+
+def registerAuthenticatedClientStreamingCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> Array α -> GrpcM β) : Registry :=
+  registry.registerAuthenticatedClientStreamingCodecWithContext name authenticator decode encode
+    (fun _ principal input => handler principal input)
+
+def registerAuthenticatedClientStreamingStreamCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> MessageStream α -> GrpcM β) :
+    Registry :=
+  registry.registerAuthenticated name .clientStreamingStream authenticator fun principal request => do
+    let inputs := request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let output ← handler
+      (RequestContext.ofClientStreamingStreamRequest request) principal inputs
+    let data ← GrpcM.ofExcept <|
+      match encode output with
+      | .ok value => .ok value
+      | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+
+def registerAuthenticatedClientStreamingStreamCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> MessageStream α -> GrpcM β) : Registry :=
+  registry.registerAuthenticatedClientStreamingStreamCodecWithContext
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedBidirectionalStreamingCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> Array α ->
+      GrpcM (Array β)) : Registry :=
+  registry.registerAuthenticated name .bidirectionalStreaming authenticator fun principal request => do
+    let inputs ← request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler (RequestContext.ofClientStreamingRequest request) principal inputs
+    let messages ← outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+
+def registerAuthenticatedBidirectionalStreamingCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> Array α -> GrpcM (Array β)) : Registry :=
+  registry.registerAuthenticatedBidirectionalStreamingCodecWithContext
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedBidirectionalStreamingStreamCodecWithContext [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> MessageStream α ->
+      GrpcM (MessageStream β)) : Registry :=
+  registry.registerAuthenticated name .bidirectionalStreamingStream authenticator
+      fun principal request => do
+    let inputs := request.messages.mapM fun message =>
+      GrpcM.ofExcept <|
+        match decode message with
+        | .ok value => .ok value
+        | .error err => .error (Status.invalidArgument s!"failed to decode request: {err}")
+    let outputs ← handler
+      (RequestContext.ofClientStreamingStreamRequest request) principal inputs
+    let messages := outputs.mapM fun output =>
+      GrpcM.ofExcept <|
+        match encode output with
+        | .ok value => .ok value
+        | .error err => .error (Status.internal s!"failed to encode response: {err}")
+    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+
+def registerAuthenticatedBidirectionalStreamingStreamCodec [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> MessageStream α ->
+      GrpcM (MessageStream β)) : Registry :=
+  registry.registerAuthenticatedBidirectionalStreamingStreamCodecWithContext
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+private def checkedAuthenticatedCodecRegistration (registry : Registry)
+    (name : MethodName) (register : Registry -> Registry) : Except DuplicateMethod Registry :=
+  (registry.ensureMethodsAvailable #[name]).map fun _ => register registry
+
+def registerAuthenticatedUnaryCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedUnaryCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedUnaryCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedUnaryCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedServerStreamingCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α -> GrpcM (Array β)) :
+    Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedServerStreamingCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedServerStreamingCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM (Array β)) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedServerStreamingCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedServerStreamingStreamCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> α ->
+      GrpcM (MessageStream β)) : Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedServerStreamingStreamCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedServerStreamingStreamCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> α -> GrpcM (MessageStream β)) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedServerStreamingStreamCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedClientStreamingCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> Array α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedClientStreamingCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedClientStreamingCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> Array α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedClientStreamingCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedClientStreamingStreamCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> MessageStream α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedClientStreamingStreamCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedClientStreamingStreamCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> MessageStream α -> GrpcM β) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedClientStreamingStreamCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedBidirectionalStreamingCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> Array α ->
+      GrpcM (Array β)) : Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedBidirectionalStreamingCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedBidirectionalStreamingCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> Array α -> GrpcM (Array β)) :
+    Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedBidirectionalStreamingCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
+
+def registerAuthenticatedBidirectionalStreamingStreamCodecWithContextChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : RequestContext -> Authenticated principal -> MessageStream α ->
+      GrpcM (MessageStream β)) : Except DuplicateMethod Registry :=
+  checkedAuthenticatedCodecRegistration registry name fun registry =>
+    registry.registerAuthenticatedBidirectionalStreamingStreamCodecWithContext
+      name authenticator decode encode handler
+
+def registerAuthenticatedBidirectionalStreamingStreamCodecChecked [ToString ε]
+    (registry : Registry) (name : MethodName)
+    (authenticator : RequestAuthenticator principal)
+    (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)
+    (handler : Authenticated principal -> MessageStream α ->
+      GrpcM (MessageStream β)) : Except DuplicateMethod Registry :=
+  registry.registerAuthenticatedBidirectionalStreamingStreamCodecWithContextChecked
+    name authenticator decode encode (fun _ principal input => handler principal input)
 
 def registerUnaryCodecWithContext [ToString ε] (registry : Registry) (name : MethodName)
     (decode : ByteArray -> Except ε α) (encode : β -> Except ε ByteArray)

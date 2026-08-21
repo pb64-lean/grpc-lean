@@ -706,17 +706,17 @@ def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.Stat
 
 /-- Run bounded pure authorization inline, with the same absolute deadline
 checked immediately before and after the callback. -/
-private def authorizePureEntryUntilWithClock (now : IO Nat)
-    (authorizer : PureRequestHeaderAuthorizer) (entry : MethodEntry)
+private def authorizePureEntryUntilWithClock (now : IO Nat) (entry : MethodEntry)
+    (authorizer : Metadata -> AuthorizationResult entry)
     (metadata : Metadata) (deadline : Option Nat) :
     IO (Except Status (AuthorizationResult entry)) := do
   match deadline with
-  | none => pure (.ok (authorizer entry metadata))
+  | none => pure (.ok (authorizer metadata))
   | some deadline =>
       if deadline <= (← now) then
         pure (.error Deadline.exceededStatus)
       else
-        let decision := authorizer entry metadata
+        let decision := authorizer metadata
         if deadline <= (← now) then
           pure (.error Deadline.exceededStatus)
         else
@@ -730,11 +730,11 @@ private def authorizeEntryUntilWithClock (now : IO Nat) (registry : Registry)
     (metadata : Metadata) (deadline : Option Nat)
     (runtime? : Option DeadlineRuntime := none) :
     IO (Except Status (AuthorizationResult entry)) := do
-  match registry.pureRequestHeaderAuthorizer? with
+  match registry.pureRequestHeaderAuthorizerFor? entry with
   | some authorizer =>
-      authorizePureEntryUntilWithClock now authorizer entry metadata deadline
+      authorizePureEntryUntilWithClock now entry authorizer metadata deadline
   | none =>
-      if !registry.usesCustomRequestHeaderAuthorizer || deadline.isNone then
+      if !registry.usesEffectfulRequestHeaderResolution entry || deadline.isNone then
         try
           registry.authorizeRequestHeaders entry metadata |>.run
         catch error =>
@@ -816,7 +816,11 @@ def authorizePreflightedEarlyRequest (registry : Registry) (state : Hpack.State)
     | .error encodeStatus => .error encodeStatus
   let authorizationResult ← authorizeEntryUntil registry entry metadata deadline runtime?
   match authorizationResult with
-  | .ok (.accept handler) => pure (.ok (.accept { entry with handler := handler }))
+  | .ok (.accept handler) => pure (.ok (.accept {
+      entry with
+      handler := handler
+      requestHeaderHandlerResolver := .registered
+    }))
   | .ok (.reject status) => pure (rejectWith status)
   | .error status => pure (rejectWith status)
 
@@ -1176,7 +1180,11 @@ def dispatchDecodedUnaryFramesWithAsync (registry : Registry) (outboundHpack : H
                   encodeUnary { status := status, data := ByteArray.empty }
               | .ok (.reject status) =>
                   encodeUnary { status := status, data := ByteArray.empty }
-              | .ok (.accept handler) => runEntry { entry with handler := handler }
+              | .ok (.accept handler) => runEntry {
+                  entry with
+                  handler := handler
+                  requestHeaderHandlerResolver := .registered
+                }
 
 def dispatchDecodedUnaryFramesWith (registry : Registry) (outboundHpack : Hpack.State)
     (request : UnaryRequestFrames) (emit : Array Frame -> IO Unit)

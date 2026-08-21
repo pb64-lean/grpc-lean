@@ -676,6 +676,18 @@ lean_test(
 )
 
 lean_test(
+    name = "authenticated_server_test",
+    srcs = ["Test/AuthenticatedServerTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "authenticated_privacy_test",
+    srcs = ["Test/AuthenticatedPrivacyTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "deadline_arbiter_test",
     srcs = ["Test/DeadlineArbiterTest.lean"],
     deps = [":grpc_lean"],
