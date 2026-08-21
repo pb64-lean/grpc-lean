@@ -462,6 +462,7 @@ lean_assurance_test(
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
+        "Grpc.Headers.requestHeaderPreflight": "Grpc.Protocol.Grpc.Headers.requestHeaderPreflightCandidate",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
     },
     expected_extern_declarations = {
@@ -723,6 +724,12 @@ lean_test(
     deps = [":grpc_lean"],
 )
 
+lean_test(
+    name = "request_preflight_summary_test",
+    srcs = ["Test/RequestPreflightSummaryTest.lean"],
+    deps = [":grpc_lean"],
+)
+
 lean_binary(
     name = "hpack_benchmark",
     srcs = ["Benchmark/HpackBenchmark.lean"],
@@ -902,6 +909,20 @@ lean_test(
     name = "frame_parser_cursor_benchmark_test",
     srcs = ["Benchmark/FrameParserCursorBenchmark.lean"],
     args = ["candidate", "unary_three", "100", "10"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "request_preflight_summary_benchmark",
+    srcs = ["Benchmark/RequestPreflightSummaryBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "request_preflight_summary_benchmark_test",
+    srcs = ["Benchmark/RequestPreflightSummaryBenchmark.lean"],
+    args = ["candidate", "client_default_7", "100", "10"],
     deps = [":grpc_lean"],
 )
 

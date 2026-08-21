@@ -749,10 +749,13 @@ def requestUsesGzip (metadata : Metadata) : Except Status Bool := do
 def validateRequestEncoding (metadata : Metadata) : Except Status Unit := do
   discard <| requestUsesGzip metadata
 
+/-- Whether one `grpc-accept-encoding` value advertises gzip. -/
+private def valueAcceptsGzip (value : String) : Bool :=
+  value.splitOn "," |>.any fun token => token.trim == gzipEncoding
+
 /-- Whether the client's `grpc-accept-encoding` header advertises gzip. -/
 def clientAcceptsGzip (metadata : Metadata) : Bool :=
-  metadata.getAll "grpc-accept-encoding" |>.any fun value =>
-    value.splitOn "," |>.any fun token => token.trim == gzipEncoding
+  metadata.getAll "grpc-accept-encoding" |>.any valueAcceptsGzip
 
 /-! Parsed facts retained by a managed HTTP/2 connection after the request
 header block has passed the complete gRPC validation sequence. -/
@@ -763,6 +766,431 @@ structure RequestPreflight where
   requestUsesGzip : Bool
   clientAcceptsGzip : Bool
   deriving Repr, DecidableEq
+
+/-! The managed HTTP/2 preflight needs the first value of four pseudo headers,
+singleton/count information for five ordinary headers, and every raw
+accepted-encoding value.  On accepted requests, its historical implementation
+obtains those facts with ten complete metadata scans after `Metadata.validate`.
+The executable scanner below collects the same raw facts in one pass. It
+recognizes the two prefix-stable outcomes while scanning, while timeout,
+length, encoding, and accept-encoding token parsing remain deferred so
+established error precedence is unchanged. -/
+
+private structure HeaderOccurrence where
+  first? : Option String := none
+  count : Nat := 0
+
+@[inline] private def HeaderOccurrence.add (occurrence : HeaderOccurrence)
+    (value : String) : HeaderOccurrence :=
+  {
+    first? := match occurrence.first? with
+      | none => some value
+      | some first => some first
+    count := occurrence.count + 1
+  }
+
+private structure RequestHeaderSummary where
+  method? : Option String := none
+  scheme? : Option String := none
+  status? : Option String := none
+  path? : Option String := none
+  contentType : HeaderOccurrence := {}
+  te : HeaderOccurrence := {}
+  timeout : HeaderOccurrence := {}
+  contentLength : HeaderOccurrence := {}
+  requestEncoding : HeaderOccurrence := {}
+  clientAcceptEncodingValues : Array String := #[]
+
+@[inline] private def rememberFirst (current : Option String) (value : String) :
+    Option String :=
+  match current with
+  | none => some value
+  | some first => some first
+
+@[inline] private def summarizeRequestHeader (summary : RequestHeaderSummary)
+    (header : Header) : RequestHeaderSummary :=
+  let nameLength := header.name.utf8ByteSize
+  match nameLength with
+  | 2 =>
+      if header.name == "te" then
+        { summary with te := summary.te.add header.value }
+      else
+        summary
+  | 5 =>
+      if header.name == ":path" then
+        { summary with path? := rememberFirst summary.path? header.value }
+      else
+        summary
+  | 7 =>
+      if header.name == ":method" then
+        { summary with method? := rememberFirst summary.method? header.value }
+      else if header.name == ":scheme" then
+        { summary with scheme? := rememberFirst summary.scheme? header.value }
+      else if header.name == ":status" then
+        { summary with status? := rememberFirst summary.status? header.value }
+      else
+        summary
+  | 12 =>
+      if header.name == "content-type" then
+        { summary with contentType := summary.contentType.add header.value }
+      else if header.name == "grpc-timeout" then
+        { summary with timeout := summary.timeout.add header.value }
+      else
+        summary
+  | 13 =>
+      if header.name == "grpc-encoding" then
+        { summary with requestEncoding := summary.requestEncoding.add header.value }
+      else
+        summary
+  | 14 =>
+      if header.name == "content-length" then
+        { summary with contentLength := summary.contentLength.add header.value }
+      else
+        summary
+  | 20 =>
+      if header.name == "grpc-accept-encoding" then
+        { summary with clientAcceptEncodingValues :=
+            summary.clientAcceptEncodingValues.push header.value }
+      else
+        summary
+  | _ => summary
+
+private inductive RequestHeaderScanStop where
+  | unsupportedContentType
+  | reject (status : Status)
+
+private inductive RequestHeaderScanState where
+  | summarize (summary : RequestHeaderSummary)
+  | pendingReject (status : Status)
+
+private def invalidMethodStatus : Status :=
+  Status.invalidArgument "gRPC requests must use POST"
+
+@[inline] private def scanRequestHeader (state : RequestHeaderScanState)
+    (header : Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
+  let nameLength := header.name.utf8ByteSize
+  match state with
+  | .pendingReject status =>
+      match nameLength with
+      | 12 =>
+          if header.name == "content-type" then
+            if isGrpcContentType header.value then
+              .error (.reject status)
+            else
+              .error .unsupportedContentType
+          else
+            .ok state
+      | _ => .ok state
+  | .summarize summary =>
+      match nameLength with
+      | 2 =>
+          if header.name == "te" then
+            .ok (.summarize
+              { summary with te := summary.te.add header.value })
+          else
+            .ok state
+      | 5 =>
+          if header.name == ":path" then
+            .ok (.summarize
+              { summary with path? := rememberFirst summary.path? header.value })
+          else
+            .ok state
+      | 7 =>
+          if header.name == ":method" then
+            match summary.method? with
+            | some _ => .ok state
+            | none =>
+                if header.value == "POST" then
+                  .ok (.summarize { summary with method? := some header.value })
+                else
+                  match summary.contentType.first? with
+                  | some _ => .error (.reject invalidMethodStatus)
+                  | none => .ok (.pendingReject invalidMethodStatus)
+          else if header.name == ":scheme" then
+            .ok (.summarize
+              { summary with scheme? := rememberFirst summary.scheme? header.value })
+          else if header.name == ":status" then
+            .ok (.summarize
+              { summary with status? := rememberFirst summary.status? header.value })
+          else
+            .ok state
+      | 12 =>
+          if header.name == "content-type" then
+            match summary.contentType.first? with
+            | some _ =>
+                .ok (.summarize
+                  { summary with contentType := summary.contentType.add header.value })
+            | none =>
+                if isGrpcContentType header.value then
+                  .ok (.summarize
+                    { summary with contentType := summary.contentType.add header.value })
+                else
+                  .error .unsupportedContentType
+          else if header.name == "grpc-timeout" then
+            .ok (.summarize
+              { summary with timeout := summary.timeout.add header.value })
+          else
+            .ok state
+      | 13 =>
+          if header.name == "grpc-encoding" then
+            .ok (.summarize
+              { summary with requestEncoding := summary.requestEncoding.add header.value })
+          else
+            .ok state
+      | 14 =>
+          if header.name == "content-length" then
+            .ok (.summarize
+              { summary with contentLength := summary.contentLength.add header.value })
+          else
+            .ok state
+      | 20 =>
+          if header.name == "grpc-accept-encoding" then
+            .ok (.summarize
+              { summary with clientAcceptEncodingValues :=
+                  summary.clientAcceptEncodingValues.push header.value })
+          else
+            .ok state
+      | _ => .ok state
+
+/-- Proof-facing fold specification for the direct scanner below. -/
+private def scanRequestHeadersCandidate (metadata : Metadata) :
+    Except RequestHeaderScanStop RequestHeaderScanState :=
+  metadata.foldlM scanRequestHeader (.summarize {})
+
+private def summarizeRequestHeadersCandidate (metadata : Metadata) :
+    RequestHeaderSummary :=
+  metadata.foldl summarizeRequestHeader {}
+
+private def occurrenceReference (metadata : Metadata) (name : String) :
+    HeaderOccurrence :=
+  let values := metadata.getAll name
+  { first? := values[0]?, count := values.size }
+
+private def summarizeRequestHeadersReference (metadata : Metadata) :
+    RequestHeaderSummary :=
+  {
+    method? := metadata.get? ":method"
+    scheme? := metadata.get? ":scheme"
+    status? := metadata.get? ":status"
+    path? := metadata.get? ":path"
+    contentType := occurrenceReference metadata "content-type"
+    te := occurrenceReference metadata "te"
+    timeout := occurrenceReference metadata "grpc-timeout"
+    contentLength := occurrenceReference metadata "content-length"
+    requestEncoding := occurrenceReference metadata "grpc-encoding"
+    clientAcceptEncodingValues := metadata.getAll "grpc-accept-encoding"
+  }
+
+private theorem normalizeName_eq_self_of_map (name : String)
+    (h : name.toList.map Char.toLower = name.toList) :
+    Header.normalizeName name = name := by
+  apply Header.normalizeName_eq_self
+  unfold String.toLower
+  rw [← String.toList_inj, String.toList_map]
+  exact h
+
+private theorem normalizeName_method : Header.normalizeName ":method" = ":method" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_scheme : Header.normalizeName ":scheme" = ":scheme" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_status : Header.normalizeName ":status" = ":status" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_path : Header.normalizeName ":path" = ":path" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_contentType :
+    Header.normalizeName "content-type" = "content-type" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_te : Header.normalizeName "te" = "te" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_timeout :
+    Header.normalizeName "grpc-timeout" = "grpc-timeout" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_contentLength :
+    Header.normalizeName "content-length" = "content-length" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_requestEncoding :
+    Header.normalizeName "grpc-encoding" = "grpc-encoding" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+private theorem normalizeName_acceptEncoding :
+    Header.normalizeName "grpc-accept-encoding" = "grpc-accept-encoding" := by
+  apply normalizeName_eq_self_of_map
+  simp [Char.toLower]
+
+@[simp] private theorem utf8ByteSize_te : "te".utf8ByteSize = 2 := by decide
+@[simp] private theorem utf8ByteSize_path : ":path".utf8ByteSize = 5 := by decide
+@[simp] private theorem utf8ByteSize_method : ":method".utf8ByteSize = 7 := by decide
+@[simp] private theorem utf8ByteSize_scheme : ":scheme".utf8ByteSize = 7 := by decide
+@[simp] private theorem utf8ByteSize_status : ":status".utf8ByteSize = 7 := by decide
+@[simp] private theorem utf8ByteSize_contentType :
+    "content-type".utf8ByteSize = 12 := by decide
+@[simp] private theorem utf8ByteSize_timeout :
+    "grpc-timeout".utf8ByteSize = 12 := by decide
+@[simp] private theorem utf8ByteSize_requestEncoding :
+    "grpc-encoding".utf8ByteSize = 13 := by decide
+@[simp] private theorem utf8ByteSize_contentLength :
+    "content-length".utf8ByteSize = 14 := by decide
+@[simp] private theorem utf8ByteSize_acceptEncoding :
+    "grpc-accept-encoding".utf8ByteSize = 20 := by decide
+
+private theorem summarizeRequestHeader_contentType_first?_of_some
+    (summary : RequestHeaderSummary) (header : Header) (value : String)
+    (hfirst : summary.contentType.first? = some value) :
+    (summarizeRequestHeader summary header).contentType.first? = some value := by
+  grind [summarizeRequestHeader, HeaderOccurrence.add]
+
+private theorem summarizeRequestHeader_method?_of_some
+    (summary : RequestHeaderSummary) (header : Header) (value : String)
+    (hfirst : summary.method? = some value) :
+    (summarizeRequestHeader summary header).method? = some value := by
+  grind [summarizeRequestHeader, rememberFirst]
+
+private theorem summarizeRequestHeader_contentType_first?_of_none
+    (summary : RequestHeaderSummary) (header : Header)
+    (hfirst : summary.contentType.first? = none) :
+    (summarizeRequestHeader summary header).contentType.first? =
+      if header.name == "content-type" then some header.value else none := by
+  by_cases hname : header.name = "content-type"
+  · simp_all [summarizeRequestHeader, HeaderOccurrence.add]
+  · grind [summarizeRequestHeader, HeaderOccurrence.add]
+
+private theorem summarizeRequestHeader_method?_of_none
+    (summary : RequestHeaderSummary) (header : Header)
+    (hfirst : summary.method? = none) :
+    (summarizeRequestHeader summary header).method? =
+      if header.name == ":method" then some header.value else none := by
+  by_cases hname : header.name = ":method"
+  · simp_all [summarizeRequestHeader, rememberFirst]
+  · grind [summarizeRequestHeader, rememberFirst]
+
+private theorem getAll_push (metadata : Metadata) (header : Header) (name : String) :
+    Metadata.getAll (metadata.push header) name =
+      if header.name == Header.normalizeName name then
+        (Metadata.getAll metadata name).push header.value
+      else
+        Metadata.getAll metadata name := by
+  simp only [Metadata.getAll]
+  split <;> simp_all
+
+private theorem first?_push (values : Array String) (value : String) :
+    (values.push value)[0]? = rememberFirst values[0]? value := by
+  cases values with
+  | mk values => cases values <;> simp [rememberFirst]
+
+private theorem get?_push (metadata : Metadata) (header : Header) (name : String) :
+    Metadata.get? (metadata.push header) name =
+      if header.name == Header.normalizeName name then
+        rememberFirst (Metadata.get? metadata name) header.value
+      else
+        Metadata.get? metadata name := by
+  unfold Metadata.get?
+  rw [getAll_push]
+  split
+  next => rw [first?_push]
+  next => rfl
+
+private theorem occurrenceOfValues_push (values : Array String) (value : String) :
+    ({
+      first? := (values.push value)[0]?
+      count := (values.push value).size
+    } : HeaderOccurrence) = ({
+      first? := values[0]?
+      count := values.size
+    } : HeaderOccurrence).add value := by
+  cases values with
+  | mk values => cases values <;> simp [HeaderOccurrence.add]
+
+private theorem occurrenceReference_push (metadata : Metadata) (header : Header)
+    (name : String) :
+    occurrenceReference (metadata.push header) name =
+      if header.name == Header.normalizeName name then
+        (occurrenceReference metadata name).add header.value
+      else
+        occurrenceReference metadata name := by
+  unfold occurrenceReference
+  rw [getAll_push]
+  split
+  next => exact occurrenceOfValues_push _ _
+  next => rfl
+
+private theorem summarizeRequestHeadersReference_push (metadata : Metadata)
+    (header : Header) :
+    summarizeRequestHeadersReference (metadata.push header) =
+      summarizeRequestHeader (summarizeRequestHeadersReference metadata) header := by
+  unfold summarizeRequestHeadersReference summarizeRequestHeader
+  simp only [get?_push, occurrenceReference_push, getAll_push,
+    normalizeName_method, normalizeName_scheme, normalizeName_status,
+    normalizeName_path, normalizeName_contentType, normalizeName_te,
+    normalizeName_timeout, normalizeName_contentLength,
+    normalizeName_requestEncoding, normalizeName_acceptEncoding]
+  by_cases hmethod : header.name = ":method"
+  · simp_all
+  by_cases hscheme : header.name = ":scheme"
+  · simp_all
+  by_cases hstatus : header.name = ":status"
+  · simp_all
+  by_cases hpath : header.name = ":path"
+  · simp_all
+  by_cases hcontentType : header.name = "content-type"
+  · simp_all
+  by_cases hte : header.name = "te"
+  · simp_all
+  by_cases htimeout : header.name = "grpc-timeout"
+  · simp_all
+  by_cases hcontentLength : header.name = "content-length"
+  · simp_all
+  by_cases hrequestEncoding : header.name = "grpc-encoding"
+  · simp_all
+  by_cases hacceptEncoding : header.name = "grpc-accept-encoding"
+  · simp_all
+  grind
+
+private theorem array_push_induction {α : Type} {motive : Array α → Prop}
+    (empty : motive #[])
+    (push : ∀ (values : Array α) (value : α),
+      motive values → motive (values.push value))
+    (values : Array α) : motive values := by
+  suffices h : ∀ reverse : List α, motive reverse.reverse.toArray by
+    simpa using h values.toList.reverse
+  intro reverse
+  induction reverse with
+  | nil => simpa using empty
+  | cons value rest ih =>
+      rw [List.reverse_cons]
+      have harray : (rest.reverse ++ [value]).toArray =
+          rest.reverse.toArray.push value := by
+        rw [← Array.toList_inj]
+        simp
+      rw [harray]
+      exact push _ _ ih
+
+private theorem summarizeRequestHeadersCandidate_eq_reference (metadata : Metadata) :
+    summarizeRequestHeadersCandidate metadata =
+      summarizeRequestHeadersReference metadata := by
+  apply array_push_induction (values := metadata)
+  · simp [summarizeRequestHeadersCandidate, summarizeRequestHeadersReference,
+      occurrenceReference, Metadata.get?, Metadata.getAll]
+  · intro values value ih
+    rw [summarizeRequestHeadersReference_push]
+    unfold summarizeRequestHeadersCandidate at ih ⊢
+    rw [Array.foldl_push, ih]
 
 private structure ValidatedRequestCore where
   method : MethodName
@@ -833,6 +1261,656 @@ def validateUnaryRequestPreflightAfterMetadata (metadata : Metadata)
     requestUsesGzip := core.requestUsesGzip
     clientAcceptsGzip := clientAcceptsGzip metadata
   }
+
+private def singletonOccurrence? (name : String) (occurrence : HeaderOccurrence) :
+    Except Status (Option String) := do
+  if occurrence.count > 1 then
+    throw (Status.invalidArgument s!"duplicate {Header.normalizeName name} header")
+  else
+    pure occurrence.first?
+
+private def timeoutOccurrence? (occurrence : HeaderOccurrence) :
+    Except Status (Option Timeout) := do
+  match ← singletonOccurrence? "grpc-timeout" occurrence with
+  | none => pure none
+  | some value =>
+      match Timeout.parse? value with
+      | some timeout => pure (some timeout)
+      | none => throw (Status.invalidArgument s!"invalid grpc-timeout header {value}")
+
+private def contentLengthOccurrence? (occurrence : HeaderOccurrence) :
+    Except Status (Option Nat) := do
+  match ← singletonOccurrence? "content-length" occurrence with
+  | none => pure none
+  | some value =>
+      match value.toNat? with
+      | some length => pure (some length)
+      | none => throw (Status.invalidArgument s!"invalid content-length header {value}")
+
+private def requestUsesGzipOccurrence (occurrence : HeaderOccurrence) :
+    Except Status Bool := do
+  match ← singletonOccurrence? "grpc-encoding" occurrence with
+  | none => pure false
+  | some value =>
+      if value == identityEncoding then
+        pure false
+      else if value == gzipEncoding then
+        pure true
+      else
+        throw (Status.unimplemented s!"unsupported grpc-encoding {value}")
+
+private def validateUnaryRequestSummaryCore (summary : RequestHeaderSummary) :
+    Except Status ValidatedRequestCore := do
+  match summary.method? with
+  | some "POST" => pure ()
+  | some _ => throw (Status.invalidArgument "gRPC requests must use POST")
+  | none => throw (Status.invalidArgument "missing :method header")
+
+  match summary.scheme? with
+  | some "http" => pure ()
+  | some "https" => pure ()
+  | some value => throw (Status.invalidArgument s!"unsupported gRPC scheme {value}")
+  | none => throw (Status.invalidArgument "missing :scheme header")
+
+  match summary.status? with
+  | some _ => throw (Status.invalidArgument "gRPC requests must not include :status")
+  | none => pure ()
+
+  let path ← match summary.path? with
+    | some path => pure path
+    | none => throw (Status.invalidArgument "missing :path header")
+
+  let method ← match MethodName.parsePath? path with
+    | some method => pure method
+    | none => throw (Status.invalidArgument s!"invalid gRPC method path {path}")
+
+  match ← singletonOccurrence? "content-type" summary.contentType with
+  | some value =>
+      if isGrpcContentType value then pure () else
+        throw (Status.invalidArgument s!"unsupported content-type {value}")
+  | none => throw (Status.invalidArgument "missing content-type header")
+
+  match ← singletonOccurrence? "te" summary.te with
+  | some "trailers" => pure ()
+  | some _ => throw (Status.invalidArgument "gRPC requests must send te: trailers")
+  | none => throw (Status.invalidArgument "missing te header")
+
+  let timeout ← timeoutOccurrence? summary.timeout
+  let contentLength ← contentLengthOccurrence? summary.contentLength
+  let requestUsesGzip ← requestUsesGzipOccurrence summary.requestEncoding
+
+  pure {
+    method := method
+    timeout := timeout
+    contentLength := contentLength
+    requestUsesGzip := requestUsesGzip
+  }
+
+private def validateUnaryRequestSummary (summary : RequestHeaderSummary) :
+    Except Status RequestPreflight := do
+  let core ← validateUnaryRequestSummaryCore summary
+  pure {
+    method := core.method
+    timeout := core.timeout
+    contentLength := core.contentLength
+    requestUsesGzip := core.requestUsesGzip
+    clientAcceptsGzip := summary.clientAcceptEncodingValues.any valueAcceptsGzip
+  }
+
+private theorem singletonOccurrence_reference (metadata : Metadata) (name : String) :
+    singletonOccurrence? name (occurrenceReference metadata name) =
+      singletonHeader? metadata name := by
+  unfold singletonOccurrence? occurrenceReference singletonHeader? singletonValues?
+  rfl
+
+private theorem singletonOccurrence_values_reference (metadata : Metadata)
+    (name : String) :
+    singletonOccurrence? name (occurrenceReference metadata name) =
+      singletonValues? name (metadata.getAll name) := by
+  unfold singletonOccurrence? occurrenceReference singletonValues?
+  rfl
+
+private theorem timeoutOccurrence_reference (metadata : Metadata) :
+    timeoutOccurrence? (occurrenceReference metadata "grpc-timeout") =
+      timeout? metadata := by
+  unfold timeoutOccurrence? timeout?
+  rw [singletonOccurrence_reference]
+
+private theorem contentLengthOccurrence_reference (metadata : Metadata) :
+    contentLengthOccurrence? (occurrenceReference metadata "content-length") =
+      contentLength? metadata := by
+  unfold contentLengthOccurrence? contentLength?
+  rw [singletonOccurrence_reference]
+
+private theorem requestUsesGzipOccurrence_reference (metadata : Metadata) :
+    requestUsesGzipOccurrence (occurrenceReference metadata "grpc-encoding") =
+      requestUsesGzip metadata := by
+  unfold requestUsesGzipOccurrence requestUsesGzip
+  rw [singletonOccurrence_reference]
+
+private theorem validateUnaryRequestSummaryCore_reference (metadata : Metadata) :
+    validateUnaryRequestSummaryCore (summarizeRequestHeadersReference metadata) =
+      validateUnaryRequestCoreAfterMetadata metadata
+        (metadata.getAll "content-type") := by
+  unfold validateUnaryRequestSummaryCore summarizeRequestHeadersReference
+    validateUnaryRequestCoreAfterMetadata
+  simp only [singletonOccurrence_values_reference, singletonHeader?,
+    timeoutOccurrence_reference, contentLengthOccurrence_reference,
+    requestUsesGzipOccurrence_reference]
+
+private theorem validateUnaryRequestSummary_reference (metadata : Metadata) :
+    validateUnaryRequestSummary (summarizeRequestHeadersReference metadata) =
+      validateUnaryRequestPreflightAfterMetadata metadata
+        (metadata.getAll "content-type") := by
+  unfold validateUnaryRequestSummary validateUnaryRequestPreflightAfterMetadata
+  rw [validateUnaryRequestSummaryCore_reference]
+  unfold summarizeRequestHeadersReference clientAcceptsGzip
+  rfl
+
+/-- Pure classification used after `Metadata.validate` and before response
+encoding or registry lookup. `unsupportedContentType` retains the historical
+HTTP 415 path, while `reject` carries the exact gRPC validation status. -/
+inductive RequestHeaderPreflightResult where
+  | unsupportedContentType
+  | reject (status : Status)
+  | accept (preflight : RequestPreflight)
+  deriving Repr, DecidableEq
+
+private def requestHeaderPreflightValidatedSummary (summary : RequestHeaderSummary) :
+    RequestHeaderPreflightResult :=
+  match validateUnaryRequestSummary summary with
+  | .error status => .reject status
+  | .ok preflight => .accept preflight
+
+private def requestHeaderPreflightReference (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  let contentTypes := metadata.getAll "content-type"
+  match contentTypes[0]? with
+  | some value =>
+      if !isGrpcContentType value then
+        .unsupportedContentType
+      else
+        match validateUnaryRequestPreflightAfterMetadata metadata contentTypes with
+        | .error status => .reject status
+        | .ok preflight => .accept preflight
+  | none =>
+      match validateUnaryRequestPreflightAfterMetadata metadata contentTypes with
+      | .error status => .reject status
+      | .ok preflight => .accept preflight
+
+private def requestHeaderPreflightSummary (summary : RequestHeaderSummary) :
+    RequestHeaderPreflightResult :=
+  match summary.contentType.first? with
+  | some value =>
+      if !isGrpcContentType value then
+        .unsupportedContentType
+      else
+        requestHeaderPreflightValidatedSummary summary
+  | none => requestHeaderPreflightValidatedSummary summary
+
+private def requestHeaderPreflightCandidateLogical (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  requestHeaderPreflightSummary (summarizeRequestHeadersCandidate metadata)
+
+private def requestHeaderScanStopResult (stop : RequestHeaderScanStop) :
+    RequestHeaderPreflightResult :=
+  match stop with
+  | .unsupportedContentType => .unsupportedContentType
+  | .reject status => .reject status
+
+private def finishRequestHeaderScan
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
+    RequestHeaderPreflightResult :=
+  match outcome with
+  | .error stop => requestHeaderScanStopResult stop
+  | .ok (.pendingReject status) => .reject status
+  | .ok (.summarize summary) => requestHeaderPreflightValidatedSummary summary
+
+private def firstContentTypeSupported (summary : RequestHeaderSummary) : Prop :=
+  match summary.contentType.first? with
+  | none => True
+  | some value => isGrpcContentType value = true
+
+private def firstMethodAccepted (summary : RequestHeaderSummary) : Prop :=
+  match summary.method? with
+  | none => True
+  | some value => value = "POST"
+
+private def RequestHeaderScanMatches
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
+    (summary : RequestHeaderSummary) : Prop :=
+  match outcome with
+  | .ok (.summarize scanned) =>
+      scanned = summary ∧ firstContentTypeSupported summary ∧
+        firstMethodAccepted summary
+  | .ok (.pendingReject status) =>
+      status = invalidMethodStatus ∧ summary.contentType.first? = none ∧
+        ∃ value, summary.method? = some value ∧ value ≠ "POST"
+  | .error .unsupportedContentType =>
+      ∃ value, summary.contentType.first? = some value ∧
+        isGrpcContentType value = false
+  | .error (.reject status) =>
+      status = invalidMethodStatus ∧
+        (∃ contentType, summary.contentType.first? = some contentType ∧
+          isGrpcContentType contentType = true) ∧
+        ∃ value, summary.method? = some value ∧ value ≠ "POST"
+
+private theorem scanRequestHeader_regular (summary : RequestHeaderSummary)
+    (header : Header) (hmethod : header.name ≠ ":method")
+    (hcontentType : header.name ≠ "content-type") :
+    scanRequestHeader (.summarize summary) header =
+      .ok (.summarize (summarizeRequestHeader summary header)) := by
+  grind [scanRequestHeader, summarizeRequestHeader,
+    utf8ByteSize_te, utf8ByteSize_path, utf8ByteSize_method,
+    utf8ByteSize_scheme, utf8ByteSize_status, utf8ByteSize_contentType,
+    utf8ByteSize_timeout, utf8ByteSize_requestEncoding,
+    utf8ByteSize_contentLength, utf8ByteSize_acceptEncoding, Except.pure]
+
+private theorem firstContentTypeSupported_regular
+    (summary : RequestHeaderSummary) (header : Header)
+    (hcontentType : header.name ≠ "content-type")
+    (hsupported : firstContentTypeSupported summary) :
+    firstContentTypeSupported (summarizeRequestHeader summary header) := by
+  unfold firstContentTypeSupported at hsupported ⊢
+  cases hfirst : summary.contentType.first? with
+  | none =>
+      rw [summarizeRequestHeader_contentType_first?_of_none _ _ hfirst]
+      simp [hcontentType]
+  | some value =>
+      rw [summarizeRequestHeader_contentType_first?_of_some _ _ _ hfirst]
+      simpa [hfirst] using hsupported
+
+private theorem firstMethodAccepted_regular (summary : RequestHeaderSummary)
+    (header : Header) (hmethod : header.name ≠ ":method")
+    (haccepted : firstMethodAccepted summary) :
+    firstMethodAccepted (summarizeRequestHeader summary header) := by
+  unfold firstMethodAccepted at haccepted ⊢
+  cases hfirst : summary.method? with
+  | none =>
+      rw [summarizeRequestHeader_method?_of_none _ _ hfirst]
+      simp [hmethod]
+  | some value =>
+      rw [summarizeRequestHeader_method?_of_some _ _ _ hfirst]
+      simpa [hfirst] using haccepted
+
+private theorem scanRequestHeader_summarize_matches
+    (summary : RequestHeaderSummary) (header : Header)
+    (hcontentType : firstContentTypeSupported summary)
+    (hmethod : firstMethodAccepted summary) :
+    RequestHeaderScanMatches (scanRequestHeader (.summarize summary) header)
+      (summarizeRequestHeader summary header) := by
+  by_cases hmethodName : header.name = ":method"
+  · cases hmethodFirst : summary.method? with
+    | none =>
+        cases hcontentFirst : summary.contentType.first? with
+        | none =>
+            by_cases hpost : header.value = "POST"
+            · simp_all [scanRequestHeader, summarizeRequestHeader,
+                RequestHeaderScanMatches, firstContentTypeSupported,
+                firstMethodAccepted, rememberFirst]
+            · simp_all [scanRequestHeader, summarizeRequestHeader,
+                RequestHeaderScanMatches, firstContentTypeSupported,
+                firstMethodAccepted, rememberFirst]
+        | some contentType =>
+            by_cases hpost : header.value = "POST"
+            · simp_all [scanRequestHeader, summarizeRequestHeader,
+                RequestHeaderScanMatches, firstContentTypeSupported,
+                firstMethodAccepted, rememberFirst]
+            · simp_all [scanRequestHeader, summarizeRequestHeader,
+                RequestHeaderScanMatches, firstContentTypeSupported,
+                firstMethodAccepted, rememberFirst]
+    | some method =>
+        simp [firstMethodAccepted, hmethodFirst] at hmethod
+        subst method
+        cases summary
+        simp_all [scanRequestHeader, summarizeRequestHeader,
+          RequestHeaderScanMatches, firstContentTypeSupported,
+          firstMethodAccepted, rememberFirst]
+  · by_cases hcontentTypeName : header.name = "content-type"
+    · cases hcontentFirst : summary.contentType.first? with
+      | none =>
+          cases hsupported : isGrpcContentType header.value <;>
+            simp_all [scanRequestHeader, summarizeRequestHeader,
+              RequestHeaderScanMatches, firstContentTypeSupported,
+              firstMethodAccepted, HeaderOccurrence.add]
+      | some contentType =>
+          simp [firstContentTypeSupported, hcontentFirst] at hcontentType
+          simp_all [scanRequestHeader, summarizeRequestHeader,
+            RequestHeaderScanMatches, firstContentTypeSupported,
+            firstMethodAccepted, HeaderOccurrence.add]
+    · rw [scanRequestHeader_regular summary header hmethodName hcontentTypeName]
+      simp [RequestHeaderScanMatches,
+        firstContentTypeSupported_regular summary header hcontentTypeName hcontentType,
+        firstMethodAccepted_regular summary header hmethodName hmethod]
+
+private theorem scanRequestHeader_pending_matches (status : Status)
+    (summary : RequestHeaderSummary) (header : Header)
+    (hstatus : status = invalidMethodStatus)
+    (hcontentType : summary.contentType.first? = none)
+    (hmethod : ∃ value, summary.method? = some value ∧ value ≠ "POST") :
+    RequestHeaderScanMatches (scanRequestHeader (.pendingReject status) header)
+      (summarizeRequestHeader summary header) := by
+  rcases hmethod with ⟨method, hmethodFirst, hmethodValue⟩
+  by_cases hcontentTypeName : header.name = "content-type"
+  · cases hsupported : isGrpcContentType header.value <;>
+      simp_all [scanRequestHeader, summarizeRequestHeader,
+        RequestHeaderScanMatches, HeaderOccurrence.add]
+  · have hcontentTypeNext :=
+      summarizeRequestHeader_contentType_first?_of_none summary header hcontentType
+    have hmethodNext :=
+      summarizeRequestHeader_method?_of_some summary header method hmethodFirst
+    simp [hcontentTypeName] at hcontentTypeNext
+    grind [scanRequestHeader, RequestHeaderScanMatches,
+      utf8ByteSize_contentType]
+
+private theorem scanRequestHeadersCandidate_matches (metadata : Metadata) :
+    RequestHeaderScanMatches (scanRequestHeadersCandidate metadata)
+      (summarizeRequestHeadersCandidate metadata) := by
+  apply array_push_induction (values := metadata)
+  · simp [scanRequestHeadersCandidate, summarizeRequestHeadersCandidate,
+      RequestHeaderScanMatches, firstContentTypeSupported, firstMethodAccepted,
+      pure, Except.pure]
+  · intro values header ih
+    unfold scanRequestHeadersCandidate summarizeRequestHeadersCandidate at ih ⊢
+    rw [Array.foldlM_push, Array.foldl_push]
+    cases hscan : Array.foldlM scanRequestHeader (.summarize {}) values with
+    | error stop =>
+        change RequestHeaderScanMatches (.error stop)
+          (summarizeRequestHeader
+            (Array.foldl summarizeRequestHeader {} values) header)
+        rw [hscan] at ih
+        cases stop with
+        | unsupportedContentType =>
+            rcases ih with ⟨contentType, hcontentType, hsupported⟩
+            exact ⟨contentType,
+              summarizeRequestHeader_contentType_first?_of_some
+                _ _ _ hcontentType,
+              hsupported⟩
+        | reject status =>
+            rcases ih with
+              ⟨hstatus, ⟨contentType, hcontentType, hsupported⟩,
+                method, hmethod, hmethodValue⟩
+            exact ⟨hstatus,
+              ⟨contentType,
+                summarizeRequestHeader_contentType_first?_of_some
+                  _ _ _ hcontentType,
+                hsupported⟩,
+              method,
+              summarizeRequestHeader_method?_of_some _ _ _ hmethod,
+              hmethodValue⟩
+    | ok state =>
+        change RequestHeaderScanMatches (scanRequestHeader state header)
+          (summarizeRequestHeader
+            (Array.foldl summarizeRequestHeader {} values) header)
+        rw [hscan] at ih
+        cases state with
+        | summarize summary =>
+            rcases ih with ⟨rfl, hcontentType, hmethod⟩
+            exact scanRequestHeader_summarize_matches _ _ hcontentType hmethod
+        | pendingReject status =>
+            rcases ih with ⟨hstatus, hcontentType, hmethod⟩
+            exact scanRequestHeader_pending_matches _ _ _ hstatus hcontentType hmethod
+
+private theorem requestHeaderPreflightValidatedSummary_invalidMethod
+    (summary : RequestHeaderSummary) (method : String)
+    (hmethod : summary.method? = some method) (hmethodValue : method ≠ "POST") :
+    requestHeaderPreflightValidatedSummary summary =
+      .reject invalidMethodStatus := by
+  have hcore : validateUnaryRequestSummaryCore summary =
+      .error (Status.invalidArgument "gRPC requests must use POST") := by
+    unfold validateUnaryRequestSummaryCore
+    rw [hmethod]
+    simp [bind, Except.bind, throw, throwThe,
+      MonadExceptOf.throw]
+  unfold requestHeaderPreflightValidatedSummary validateUnaryRequestSummary
+    invalidMethodStatus
+  rw [hcore]
+  rfl
+
+private theorem finishRequestHeaderScan_matches
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
+    (summary : RequestHeaderSummary)
+    (hmatches : RequestHeaderScanMatches outcome summary) :
+    finishRequestHeaderScan outcome = requestHeaderPreflightSummary summary := by
+  cases outcome with
+  | error stop =>
+      cases stop with
+      | unsupportedContentType =>
+          rcases hmatches with ⟨contentType, hcontentType, hsupported⟩
+          simp [finishRequestHeaderScan, requestHeaderScanStopResult,
+            requestHeaderPreflightSummary, hcontentType, hsupported]
+      | reject status =>
+          rcases hmatches with
+            ⟨hstatus, ⟨contentType, hcontentType, hsupported⟩,
+              method, hmethod, hmethodValue⟩
+          subst status
+          have hvalidated := requestHeaderPreflightValidatedSummary_invalidMethod
+            summary method hmethod hmethodValue
+          simp [finishRequestHeaderScan, requestHeaderScanStopResult,
+            requestHeaderPreflightSummary, hcontentType, hsupported, hvalidated]
+  | ok state =>
+      cases state with
+      | summarize scanned =>
+          rcases hmatches with ⟨rfl, hcontentType, _⟩
+          cases hfirst : scanned.contentType.first? with
+          | none =>
+              simp [finishRequestHeaderScan, requestHeaderPreflightSummary,
+                hfirst]
+          | some contentType =>
+              simp [firstContentTypeSupported, hfirst] at hcontentType
+              simp [finishRequestHeaderScan, requestHeaderPreflightSummary,
+                hfirst, hcontentType]
+      | pendingReject status =>
+          rcases hmatches with
+            ⟨hstatus, hcontentType, method, hmethod, hmethodValue⟩
+          subst status
+          have hvalidated := requestHeaderPreflightValidatedSummary_invalidMethod
+            summary method hmethod hmethodValue
+          simp [finishRequestHeaderScan, requestHeaderPreflightSummary,
+            hcontentType, hvalidated]
+
+private theorem finishRequestHeaderScan_eq_logical (metadata : Metadata) :
+    finishRequestHeaderScan (scanRequestHeadersCandidate metadata) =
+      requestHeaderPreflightCandidateLogical metadata := by
+  unfold requestHeaderPreflightCandidateLogical
+  exact finishRequestHeaderScan_matches _ _
+    (scanRequestHeadersCandidate_matches metadata)
+
+private def requestHeaderPreflightPendingMethodDirect
+    (metadata : Metadata) (index : Nat) (status : Status) :
+    RequestHeaderPreflightResult :=
+  if h : index < metadata.size then
+    let header := metadata[index]
+    let next := index + 1
+    match header.name.utf8ByteSize with
+    | 12 =>
+        if header.name == "content-type" then
+          if isGrpcContentType header.value then
+            .reject status
+          else
+            .unsupportedContentType
+        else
+          requestHeaderPreflightPendingMethodDirect metadata next status
+    | _ => requestHeaderPreflightPendingMethodDirect metadata next status
+  else
+    .reject status
+termination_by metadata.size - index
+decreasing_by all_goals omega
+
+private def requestHeaderPreflightCandidateDirectLoop (metadata : Metadata)
+    (index : Nat) (summary : RequestHeaderSummary) :
+    RequestHeaderPreflightResult :=
+  if h : index < metadata.size then
+    let header := metadata[index]
+    let next := index + 1
+    match header.name.utf8ByteSize with
+    | 2 =>
+        if header.name == "te" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with te := summary.te.add header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 5 =>
+        if header.name == ":path" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with path? := rememberFirst summary.path? header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 7 =>
+        if header.name == ":method" then
+          match summary.method? with
+          | some _ => requestHeaderPreflightCandidateDirectLoop metadata next summary
+          | none =>
+              if header.value == "POST" then
+                requestHeaderPreflightCandidateDirectLoop metadata next
+                  { summary with method? := some header.value }
+              else
+                match summary.contentType.first? with
+                | some _ => .reject invalidMethodStatus
+                | none =>
+                    requestHeaderPreflightPendingMethodDirect metadata next
+                      invalidMethodStatus
+        else if header.name == ":scheme" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with scheme? := rememberFirst summary.scheme? header.value }
+        else if header.name == ":status" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with status? := rememberFirst summary.status? header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 12 =>
+        if header.name == "content-type" then
+          match summary.contentType.first? with
+          | some _ =>
+              requestHeaderPreflightCandidateDirectLoop metadata next
+                { summary with contentType := summary.contentType.add header.value }
+          | none =>
+              if isGrpcContentType header.value then
+                requestHeaderPreflightCandidateDirectLoop metadata next
+                  { summary with contentType := summary.contentType.add header.value }
+              else
+                .unsupportedContentType
+        else if header.name == "grpc-timeout" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with timeout := summary.timeout.add header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 13 =>
+        if header.name == "grpc-encoding" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with requestEncoding := summary.requestEncoding.add header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 14 =>
+        if header.name == "content-length" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with contentLength := summary.contentLength.add header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | 20 =>
+        if header.name == "grpc-accept-encoding" then
+          requestHeaderPreflightCandidateDirectLoop metadata next
+            { summary with clientAcceptEncodingValues :=
+                summary.clientAcceptEncodingValues.push header.value }
+        else
+          requestHeaderPreflightCandidateDirectLoop metadata next summary
+    | _ => requestHeaderPreflightCandidateDirectLoop metadata next summary
+  else
+    requestHeaderPreflightValidatedSummary summary
+termination_by metadata.size - index
+decreasing_by all_goals omega
+
+private def requestHeaderPreflightCandidateDirect (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  requestHeaderPreflightCandidateDirectLoop metadata 0 {}
+
+private theorem requestHeaderPreflightPendingMethodDirect_eq_foldlM
+    (metadata : Metadata) (index : Nat) (status : Status) :
+    requestHeaderPreflightPendingMethodDirect metadata index status =
+      finishRequestHeaderScan
+        ((metadata.toList.drop index).foldlM scanRequestHeader
+          (.pendingReject status)) := by
+  fun_induction requestHeaderPreflightPendingMethodDirect metadata index status <;>
+    simp_all +zetaDelta [List.drop_eq_getElem_cons, List.drop_of_length_le,
+      scanRequestHeader,
+      finishRequestHeaderScan, requestHeaderScanStopResult, bind, Except.bind,
+      pure, Except.pure]
+
+private theorem requestHeaderPreflightCandidateDirectLoop_eq_foldlM
+    (metadata : Metadata) (index : Nat) (summary : RequestHeaderSummary) :
+    requestHeaderPreflightCandidateDirectLoop metadata index summary =
+      finishRequestHeaderScan
+        ((metadata.toList.drop index).foldlM scanRequestHeader
+          (.summarize summary)) := by
+  fun_induction requestHeaderPreflightCandidateDirectLoop metadata index summary <;>
+    simp_all +zetaDelta [List.drop_eq_getElem_cons, List.drop_of_length_le,
+      scanRequestHeader, requestHeaderPreflightPendingMethodDirect_eq_foldlM,
+      finishRequestHeaderScan, requestHeaderScanStopResult, bind, Except.bind,
+      pure, Except.pure]
+
+private theorem requestHeaderPreflightCandidateDirect_eq_logical
+    (metadata : Metadata) :
+    requestHeaderPreflightCandidateDirect metadata =
+      requestHeaderPreflightCandidateLogical metadata := by
+  unfold requestHeaderPreflightCandidateDirect
+  rw [requestHeaderPreflightCandidateDirectLoop_eq_foldlM]
+  simp only [List.drop_zero, Array.foldlM_toList]
+  exact finishRequestHeaderScan_eq_logical metadata
+
+private def requestHeaderPreflightCandidate (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  requestHeaderPreflightCandidateDirect metadata
+
+private theorem requestHeaderPreflightCandidate_eq_logical (metadata : Metadata) :
+    requestHeaderPreflightCandidate metadata =
+      requestHeaderPreflightReference metadata := by
+  unfold requestHeaderPreflightCandidate
+  rw [requestHeaderPreflightCandidateDirect_eq_logical]
+  unfold requestHeaderPreflightReference requestHeaderPreflightCandidateLogical
+    requestHeaderPreflightSummary requestHeaderPreflightValidatedSummary
+  rw [summarizeRequestHeadersCandidate_eq_reference]
+  simp only [validateUnaryRequestSummary_reference]
+  unfold summarizeRequestHeadersReference occurrenceReference
+  rfl
+
+/-- Classify already validated request metadata. The logical body retains the
+former repeated getters; generated code uses the proved direct index scan and
+its prefix-stable short-circuit outcomes. -/
+@[implemented_by requestHeaderPreflightCandidate]
+def requestHeaderPreflight (metadata : Metadata) : RequestHeaderPreflightResult :=
+  requestHeaderPreflightReference metadata
+
+namespace TestSupport
+
+/-- Exact former repeated-scan classifier retained for differential tests. -/
+@[noinline] def requestHeaderPreflightReferenceForBenchmark (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  requestHeaderPreflightReference metadata
+
+/-- Executable direct one-pass classifier retained for differential tests. -/
+@[noinline] def requestHeaderPreflightCandidateForBenchmark (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  requestHeaderPreflightCandidate metadata
+
+end TestSupport
+
+/-- The executable one-pass classifier has exactly the result of the logical
+repeated-scan definition for every metadata array. -/
+theorem requestHeaderPreflightCandidate_eq_requestHeaderPreflight
+    (metadata : Metadata) :
+    TestSupport.requestHeaderPreflightCandidateForBenchmark metadata =
+      requestHeaderPreflight metadata := by
+  unfold TestSupport.requestHeaderPreflightCandidateForBenchmark
+    requestHeaderPreflight
+  exact requestHeaderPreflightCandidate_eq_logical metadata
+
+/-- The independent benchmark seams agree for every metadata array. -/
+theorem requestHeaderPreflightCandidate_eq_reference (metadata : Metadata) :
+    TestSupport.requestHeaderPreflightCandidateForBenchmark metadata =
+      TestSupport.requestHeaderPreflightReferenceForBenchmark metadata := by
+  unfold TestSupport.requestHeaderPreflightCandidateForBenchmark
+    TestSupport.requestHeaderPreflightReferenceForBenchmark
+  exact requestHeaderPreflightCandidate_eq_logical metadata
 
 def validateUnaryRequestPreflight (metadata : Metadata) : Except Status RequestPreflight := do
   Metadata.validate metadata

@@ -45,6 +45,13 @@ differential-tested byte scan to reuse already-normalized ASCII names. -/
 def normalizeName (name : String) : String :=
   name.toLower
 
+/-- A name already fixed by lowercase normalization is also fixed by the
+public header-name normalizer. -/
+theorem normalizeName_eq_self (name : String) (h : name.toLower = name) :
+    normalizeName name = name := by
+  unfold normalizeName
+  exact h
+
 @[expose] def of (name value : String) : Header :=
   { name := normalizeName name, value := value }
 
