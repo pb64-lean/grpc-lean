@@ -626,7 +626,10 @@ private def forbiddenHttp2HeaderName (name : String) : Bool :=
     || name == "transfer-encoding"
     || name == "upgrade"
 
-private def validatePseudoHeaders (metadata : Metadata) : Except Status Unit := do
+/-- Validate the HTTP/2 pseudo-header layout before ordinary header values.
+This is exposed as the first stage of metadata validation so proved fused
+consumers can retain the exact `validate` error precedence. -/
+def validatePseudoHeaders (metadata : Metadata) : Except Status Unit := do
   let _ ← metadata.foldlM (init := (false, (#[] : Array String))) fun state header => do
     let (seenRegular, seenPseudo) := state
     let name := header.name
@@ -655,9 +658,72 @@ def validateHeader (header : Header) : Except Status Unit := do
   else
     throw (Status.invalidArgument s!"invalid ASCII gRPC metadata value for {header.name}")
 
-def validate (metadata : Metadata) : Except Status Unit := do
+private theorem validateHeader_eq_visible_of_plainName (header : Header)
+    (hvalid : validHeaderName header.name = true)
+    (hconnection : header.name ≠ "connection")
+    (hkeepAlive : header.name ≠ "keep-alive")
+    (hproxyConnection : header.name ≠ "proxy-connection")
+    (htransferEncoding : header.name ≠ "transfer-encoding")
+    (hupgrade : header.name ≠ "upgrade")
+    (hbinary : header.isBinary = false) :
+    validateHeader header =
+      if Ascii.isVisibleString header.value then
+        .ok ()
+      else
+        .error (Status.invalidArgument
+          s!"invalid ASCII gRPC metadata value for {header.name}") := by
+  simp [validateHeader, hvalid, forbiddenHttp2HeaderName, hconnection,
+    hkeepAlive, hproxyConnection, htransferEncoding, hupgrade, hbinary]
+  <;> split <;> rfl
+
+/-- Fixed managed-request names bypass name, forbidden-header, and binary
+validation; their exact remaining validation is the visible-string check. -/
+theorem validateHeader_eq_visible_of_fixedRequestName (header : Header)
+    (hname :
+      header.name = "te" ∨
+      header.name = ":path" ∨
+      header.name = ":method" ∨
+      header.name = ":scheme" ∨
+      header.name = ":status" ∨
+      header.name = ":authority" ∨
+      header.name = "content-type" ∨
+      header.name = "grpc-timeout" ∨
+      header.name = "x-request-id" ∨
+      header.name = "grpc-encoding" ∨
+      header.name = "authorization" ∨
+      header.name = "content-length" ∨
+      header.name = "grpc-accept-encoding") :
+    validateHeader header =
+      if Ascii.isVisibleString header.value then
+        .ok ()
+      else
+        .error (Status.invalidArgument
+          s!"invalid ASCII gRPC metadata value for {header.name}") := by
+  cases header with
+  | mk name value =>
+      rcases hname with hname | hname | hname | hname | hname | hname | hname |
+        hname | hname | hname | hname | hname | hname
+      all_goals simp only at hname
+      all_goals subst name
+      all_goals apply validateHeader_eq_visible_of_plainName
+      all_goals simp only [Header.isBinary]
+      all_goals try simp [validHeaderName, knownPseudoHeader,
+        Ascii.validHeaderName, Ascii.isLowercaseHeaderNameChar]
+      all_goals rw [String.endsWith_eq_endsWith_toSlice,
+        String.Slice.endsWith_string_eq_false_iff]
+      all_goals simp
+      all_goals decide
+
+@[expose] def validate (metadata : Metadata) : Except Status Unit := do
   validatePseudoHeaders metadata
   metadata.forM validateHeader
+
+/-- The public validation sequence is pseudo-header layout first, followed by
+ordinary name/value validation in array order. -/
+theorem validate_eq_stages (metadata : Metadata) :
+    validate metadata = (do
+      validatePseudoHeaders metadata
+      metadata.forM validateHeader) := rfl
 
 end Metadata
 

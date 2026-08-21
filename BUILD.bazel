@@ -463,6 +463,7 @@ lean_assurance_test(
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
         "Grpc.Headers.requestHeaderPreflight": "Grpc.Protocol.Grpc.Headers.requestHeaderPreflightCandidate",
+        "Grpc.Headers.validateRequestHeaderPreflight": "Grpc.Protocol.Grpc.Headers.validateRequestHeaderPreflightCandidate",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
     },
     expected_extern_declarations = {
@@ -923,6 +924,20 @@ lean_test(
     name = "request_preflight_summary_benchmark_test",
     srcs = ["Benchmark/RequestPreflightSummaryBenchmark.lean"],
     args = ["candidate", "client_default_7", "100", "10"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "request_validation_fusion_benchmark",
+    srcs = ["Benchmark/RequestValidationFusionBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "request_validation_fusion_benchmark_test",
+    srcs = ["Benchmark/RequestValidationFusionBenchmark.lean"],
+    args = ["fused", "client_default_7", "100", "10"],
     deps = [":grpc_lean"],
 )
 

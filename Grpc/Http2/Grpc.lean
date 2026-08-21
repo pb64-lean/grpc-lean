@@ -471,34 +471,31 @@ inductive EarlyRequestPreflightDecision where
   | accept (entry : MethodEntry) (preflight : Headers.RequestPreflight)
   | reject (frames : Array Frame) (outboundHpack : Hpack.State)
 
-/-- Parse and validate every managed-request header fact once while preserving
-the historical wire-error precedence: metadata errors, unsupported
-content-type as HTTP 415, then the complete gRPC header/method validation. -/
+/-- Parse and validate every managed-request header fact while preserving the
+historical wire-error precedence: metadata errors, unsupported content-type as
+HTTP 415, then the complete gRPC header/method validation.  Generated code
+keeps pseudo-header validation as one pass and fuses ordinary metadata
+validation with request classification in a second pass. -/
 def preflightEarlyRequest (registry : Registry) (state : Hpack.State) (streamId : Nat)
     (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :
     Except Status EarlyRequestPreflightDecision := do
   let encodeGrpcStatus (status : Status) : Except Status (Array Frame × Hpack.State) :=
     encodeUnaryResponseFrames state streamId { status := status, data := ByteArray.empty }
       maxDataFrameSize
-  match Metadata.validate metadata with
-  | .error status =>
+  match Headers.validateRequestHeaderPreflight metadata with
+  | .unsupportedContentType =>
+      let encoded ← encodeHttpStatusOnlyFrames state streamId "415" maxDataFrameSize
+      pure (.reject encoded.1 encoded.2)
+  | .reject status =>
       let encoded ← encodeGrpcStatus status
       pure (.reject encoded.1 encoded.2)
-  | .ok () =>
-      match Headers.requestHeaderPreflight metadata with
-      | .unsupportedContentType =>
-          let encoded ← encodeHttpStatusOnlyFrames state streamId "415" maxDataFrameSize
+  | .accept preflight =>
+      match registry.findEntry? preflight.method with
+      | some entry => pure (.accept entry preflight)
+      | none =>
+          let encoded ← encodeGrpcStatus
+            (Status.unimplemented s!"unknown gRPC method {preflight.method.path}")
           pure (.reject encoded.1 encoded.2)
-      | .reject status =>
-          let encoded ← encodeGrpcStatus status
-          pure (.reject encoded.1 encoded.2)
-      | .accept preflight =>
-          match registry.findEntry? preflight.method with
-          | some entry => pure (.accept entry preflight)
-          | none =>
-              let encoded ← encodeGrpcStatus
-                (Status.unimplemented s!"unknown gRPC method {preflight.method.path}")
-              pure (.reject encoded.1 encoded.2)
 
 def encodeEarlyRequestRejectionFrames? (registry : Registry) (state : Hpack.State) (streamId : Nat)
     (metadata : Metadata) (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) :

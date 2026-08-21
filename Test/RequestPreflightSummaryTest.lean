@@ -24,19 +24,50 @@ private def reference (metadata : Metadata) : PreflightResult :=
 private def candidate (metadata : Metadata) : PreflightResult :=
   Headers.TestSupport.requestHeaderPreflightCandidateForBenchmark metadata
 
+private def validatedReference (metadata : Metadata) : PreflightResult :=
+  Headers.TestSupport.validateRequestHeaderPreflightReferenceForBenchmark metadata
+
+private def validatedCandidate (metadata : Metadata) : PreflightResult :=
+  Headers.TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata
+
 private def expectExact (label : String) (metadata : Metadata)
     (expected? : Option PreflightResult := none) : IO Unit := do
   let referenceResult := reference metadata
   let candidateResult := candidate metadata
+  let validatedReferenceResult := validatedReference metadata
+  let validatedCandidateResult := validatedCandidate metadata
   expect (candidateResult == referenceResult) <|
     s!"{label}: candidate result differs from the exact repeated-scan reference; " ++
       s!"reference={repr referenceResult}, candidate={repr candidateResult}"
+  expect (validatedCandidateResult == validatedReferenceResult) <|
+    s!"{label}: fused validation/classification differs from the exact separate sequence; " ++
+      s!"reference={repr validatedReferenceResult}, candidate={repr validatedCandidateResult}"
+  match Metadata.validate metadata with
+  | .error status =>
+      expect (validatedReferenceResult == .reject status) <|
+        s!"{label}: metadata validation failure did not retain precedence; " ++
+          s!"validation={repr status}, combined={repr validatedReferenceResult}"
+  | .ok () =>
+      expect (validatedReferenceResult == referenceResult) <|
+        s!"{label}: validated metadata changed classification in the fused seam; " ++
+          s!"classifier={repr referenceResult}, combined={repr validatedReferenceResult}"
   match expected? with
   | none => pure ()
   | some expected =>
       expect (referenceResult == expected) <|
         s!"{label}: reference result differs from the independent expectation; " ++
           s!"expected={repr expected}, actual={repr referenceResult}"
+
+private def expectValidatedExact (label : String) (metadata : Metadata)
+    (expected : PreflightResult) : IO Unit := do
+  let referenceResult := validatedReference metadata
+  let candidateResult := validatedCandidate metadata
+  expect (candidateResult == referenceResult) <|
+    s!"{label}: fused validation/classification differs from the exact separate sequence; " ++
+      s!"reference={repr referenceResult}, candidate={repr candidateResult}"
+  expect (referenceResult == expected) <|
+    s!"{label}: combined preflight differs from the independent expectation; " ++
+      s!"expected={repr expected}, actual={repr referenceResult}"
 
 private def method : MethodName := {
   service := "acme.v1.WidgetService"
@@ -434,6 +465,57 @@ private def testArbitraryOrderSuffixSafety : IO Nat := do
     expectExact s!"arbitrary-order/{label}" metadata (some expected)
   pure cases.size
 
+/- Cross-phase controls for the fused production seam.  Pseudo-header layout
+errors outrank every ordinary header error; after the layout succeeds, the
+first ordinary validation error outranks HTTP 415 and all semantic outcomes. -/
+private def testFusedValidationPrecedence : IO Nat := do
+  let cases : Array (String × Metadata × PreflightResult) := #[
+    ("late-pseudo-after-invalid-regular", Metadata.empty
+      |>.insert ":method" "POST"
+      |>.insert ":scheme" "https"
+      |>.insert ":path" method.path
+      |>.insert "x-control" "\u0000"
+      |>.insert ":authority" "widgets.internal",
+      .reject (Status.invalidArgument
+        "HTTP/2 pseudo-header :authority appeared after regular metadata")),
+    ("duplicate-unknown-pseudo-before-invalid-name", Metadata.empty
+      |>.insert ":bogus" "first"
+      |>.insert ":bogus" "second",
+      .reject (Status.invalidArgument "duplicate HTTP/2 pseudo-header :bogus")),
+    ("duplicate-pseudo-after-invalid-pseudo-value", Metadata.empty
+      |>.insert ":method" "\u0000"
+      |>.insert ":scheme" "https"
+      |>.insert ":scheme" "http",
+      .reject (Status.invalidArgument "duplicate HTTP/2 pseudo-header :scheme")),
+    ("invalid-name-before-http-415",
+      (replaceValues minimalAccepted "content-type" #["application/json"])
+        |>.push { name := "bad header", value := "x" },
+      .reject (Status.invalidArgument "invalid gRPC metadata name bad header")),
+    ("forbidden-name-before-http-415",
+      (replaceValues minimalAccepted "content-type" #["application/json"])
+        |>.insert "connection" "keep-alive",
+      .reject (Status.invalidArgument
+        "HTTP/2 connection-specific metadata is forbidden: connection")),
+    ("invalid-binary-before-http-415",
+      (replaceValues minimalAccepted "content-type" #["application/json"])
+        |>.insert "x-bin" "%%%",
+      .reject (Status.invalidArgument
+        "invalid binary gRPC metadata x-bin: invalid base64 character")),
+    ("late-ascii-error-before-invalid-method",
+      (replaceHeaderValue minimalAccepted ":method" "GET")
+        |>.insert "x-control" "\u0000",
+      .reject (Status.invalidArgument
+        "invalid ASCII gRPC metadata value for x-control")),
+    ("first-ordinary-validation-error",
+      minimalAccepted
+        |>.push { name := "bad header", value := "x" }
+        |>.push (Header.of "connection" "keep-alive"),
+      .reject (Status.invalidArgument "invalid gRPC metadata name bad header"))
+  ]
+  for (label, metadata, expected) in cases do
+    expectValidatedExact s!"fused-precedence/{label}" metadata expected
+  pure cases.size
+
 private def testDirectedValues : IO Nat := do
   let base := minimalAccepted
   let timeoutInvalid : Array String := #[
@@ -587,10 +669,11 @@ def main : IO Unit := do
   let duplicates ← testSingletonDuplicates
   let precedence ← testErrorPrecedence
   let arbitraryOrder ← testArbitraryOrderSuffixSafety
+  let fusedPrecedence ← testFusedValidationPrecedence
   let directed ← testDirectedValues
   let production ← testProductionPath
-  let total := accepted + permuted + duplicates + precedence + arbitraryOrder + directed +
-    production
+  let total := accepted + permuted + duplicates + precedence + arbitraryOrder +
+    fusedPrecedence + directed + production
   IO.println <| s!"request preflight summary matches the exact repeated-scan reference " ++
     s!"across {total} exhaustive and directed cases"
 

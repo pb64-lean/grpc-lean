@@ -1912,6 +1912,587 @@ theorem requestHeaderPreflightCandidate_eq_reference (metadata : Metadata) :
     TestSupport.requestHeaderPreflightReferenceForBenchmark
   exact requestHeaderPreflightCandidate_eq_logical metadata
 
+/-! The managed transport historically runs `Metadata.validate` and then the
+request classifier above.  The executor below keeps pseudo-header validation
+as the unchanged first pass, but fuses ordinary name/value validation with the
+classifier scan.  An already determined classifier outcome is retained while
+the loop continues validating later headers, so metadata errors still outrank
+HTTP 415 and every gRPC semantic rejection. -/
+
+@[inline] private def advanceValidatedRequestHeaderScan
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
+    (header : Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
+  outcome.bind fun state => scanRequestHeader state header
+
+@[inline] private def validateAndScanRequestHeader
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
+    (header : Header) :
+    Except Status (Except RequestHeaderScanStop RequestHeaderScanState) := do
+  Metadata.validateHeader header
+  pure (advanceValidatedRequestHeaderScan outcome header)
+
+private theorem validateAndScanRequestHeadersList_eq_separate
+    (headers : List Header)
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
+    headers.foldlM validateAndScanRequestHeader outcome =
+      match headers.foldlM (fun _ header => Metadata.validateHeader header)
+          PUnit.unit with
+      | .error status => .error status
+      | .ok _ =>
+          .ok (headers.foldl advanceValidatedRequestHeaderScan outcome) := by
+  induction headers generalizing outcome with
+  | nil => rfl
+  | cons header headers ih =>
+      simp only [List.foldlM_cons, List.foldl_cons]
+      cases hvalidate : Metadata.validateHeader header with
+      | error status =>
+          simp [validateAndScanRequestHeader, hvalidate, bind, Except.bind]
+      | ok result =>
+          cases result
+          simp only [validateAndScanRequestHeader, hvalidate, bind, Except.bind,
+            pure, Except.pure]
+          rw [ih]
+
+private theorem validateAndScanRequestHeaders_eq_separate
+    (metadata : Metadata)
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
+    metadata.foldlM validateAndScanRequestHeader outcome =
+      match metadata.forM Metadata.validateHeader with
+      | .error status => .error status
+      | .ok _ =>
+          .ok (metadata.foldl advanceValidatedRequestHeaderScan outcome) := by
+  change metadata.foldlM validateAndScanRequestHeader outcome =
+    match metadata.foldlM (fun _ header => Metadata.validateHeader header)
+        PUnit.unit with
+    | .error status => .error status
+    | .ok _ =>
+        .ok (metadata.foldl advanceValidatedRequestHeaderScan outcome)
+  rw [← Array.foldlM_toList, ← Array.foldlM_toList,
+    ← Array.foldl_toList]
+  exact validateAndScanRequestHeadersList_eq_separate metadata.toList outcome
+
+private theorem advanceValidatedRequestHeaderScanList_eq_foldlM
+    (headers : List Header)
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
+    headers.foldl advanceValidatedRequestHeaderScan outcome =
+      match outcome with
+      | .error stop => .error stop
+      | .ok state => headers.foldlM scanRequestHeader state := by
+  induction headers generalizing outcome with
+  | nil => cases outcome <;> rfl
+  | cons header headers ih =>
+      simp only [List.foldl_cons]
+      rw [ih]
+      cases outcome with
+      | error stop => rfl
+      | ok state =>
+          simp only [advanceValidatedRequestHeaderScan, bind, Except.bind,
+            List.foldlM_cons]
+          cases scanRequestHeader state header <;> rfl
+
+private theorem advanceValidatedRequestHeaderScan_eq_foldlM
+    (metadata : Metadata)
+    (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
+    metadata.foldl advanceValidatedRequestHeaderScan outcome =
+      match outcome with
+      | .error stop => .error stop
+      | .ok state => metadata.foldlM scanRequestHeader state := by
+  rw [← Array.foldl_toList]
+  cases outcome with
+  | error stop =>
+      exact advanceValidatedRequestHeaderScanList_eq_foldlM
+        metadata.toList (.error stop)
+  | ok state =>
+      simp only
+      rw [← Array.foldlM_toList]
+      exact advanceValidatedRequestHeaderScanList_eq_foldlM
+        metadata.toList (.ok state)
+
+private def validateRequestHeaderPreflightReference (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  match Metadata.validate metadata with
+  | .error status => .reject status
+  | .ok () => requestHeaderPreflightReference metadata
+
+private def validateRequestHeaderPreflightCandidateFold (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  match Metadata.validatePseudoHeaders metadata with
+  | .error status => .reject status
+  | .ok () =>
+      match metadata.foldlM validateAndScanRequestHeader
+          (.ok (.summarize {})) with
+      | .error status => .reject status
+      | .ok outcome => finishRequestHeaderScan outcome
+
+private theorem finishRequestHeaderScan_eq_reference (metadata : Metadata) :
+    finishRequestHeaderScan (scanRequestHeadersCandidate metadata) =
+      requestHeaderPreflightReference metadata := by
+  calc
+    finishRequestHeaderScan (scanRequestHeadersCandidate metadata) =
+        requestHeaderPreflightCandidateLogical metadata :=
+      finishRequestHeaderScan_eq_logical metadata
+    _ = requestHeaderPreflightReference metadata := by
+      have h := requestHeaderPreflightCandidate_eq_logical metadata
+      unfold requestHeaderPreflightCandidate at h
+      rw [requestHeaderPreflightCandidateDirect_eq_logical] at h
+      exact h
+
+private theorem validateRequestHeaderPreflightCandidateFold_eq_reference
+    (metadata : Metadata) :
+    validateRequestHeaderPreflightCandidateFold metadata =
+      validateRequestHeaderPreflightReference metadata := by
+  unfold validateRequestHeaderPreflightCandidateFold
+    validateRequestHeaderPreflightReference
+  rw [Metadata.validate_eq_stages]
+  cases hpseudo : Metadata.validatePseudoHeaders metadata with
+  | error status => simp [bind, Except.bind]
+  | ok result =>
+      cases result
+      simp only [bind, Except.bind]
+      rw [validateAndScanRequestHeaders_eq_separate]
+      cases hheaders : metadata.forM Metadata.validateHeader with
+      | error status => simp
+      | ok result =>
+          cases result
+          simp only
+          rw [advanceValidatedRequestHeaderScan_eq_foldlM]
+          exact finishRequestHeaderScan_eq_reference metadata
+
+/-! Allocation-light specialized executor. Accepted requests carry the raw
+summary rather than nested `Except` scan state. Once a prefix-stable semantic
+result is known, a small continuation validates the suffix without doing more
+classifier work. -/
+
+@[inline] private def validateKnownVisibleRequestHeader (header : Header) :
+    Except Status Unit :=
+  if Ascii.isVisibleString header.value then
+    .ok ()
+  else
+    .error (Status.invalidArgument
+      s!"invalid ASCII gRPC metadata value for {header.name}")
+
+@[inline] private def validateNonExtensionRequestHeaderFast (header : Header) :
+    Except Status Unit :=
+  match header.name.utf8ByteSize with
+  | 2 =>
+      if header.name == "te" then validateKnownVisibleRequestHeader header
+      else Metadata.validateHeader header
+  | 5 =>
+      if header.name == ":path" then validateKnownVisibleRequestHeader header
+      else Metadata.validateHeader header
+  | 7 =>
+      if header.name == ":method" || header.name == ":scheme" ||
+          header.name == ":status" then
+        validateKnownVisibleRequestHeader header
+      else
+        Metadata.validateHeader header
+  | 10 =>
+      if header.name == ":authority" then validateKnownVisibleRequestHeader header
+      else Metadata.validateHeader header
+  | 12 =>
+      if header.name == "content-type" || header.name == "grpc-timeout" ||
+          header.name == "x-request-id" then
+        validateKnownVisibleRequestHeader header
+      else
+        Metadata.validateHeader header
+  | 13 =>
+      if header.name == "grpc-encoding" || header.name == "authorization" then
+        validateKnownVisibleRequestHeader header
+      else
+        Metadata.validateHeader header
+  | 14 =>
+      if header.name == "content-length" then validateKnownVisibleRequestHeader header
+      else Metadata.validateHeader header
+  | 20 =>
+      if header.name == "grpc-accept-encoding" then
+        validateKnownVisibleRequestHeader header
+      else
+        Metadata.validateHeader header
+  | _ => Metadata.validateHeader header
+
+private theorem validateKnownVisibleRequestHeader_eq_validateHeader
+    (header : Header)
+    (hname :
+      header.name = "te" ∨
+      header.name = ":path" ∨
+      header.name = ":method" ∨
+      header.name = ":scheme" ∨
+      header.name = ":status" ∨
+      header.name = ":authority" ∨
+      header.name = "content-type" ∨
+      header.name = "grpc-timeout" ∨
+      header.name = "x-request-id" ∨
+      header.name = "grpc-encoding" ∨
+      header.name = "authorization" ∨
+      header.name = "content-length" ∨
+      header.name = "grpc-accept-encoding") :
+    validateKnownVisibleRequestHeader header =
+      Metadata.validateHeader header := by
+  rw [Metadata.validateHeader_eq_visible_of_fixedRequestName header hname]
+  unfold validateKnownVisibleRequestHeader
+  split <;> rfl
+
+private theorem validateNonExtensionRequestHeaderFast_eq_validateHeader
+    (header : Header) :
+    validateNonExtensionRequestHeaderFast header =
+      Metadata.validateHeader header := by
+  unfold validateNonExtensionRequestHeaderFast
+  split <;> simp_all
+  all_goals intro hname
+  all_goals apply validateKnownVisibleRequestHeader_eq_validateHeader
+  all_goals grind
+
+private def validateRemainingRequestHeadersDirect (metadata : Metadata)
+    (index : Nat) (result : RequestHeaderPreflightResult) :
+    RequestHeaderPreflightResult :=
+  if h : index < metadata.size then
+    let header := metadata[index]
+    let next := index + 1
+    match validateNonExtensionRequestHeaderFast header with
+    | .error status => .reject status
+    | .ok () => validateRemainingRequestHeadersDirect metadata next result
+  else
+    result
+termination_by metadata.size - index
+decreasing_by all_goals omega
+
+private def validatePendingInvalidMethodDirect (metadata : Metadata)
+    (index : Nat) (status : Status) : RequestHeaderPreflightResult :=
+  if h : index < metadata.size then
+    let header := metadata[index]
+    let next := index + 1
+    match validateNonExtensionRequestHeaderFast header with
+    | .error status => .reject status
+    | .ok () =>
+        match header.name.utf8ByteSize with
+        | 12 =>
+            if header.name == "content-type" then
+              if isGrpcContentType header.value then
+                validateRemainingRequestHeadersDirect metadata next (.reject status)
+              else
+                validateRemainingRequestHeadersDirect metadata next
+                  .unsupportedContentType
+            else
+              validatePendingInvalidMethodDirect metadata next status
+        | _ => validatePendingInvalidMethodDirect metadata next status
+  else
+    .reject status
+termination_by metadata.size - index
+decreasing_by all_goals omega
+
+private def validateRequestHeaderPreflightFusedDirectLoop (metadata : Metadata)
+    (index : Nat) (summary : RequestHeaderSummary) :
+    RequestHeaderPreflightResult :=
+  if h : index < metadata.size then
+    let header := metadata[index]
+    let next := index + 1
+    match header.name.utf8ByteSize with
+    | 2 =>
+        if header.name == "te" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with te := summary.te.add header.value }
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 5 =>
+        if header.name == ":path" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with path? := rememberFirst summary.path? header.value }
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 7 =>
+        if header.name == ":method" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              match summary.method? with
+              | some _ =>
+                  validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+              | none =>
+                  if header.value == "POST" then
+                    validateRequestHeaderPreflightFusedDirectLoop metadata next
+                      { summary with method? := some header.value }
+                  else
+                    match summary.contentType.first? with
+                    | some _ =>
+                        validateRemainingRequestHeadersDirect metadata next
+                          (.reject invalidMethodStatus)
+                    | none =>
+                        validatePendingInvalidMethodDirect metadata next
+                          invalidMethodStatus
+        else if header.name == ":scheme" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with scheme? := rememberFirst summary.scheme? header.value }
+        else if header.name == ":status" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with status? := rememberFirst summary.status? header.value }
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 10 =>
+        if header.name == ":authority" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 12 =>
+        if header.name == "content-type" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              match summary.contentType.first? with
+              | some _ =>
+                  validateRequestHeaderPreflightFusedDirectLoop metadata next
+                    { summary with contentType := summary.contentType.add header.value }
+              | none =>
+                  if isGrpcContentType header.value then
+                    validateRequestHeaderPreflightFusedDirectLoop metadata next
+                      { summary with contentType := summary.contentType.add header.value }
+                  else
+                    validateRemainingRequestHeadersDirect metadata next
+                      .unsupportedContentType
+        else if header.name == "grpc-timeout" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with timeout := summary.timeout.add header.value }
+        else if header.name == "x-request-id" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 13 =>
+        if header.name == "grpc-encoding" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with requestEncoding :=
+                    summary.requestEncoding.add header.value }
+        else if header.name == "authorization" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 14 =>
+        if header.name == "content-length" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with contentLength := summary.contentLength.add header.value }
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | 20 =>
+        if header.name == "grpc-accept-encoding" then
+          match validateKnownVisibleRequestHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next
+                { summary with clientAcceptEncodingValues :=
+                    summary.clientAcceptEncodingValues.push header.value }
+        else
+          match Metadata.validateHeader header with
+          | .error status => .reject status
+          | .ok () =>
+              validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+    | _ =>
+        match Metadata.validateHeader header with
+        | .error status => .reject status
+        | .ok () =>
+            validateRequestHeaderPreflightFusedDirectLoop metadata next summary
+  else
+    requestHeaderPreflightValidatedSummary summary
+termination_by metadata.size - index
+decreasing_by all_goals omega
+
+private def validateRequestHeaderPreflightFusedDirect (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  match Metadata.validatePseudoHeaders metadata with
+  | .error status => .reject status
+  | .ok () => validateRequestHeaderPreflightFusedDirectLoop metadata 0 {}
+
+@[inline] private def finishValidatedRequestHeaderScan
+    (outcome : Except Status
+      (Except RequestHeaderScanStop RequestHeaderScanState)) :
+    RequestHeaderPreflightResult :=
+  match outcome with
+  | .error status => .reject status
+  | .ok outcome => finishRequestHeaderScan outcome
+
+private theorem validateRemainingRequestHeadersDirect_eq_foldlM
+    (metadata : Metadata) (index : Nat) (stop : RequestHeaderScanStop) :
+    validateRemainingRequestHeadersDirect metadata index
+        (requestHeaderScanStopResult stop) =
+      finishValidatedRequestHeaderScan
+        ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
+          (.error stop)) := by
+  fun_induction validateRemainingRequestHeadersDirect metadata index
+    (requestHeaderScanStopResult stop) <;>
+    simp_all +zetaDelta [List.drop_eq_getElem_cons, List.drop_of_length_le,
+      validateAndScanRequestHeader, advanceValidatedRequestHeaderScan,
+      validateNonExtensionRequestHeaderFast_eq_validateHeader,
+      finishValidatedRequestHeaderScan, finishRequestHeaderScan,
+      requestHeaderScanStopResult, bind, Except.bind, pure, Except.pure]
+
+private theorem validateRemainingRequestHeadersDirect_reject_eq_foldlM
+    (metadata : Metadata) (index : Nat) (status : Status) :
+    validateRemainingRequestHeadersDirect metadata index (.reject status) =
+      finishValidatedRequestHeaderScan
+        ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
+          (.error (.reject status))) :=
+  validateRemainingRequestHeadersDirect_eq_foldlM metadata index (.reject status)
+
+private theorem validateRemainingRequestHeadersDirect_unsupported_eq_foldlM
+    (metadata : Metadata) (index : Nat) :
+    validateRemainingRequestHeadersDirect metadata index .unsupportedContentType =
+      finishValidatedRequestHeaderScan
+        ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
+          (.error .unsupportedContentType)) :=
+  validateRemainingRequestHeadersDirect_eq_foldlM metadata index
+    .unsupportedContentType
+
+private theorem validatePendingInvalidMethodDirect_eq_foldlM
+    (metadata : Metadata) (index : Nat) (status : Status) :
+    validatePendingInvalidMethodDirect metadata index status =
+      finishValidatedRequestHeaderScan
+        ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
+          (.ok (.pendingReject status))) := by
+  fun_induction validatePendingInvalidMethodDirect metadata index status <;>
+    simp_all +zetaDelta [List.drop_eq_getElem_cons, List.drop_of_length_le,
+      validateAndScanRequestHeader, advanceValidatedRequestHeaderScan,
+      validateNonExtensionRequestHeaderFast_eq_validateHeader,
+      finishValidatedRequestHeaderScan, finishRequestHeaderScan,
+      scanRequestHeader, requestHeaderScanStopResult,
+      validateRemainingRequestHeadersDirect_reject_eq_foldlM,
+      validateRemainingRequestHeadersDirect_unsupported_eq_foldlM,
+      bind, Except.bind, pure, Except.pure]
+
+private theorem validateRequestHeaderPreflightFusedDirectLoop_eq_foldlM
+    (metadata : Metadata) (index : Nat) (summary : RequestHeaderSummary) :
+    validateRequestHeaderPreflightFusedDirectLoop metadata index summary =
+      finishValidatedRequestHeaderScan
+        ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
+          (.ok (.summarize summary))) := by
+  fun_induction validateRequestHeaderPreflightFusedDirectLoop metadata index summary <;>
+    simp_all +zetaDelta [List.drop_eq_getElem_cons, List.drop_of_length_le,
+      validateAndScanRequestHeader, advanceValidatedRequestHeaderScan,
+      validateKnownVisibleRequestHeader_eq_validateHeader,
+      finishValidatedRequestHeaderScan, finishRequestHeaderScan,
+      scanRequestHeader, requestHeaderScanStopResult,
+      validateRemainingRequestHeadersDirect_reject_eq_foldlM,
+      validateRemainingRequestHeadersDirect_unsupported_eq_foldlM,
+      validatePendingInvalidMethodDirect_eq_foldlM,
+      bind, Except.bind, pure, Except.pure]
+
+private theorem validateRequestHeaderPreflightFusedDirect_eq_fold
+    (metadata : Metadata) :
+    validateRequestHeaderPreflightFusedDirect metadata =
+      validateRequestHeaderPreflightCandidateFold metadata := by
+  unfold validateRequestHeaderPreflightFusedDirect
+    validateRequestHeaderPreflightCandidateFold
+  cases hpseudo : Metadata.validatePseudoHeaders metadata with
+  | error status => rfl
+  | ok result =>
+      cases result
+      rw [validateRequestHeaderPreflightFusedDirectLoop_eq_foldlM]
+      simp only [List.drop_zero, Array.foldlM_toList]
+      rfl
+
+private def validateRequestHeaderPreflightCandidate (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  validateRequestHeaderPreflightFusedDirect metadata
+
+private theorem validateRequestHeaderPreflightCandidate_eq_reference
+    (metadata : Metadata) :
+  validateRequestHeaderPreflightCandidate metadata =
+      validateRequestHeaderPreflightReference metadata := by
+  unfold validateRequestHeaderPreflightCandidate
+  rw [validateRequestHeaderPreflightFusedDirect_eq_fold]
+  exact validateRequestHeaderPreflightCandidateFold_eq_reference metadata
+
+/-- Validate and classify managed request metadata.  The logical definition is
+the former three-pass sequence; generated code uses the proved two-pass direct
+executor while retaining exact metadata and gRPC rejection precedence. -/
+@[implemented_by validateRequestHeaderPreflightCandidate]
+def validateRequestHeaderPreflight (metadata : Metadata) :
+    RequestHeaderPreflightResult :=
+  validateRequestHeaderPreflightReference metadata
+
+namespace TestSupport
+
+/-- Exact separate validation/classification sequence retained for tests and
+incremental benchmarks. -/
+@[noinline] def validateRequestHeaderPreflightReferenceForBenchmark
+    (metadata : Metadata) : RequestHeaderPreflightResult :=
+  validateRequestHeaderPreflightReference metadata
+
+/-- Executable fused validation/classification sequence retained for tests and
+incremental benchmarks. -/
+@[noinline] def validateRequestHeaderPreflightCandidateForBenchmark
+    (metadata : Metadata) : RequestHeaderPreflightResult :=
+  validateRequestHeaderPreflightCandidate metadata
+
+end TestSupport
+
+/-- The executable fused validator has exactly the result of the former
+separate production sequence for every metadata array. -/
+theorem validateRequestHeaderPreflightCandidate_eq_validateRequestHeaderPreflight
+    (metadata : Metadata) :
+    TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata =
+      validateRequestHeaderPreflight metadata := by
+  unfold TestSupport.validateRequestHeaderPreflightCandidateForBenchmark
+    validateRequestHeaderPreflight
+  exact validateRequestHeaderPreflightCandidate_eq_reference metadata
+
+/-- The independent fused and separate benchmark seams agree for every
+metadata array. -/
+theorem validateRequestHeaderPreflightCandidate_eq_referenceForBenchmark
+    (metadata : Metadata) :
+    TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata =
+      TestSupport.validateRequestHeaderPreflightReferenceForBenchmark metadata := by
+  unfold TestSupport.validateRequestHeaderPreflightCandidateForBenchmark
+    TestSupport.validateRequestHeaderPreflightReferenceForBenchmark
+  exact validateRequestHeaderPreflightCandidate_eq_reference metadata
+
 def validateUnaryRequestPreflight (metadata : Metadata) : Except Status RequestPreflight := do
   Metadata.validate metadata
   validateUnaryRequestPreflightAfterMetadata metadata (metadata.getAll "content-type")
