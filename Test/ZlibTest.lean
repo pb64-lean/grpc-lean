@@ -93,4 +93,35 @@ def main : IO Unit := do
       (Metadata.empty.insert "grpc-accept-encoding" "identity"))
     "identity-only accept-encoding should not enable gzip"
 
+  -- The executable fast path and fused fallback must return exactly the same
+  -- result as the former split/trim/list parser.  The first canonical
+  -- value exercises the shortcut; the rest cover fallback boundaries.
+  let acceptEncodingValues : Array String := #[
+    "identity,gzip",
+    "",
+    ",",
+    ",,",
+    "gzip",
+    "identity",
+    "identity, gzip",
+    " gzip ",
+    "\tgzip\r\n",
+    "GZIP",
+    "gzip;q=1",
+    "br,gzip,identity",
+    "identity,,gzip,",
+    "identity，gzip",
+    "café,gzip",
+    "br,deflate,zstd,snappy,identity,gzip"
+  ]
+  for value in acceptEncodingValues do
+    let reference :=
+      Headers.TestSupport.valueAcceptsGzipReferenceForBenchmark value
+    let candidate :=
+      Headers.TestSupport.valueAcceptsGzipCandidateForBenchmark value
+    expect (candidate == reference)
+      s!"accept-encoding candidate differs from reference for {repr value}"
+    expect (Headers.valueAcceptsGzip value == reference)
+      s!"compiled accept-encoding parser differs from reference for {repr value}"
+
   IO.println "zlib gzip tests passed"

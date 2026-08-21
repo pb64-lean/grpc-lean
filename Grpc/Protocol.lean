@@ -1,5 +1,9 @@
 module
 
+import all Init.Data.String.Legacy
+import all Init.Data.String.Slice
+import all Init.Data.String.TakeDrop
+
 public import Std.Sync.Channel
 public import Grpc.Bytes
 public import Grpc.Framing
@@ -749,13 +753,160 @@ def requestUsesGzip (metadata : Metadata) : Except Status Bool := do
 def validateRequestEncoding (metadata : Metadata) : Except Status Unit := do
   discard <| requestUsesGzip metadata
 
-/-- Whether one `grpc-accept-encoding` value advertises gzip. -/
-private def valueAcceptsGzip (value : String) : Bool :=
+/-- Exact former split/trim/list-any parser retained as the logical reference. -/
+private def valueAcceptsGzipReference (value : String) : Bool :=
   value.splitOn "," |>.any fun token => token.trim == gzipEncoding
+
+/-- Whether one comma-delimited token advertises gzip. -/
+private def gzipEncodingToken (token : String) : Bool :=
+  token.trim == gzipEncoding
+
+/-- Observe the legacy comma splitter without constructing its intermediate
+token list. -/
+private def valueAcceptsGzipFusedAux (value : String) (begin current : String.Pos.Raw) :
+    Bool :=
+  if current.atEnd value then
+    gzipEncodingToken (begin.extract value current)
+  else if current.get value == ',' then
+    gzipEncodingToken (begin.extract value current) ||
+      valueAcceptsGzipFusedAux value (current.next value) (current.next value)
+  else
+    valueAcceptsGzipFusedAux value begin (current.next value)
+termination_by value.rawEndPos.1 - current.1
+decreasing_by
+  all_goals
+    exact Nat.sub_lt_sub_left
+      (Nat.gt_of_not_le (mt decide_eq_true ‹_›))
+      (String.Pos.Raw.lt_next value current)
+
+private theorem splitOnAux_comma_any (value : String)
+    (begin current : String.Pos.Raw) (reverseTokens : List String) :
+    (String.splitOnAux value "," begin current 0 reverseTokens).any
+        gzipEncodingToken =
+      (reverseTokens.any gzipEncodingToken ||
+        valueAcceptsGzipFusedAux value begin current) := by
+  fun_induction valueAcceptsGzipFusedAux value begin current
+      generalizing reverseTokens with
+  | case1 begin current hend =>
+      rw [String.splitOnAux]
+      simp [hend, gzipEncodingToken, Bool.or_comm]
+  | case2 begin current hend hcomma ih =>
+      rw [String.splitOnAux]
+      simp only [hend]
+      have hget : current.get value == (0 : String.Pos.Raw).get "," := by
+        simpa using hcomma
+      simp only [hget, ↓reduceIte]
+      have hseparatorEnd : ((0 : String.Pos.Raw).next ",").atEnd "," := by
+        decide
+      simp only [hseparatorEnd, ↓reduceIte]
+      have hunoffset :
+          (current.next value).unoffsetBy ((0 : String.Pos.Raw).next ",") =
+            current := by
+        rw [String.Pos.Raw.next, String.Pos.Raw.next]
+        have hchar : current.get value = ',' := by simpa using hcomma
+        rw [hchar]
+        rfl
+      rw [hunoffset]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [ih]
+      simp only [List.any_cons]
+      simp [Bool.or_assoc, Bool.or_comm]
+  | case3 begin current hend hcomma ih =>
+      rw [String.splitOnAux]
+      simp only [hend]
+      have hget : ¬(current.get value == (0 : String.Pos.Raw).get ",") := by
+        simpa using hcomma
+      simp only [hget]
+      have hunoffset : current.unoffsetBy (0 : String.Pos.Raw) = current := by
+        rfl
+      rw [hunoffset]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [ih]
+
+private theorem valueAcceptsGzipFused_eq_reference (value : String) :
+    valueAcceptsGzipFusedAux value 0 0 =
+      valueAcceptsGzipReference value := by
+  unfold valueAcceptsGzipReference String.splitOn
+  simp only [String.reduceBEq, Bool.false_eq_true, ↓reduceIte]
+  change valueAcceptsGzipFusedAux value 0 0 =
+    (String.splitOnAux value "," 0 0 0 []).any gzipEncodingToken
+  rw [splitOnAux_comma_any]
+  simp
+
+private theorem gzip_trim : "gzip".trim = "gzip" := by
+  unfold String.trim String.trimAscii String.Slice.trimAscii
+    String.Slice.trimAsciiStart String.Slice.trimAsciiEnd
+  rw [String.Slice.dropWhile_eq_self (by decide)]
+  rw [String.Slice.dropEndWhile_eq_self (by
+    rw [String.Slice.endsWith_bool_eq_getLast?]
+    rw [String.copy_toSlice]
+    decide)]
+  simp
+
+private theorem acceptedEncodings_reference_true :
+    valueAcceptsGzipReference acceptedEncodings = true := by
+  change ("identity,gzip".splitOn ",").any
+    (fun token => token.trim == "gzip") = true
+  change valueAcceptsGzipReference "identity,gzip" = true
+  rw [← valueAcceptsGzipFused_eq_reference]
+  simp +decide [valueAcceptsGzipFusedAux, gzipEncodingToken, gzipEncoding]
+  right
+  simpa +decide [String.Pos.Raw.next] using gzip_trim
+
+private def valueAcceptsGzipCandidate (value : String) : Bool :=
+  if value == acceptedEncodings then
+    true
+  else
+    valueAcceptsGzipFusedAux value 0 0
+
+private theorem valueAcceptsGzipCandidate_eq_logical (value : String) :
+    valueAcceptsGzipCandidate value = valueAcceptsGzipReference value := by
+  unfold valueAcceptsGzipCandidate
+  split
+  · rename_i heq
+    simp only [beq_iff_eq] at heq
+    subst value
+    exact acceptedEncodings_reference_true.symm
+  · exact valueAcceptsGzipFused_eq_reference value
+
+/-- Whether one `grpc-accept-encoding` value advertises gzip. The logical
+definition retains the former split/trim/list-any parser; generated code uses
+the proved canonical-value fast path and fused fallback observer. -/
+@[implemented_by valueAcceptsGzipCandidate]
+def valueAcceptsGzip (value : String) : Bool :=
+  valueAcceptsGzipReference value
 
 /-- Whether the client's `grpc-accept-encoding` header advertises gzip. -/
 def clientAcceptsGzip (metadata : Metadata) : Bool :=
   metadata.getAll "grpc-accept-encoding" |>.any valueAcceptsGzip
+
+namespace TestSupport
+
+/-- Exact former per-value parser retained for differential tests. -/
+@[noinline] def valueAcceptsGzipReferenceForBenchmark (value : String) : Bool :=
+  valueAcceptsGzipReference value
+
+/-- Executable canonical fast path plus fused fallback retained for tests. -/
+@[noinline] def valueAcceptsGzipCandidateForBenchmark (value : String) : Bool :=
+  valueAcceptsGzipCandidate value
+
+end TestSupport
+
+/-- The executable per-value parser has exactly the former split/trim/list-any
+result for every string. -/
+theorem valueAcceptsGzipCandidate_eq_valueAcceptsGzip (value : String) :
+    TestSupport.valueAcceptsGzipCandidateForBenchmark value =
+      valueAcceptsGzip value := by
+  unfold TestSupport.valueAcceptsGzipCandidateForBenchmark valueAcceptsGzip
+  exact valueAcceptsGzipCandidate_eq_logical value
+
+/-- The independent per-value benchmark seams agree for every string. -/
+theorem valueAcceptsGzipCandidate_eq_reference (value : String) :
+    TestSupport.valueAcceptsGzipCandidateForBenchmark value =
+      TestSupport.valueAcceptsGzipReferenceForBenchmark value := by
+  unfold TestSupport.valueAcceptsGzipCandidateForBenchmark
+    TestSupport.valueAcceptsGzipReferenceForBenchmark
+  exact valueAcceptsGzipCandidate_eq_logical value
 
 /-! Parsed facts retained by a managed HTTP/2 connection after the request
 header block has passed the complete gRPC validation sequence. -/

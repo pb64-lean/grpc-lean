@@ -257,6 +257,9 @@ lean_assurance_test(
         "Grpc.Timeout.parse?_render_ofNanoseconds",
         "Grpc.Base64.decodeBytes_encodeBytes",
         "Grpc.Base64.decodeBytes_encodeBytesUnpadded",
+        # The generated-code gzip accept-encoding parser is extensionally the
+        # former split/trim/list parser for every input string.
+        "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip",
         # Channel-lease kernel: unique bounded leases, draining stops
         # admission, close requires drained, and phase-preservation equations.
         "Grpc.ChannelLease.State.invariant",
@@ -357,6 +360,7 @@ lean_assurance_test(
         "Grpc.Timeout.parse?_render_ofNanoseconds": "∀ (nanoseconds : Nat), Grpc.Timeout.parse? (Grpc.Timeout.ofNanoseconds nanoseconds).render = some (Grpc.Timeout.ofNanoseconds nanoseconds)",
         "Grpc.Base64.decodeBytes_encodeBytes": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytes bytes) = Except.ok bytes",
         "Grpc.Base64.decodeBytes_encodeBytesUnpadded": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytesUnpadded bytes) = Except.ok bytes",
+        "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip": "∀ (value : String), Grpc.Headers.TestSupport.valueAcceptsGzipCandidateForBenchmark value = Grpc.Headers.valueAcceptsGzip value",
         "Grpc.ChannelLease.State.invariant": "∀ (state : Grpc.ChannelLease.State), state.Invariant",
         "Grpc.ChannelLease.State.closed_has_no_leases": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeLeases = []",
         "Grpc.ChannelLease.State.closed_active_count_zero": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeCount = 0",
@@ -462,6 +466,7 @@ lean_assurance_test(
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
+        "Grpc.Headers.valueAcceptsGzip": "Grpc.Protocol.Grpc.Headers.valueAcceptsGzipCandidate",
         "Grpc.Headers.requestHeaderPreflight": "Grpc.Protocol.Grpc.Headers.requestHeaderPreflightCandidate",
         "Grpc.Headers.validateRequestHeaderPreflight": "Grpc.Protocol.Grpc.Headers.validateRequestHeaderPreflightCandidate",
         "Grpc.Timeout.parse?": "Grpc.Timeout.parseByteIndexed?",
