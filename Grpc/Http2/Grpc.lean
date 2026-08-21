@@ -338,7 +338,8 @@ private def appendMessageDataFrames (streamId maxDataFrameSize : Nat)
   let data ← dataFrames streamId message maxDataFrameSize
   pure (frames.append data)
 
-def encodeUnaryResponseFrames (state : Hpack.State) (streamId : Nat) (response : UnaryResponse)
+private def encodeUnaryResponseFramesReference (state : Hpack.State) (streamId : Nat)
+    (response : UnaryResponse)
     (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
     Except Status (Array Frame × Hpack.State) := do
   if !response.status.isOk then
@@ -364,6 +365,205 @@ def encodeUnaryResponseFrames (state : Hpack.State) (streamId : Nat) (response :
       pure ((initial.append data).append trailerFrames, state)
     else
       pure (initial.append trailerFrames, state)
+
+/- The ordinary successful unary response consists of one initial HEADERS
+frame, one DATA frame, and one trailer HEADERS frame.  The reference above
+first constructs three singleton arrays and then appends them.  Keep its exact
+fallback for split blocks, but assemble the common exact-fit shape in one
+pre-sized array. -/
+private def encodeUnaryResponseFramesCandidate (state : Hpack.State) (streamId : Nat)
+    (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    Except Status (Array Frame × Hpack.State) := do
+  if !response.status.isOk then
+    let metadata := Metadata.append Headers.responseHeaders response.metadata
+    let metadata := Metadata.append metadata (Headers.trailers response.status response.trailers)
+    let block ← Hpack.encodeHeaderBlock state metadata
+    let state := block.2
+    let frames ← headerBlockFrames streamId block.1 true maxDataFrameSize
+    pure (frames, state)
+  else
+    let initialBlock ← encodeResponseHeadersBlock state gzip response.metadata
+    let state := initialBlock.2
+    if maxDataFrameSize == 0 then
+      throw (Status.internal "HTTP/2 header block frame max size must be positive")
+    else if initialBlock.1.size > maxDataFrameSize then
+      let initial ← headerBlockFrames streamId initialBlock.1 false maxDataFrameSize
+      let trailerBlock ← encodeResponseTrailersBlock state response.status response.trailers
+      let state := trailerBlock.2
+      let trailerFrames ← headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize
+      let message ← Message.encode
+        (if gzip then Message.gzipped response.data else { data := response.data })
+      let data ← dataFrames streamId message maxDataFrameSize
+      pure ((initial.append data).append trailerFrames, state)
+    else
+      let initialPayload :=
+        if initialBlock.1.isEmpty then ByteArray.empty else initialBlock.1
+      let initialFrame := headerBlockFrame streamId FrameType.headers initialPayload
+        (headerBlockFlags true true false)
+      let trailerBlock ← encodeResponseTrailersBlock state response.status response.trailers
+      let state := trailerBlock.2
+      if trailerBlock.1.size > maxDataFrameSize then
+        let initial := #[initialFrame]
+        let trailerFrames ← headerBlockFrames streamId trailerBlock.1 true maxDataFrameSize
+        let message ← Message.encode
+          (if gzip then Message.gzipped response.data else { data := response.data })
+        let data ← dataFrames streamId message maxDataFrameSize
+        pure ((initial.append data).append trailerFrames, state)
+      else
+        let trailerPayload :=
+          if trailerBlock.1.isEmpty then ByteArray.empty else trailerBlock.1
+        let trailerFrame := headerBlockFrame streamId FrameType.headers trailerPayload
+          (headerBlockFlags true true true)
+        let message ← Message.encode
+          (if gzip then Message.gzipped response.data else { data := response.data })
+        if !message.isEmpty && message.size <= maxDataFrameSize then
+          let data := dataFrame streamId message
+          let frames := Array.emptyWithCapacity 3
+          let frames := frames.push initialFrame
+          let frames := frames.push data
+          let frames := frames.push trailerFrame
+          pure (frames, state)
+        else
+          let initial := #[initialFrame]
+          let trailerFrames := #[trailerFrame]
+          let data ← dataFrames streamId message maxDataFrameSize
+          pure ((initial.append data).append trailerFrames, state)
+
+private theorem headerBlockFrames_eq_singleton (streamId : Nat) (block : ByteArray)
+    (endStream : Bool) (maxSize : Nat) (hmax : maxSize != 0)
+    (hle : block.size <= maxSize) :
+    headerBlockFrames streamId block endStream maxSize =
+      .ok #[headerBlockFrame streamId FrameType.headers
+        (if block.isEmpty then ByteArray.empty else block)
+        (headerBlockFlags true true endStream)] := by
+  have hmax' : maxSize ≠ 0 := bne_iff_ne.mp hmax
+  simp only [headerBlockFrames, beq_iff_eq]
+  rw [if_neg hmax']
+  split <;> simp_all <;> rfl
+
+private theorem dataFrames_eq_singleton (streamId : Nat) (payload : ByteArray)
+    (maxSize : Nat) (hmax : maxSize != 0) (hne : !payload.isEmpty)
+    (hle : payload.size <= maxSize) :
+    dataFrames streamId payload maxSize = .ok #[dataFrame streamId payload] := by
+  have hmax' : maxSize ≠ 0 := bne_iff_ne.mp hmax
+  rw [Bool.not_eq_true'] at hne
+  simp only [dataFrames, beq_iff_eq]
+  rw [if_neg hmax']
+  rw [if_neg (by simp [hne])]
+  rw [if_pos hle]
+  rfl
+
+private theorem encodeUnaryResponseFramesCandidate_eq_logicalReference
+    (state : Hpack.State) (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    encodeUnaryResponseFramesCandidate state streamId response maxDataFrameSize gzip =
+      encodeUnaryResponseFramesReference state streamId response maxDataFrameSize gzip := by
+  have bindOk {α β : Type} (value : α) (next : α → Except Status β) :
+      (do let x ← (.ok value : Except Status α); next x) = next value := by
+    rfl
+  by_cases hs : response.status.isOk
+  · simp only [encodeUnaryResponseFramesCandidate, encodeUnaryResponseFramesReference,
+      hs, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    cases hi : encodeResponseHeadersBlock state gzip response.metadata with
+    | error error => rfl
+    | ok initialBlock =>
+      rw [bindOk, bindOk]
+      by_cases hz : maxDataFrameSize = 0
+      · subst maxDataFrameSize
+        rfl
+      · by_cases hiLarge : initialBlock.1.size > maxDataFrameSize
+        · simp [hz, hiLarge]
+        · simp only [beq_iff_eq]
+          rw [if_neg hz, if_neg hiLarge]
+          have hmax : (maxDataFrameSize != 0) = true := bne_iff_ne.mpr hz
+          have hiLe : initialBlock.1.size <= maxDataFrameSize := by omega
+          rw [headerBlockFrames_eq_singleton streamId initialBlock.1 false
+            maxDataFrameSize hmax hiLe]
+          rw [bindOk]
+          cases ht : encodeResponseTrailersBlock initialBlock.2 response.status
+              response.trailers with
+          | error error => rfl
+          | ok trailerBlock =>
+            rw [bindOk, bindOk]
+            by_cases htLarge : trailerBlock.1.size > maxDataFrameSize
+            · simp [htLarge]
+            · rw [if_neg htLarge]
+              have htLe : trailerBlock.1.size <= maxDataFrameSize := by omega
+              rw [headerBlockFrames_eq_singleton streamId trailerBlock.1 true
+                maxDataFrameSize hmax htLe]
+              rw [bindOk]
+              cases hm : Message.encode
+                  (if gzip then Message.gzipped response.data else { data := response.data }) with
+              | error error => rfl
+              | ok message =>
+                rw [bindOk, bindOk]
+                by_cases hd : !message.isEmpty && message.size <= maxDataFrameSize
+                · simp only [Bool.and_eq_true, decide_eq_true_eq] at hd
+                  have hd' :
+                      (!message.isEmpty && decide (message.size <= maxDataFrameSize)) = true := by
+                    rw [Bool.and_eq_true, decide_eq_true_eq]
+                    exact hd
+                  rw [if_pos hd']
+                  rw [dataFrames_eq_singleton streamId message maxDataFrameSize
+                    hmax hd.1 hd.2]
+                  rw [bindOk]
+                  rfl
+                · simp [hd]
+  · simp [encodeUnaryResponseFramesCandidate, encodeUnaryResponseFramesReference, hs]
+
+/-- Encode one unary response as HTTP/2 frames. The proof-facing definition
+retains the former splitter/append composition; generated code directly
+assembles the common one-HEADERS/one-DATA/one-trailer shape. -/
+@[implemented_by encodeUnaryResponseFramesCandidate]
+def encodeUnaryResponseFrames (state : Hpack.State) (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    Except Status (Array Frame × Hpack.State) :=
+  encodeUnaryResponseFramesReference state streamId response maxDataFrameSize gzip
+
+namespace TestSupport
+
+/-- Exact former unary response encoder retained for differential benchmarks. -/
+@[noinline] def encodeUnaryResponseFramesReferenceForBenchmark (state : Hpack.State)
+    (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    Except Status (Array Frame × Hpack.State) :=
+  encodeUnaryResponseFramesReference state streamId response maxDataFrameSize gzip
+
+/-- Executable direct frame assembler retained for differential benchmarks. -/
+@[noinline] def encodeUnaryResponseFramesCandidateForBenchmark (state : Hpack.State)
+    (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    Except Status (Array Frame × Hpack.State) :=
+  encodeUnaryResponseFramesCandidate state streamId response maxDataFrameSize gzip
+
+end TestSupport
+
+/-- The executable unary frame assembler has exactly the result of the
+proof-facing splitter/append encoder for every state, response, and limit. -/
+theorem encodeUnaryResponseFramesCandidate_eq_encodeUnaryResponseFrames
+    (state : Hpack.State) (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    TestSupport.encodeUnaryResponseFramesCandidateForBenchmark
+        state streamId response maxDataFrameSize gzip =
+      encodeUnaryResponseFrames state streamId response maxDataFrameSize gzip := by
+  unfold TestSupport.encodeUnaryResponseFramesCandidateForBenchmark
+    encodeUnaryResponseFrames
+  exact encodeUnaryResponseFramesCandidate_eq_logicalReference
+    state streamId response maxDataFrameSize gzip
+
+/-- The two independent unary frame-assembly benchmark seams agree totally. -/
+theorem encodeUnaryResponseFramesCandidate_eq_reference
+    (state : Hpack.State) (streamId : Nat) (response : UnaryResponse)
+    (maxDataFrameSize : Nat := defaultMaxFramePayloadLength) (gzip : Bool := false) :
+    TestSupport.encodeUnaryResponseFramesCandidateForBenchmark
+        state streamId response maxDataFrameSize gzip =
+      TestSupport.encodeUnaryResponseFramesReferenceForBenchmark
+        state streamId response maxDataFrameSize gzip := by
+  unfold TestSupport.encodeUnaryResponseFramesCandidateForBenchmark
+    TestSupport.encodeUnaryResponseFramesReferenceForBenchmark
+  exact encodeUnaryResponseFramesCandidate_eq_logicalReference
+    state streamId response maxDataFrameSize gzip
 
 def encodeServerStreamingResponseFrames (state : Hpack.State) (streamId : Nat)
     (response : ServerStreamingResponse)

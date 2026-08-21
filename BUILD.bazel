@@ -260,6 +260,9 @@ lean_assurance_test(
         # The generated-code gzip accept-encoding parser is extensionally the
         # former split/trim/list parser for every input string.
         "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip",
+        # Successful unary response frame assembly preserves the former
+        # splitter/append encoder for every HPACK state, response, and limit.
+        "Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate_eq_encodeUnaryResponseFrames",
         # Channel-lease kernel: unique bounded leases, draining stops
         # admission, close requires drained, and phase-preservation equations.
         "Grpc.ChannelLease.State.invariant",
@@ -361,6 +364,7 @@ lean_assurance_test(
         "Grpc.Base64.decodeBytes_encodeBytes": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytes bytes) = Except.ok bytes",
         "Grpc.Base64.decodeBytes_encodeBytesUnpadded": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytesUnpadded bytes) = Except.ok bytes",
         "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip": "∀ (value : String), Grpc.Headers.TestSupport.valueAcceptsGzipCandidateForBenchmark value = Grpc.Headers.valueAcceptsGzip value",
+        "Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate_eq_encodeUnaryResponseFrames": "∀ (state : Grpc.Http2.Hpack.State) (streamId : Nat) (response : Grpc.UnaryResponse) (maxDataFrameSize : Nat) (gzip : Bool), Grpc.Http2.Transport.TestSupport.encodeUnaryResponseFramesCandidateForBenchmark state streamId response maxDataFrameSize gzip = Grpc.Http2.Transport.encodeUnaryResponseFrames state streamId response maxDataFrameSize gzip",
         "Grpc.ChannelLease.State.invariant": "∀ (state : Grpc.ChannelLease.State), state.Invariant",
         "Grpc.ChannelLease.State.closed_has_no_leases": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeLeases = []",
         "Grpc.ChannelLease.State.closed_active_count_zero": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeCount = 0",
@@ -456,6 +460,7 @@ lean_assurance_test(
         "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
         "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
         "Grpc.Http2.Frame.decodeChunk": "Grpc.Http2.Frame.decodeChunkCandidate",
+        "Grpc.Http2.Transport.encodeUnaryResponseFrames": "Grpc.Http2.Grpc.Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate",
         "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
         "Grpc.Http2.Connection.flushOutbound": "Grpc.Http2.Connection.flushOutboundCandidate",
         "Grpc.Http2.Connection.processUnaryRequestData": "Grpc.Http2.Connection.processUnaryRequestDataCandidate",
@@ -803,6 +808,20 @@ lean_binary(
     name = "response_hpack_benchmark",
     srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
     tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_binary(
+    name = "unary_response_frame_assembly_benchmark",
+    srcs = ["Benchmark/UnaryResponseFrameAssemblyBenchmark.lean"],
+    tags = ["manual"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
+    name = "unary_response_frame_assembly_benchmark_test",
+    srcs = ["Benchmark/UnaryResponseFrameAssemblyBenchmark.lean"],
+    args = ["candidate", "exact_128", "100", "10"],
     deps = [":grpc_lean"],
 )
 
