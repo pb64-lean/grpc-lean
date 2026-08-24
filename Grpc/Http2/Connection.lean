@@ -1,7 +1,9 @@
 module
 
 public import Std.Sync.Mutex
+public import Std.Sync.Notify
 public import Grpc.Http2.Frame
+public import Grpc.Http2.ExtendedConnect
 public import Grpc.Http2.Grpc
 import Std.Async.Timer
 import Std.Data.HashMap
@@ -351,6 +353,55 @@ structure ActiveAuthorization where
   cancelled : IO.Ref Bool
   private deadlineChild : IO.Ref (Option DeadlineChild)
 
+/-- One connection-owned extended CONNECT policy decision. The callback runs
+without the connection-state mutex and is retained so reset and shutdown can
+cancel and join its exact task. -/
+structure ActiveExtendedConnectDecision where
+  streamId : Nat
+  task : Task (Except IO.Error Unit)
+  cancelled : IO.Ref Bool
+
+private def findActiveExtendedConnectDecision?
+    (decisions : Array ActiveExtendedConnectDecision) (streamId : Nat) :
+    Option ActiveExtendedConnectDecision :=
+  decisions.find? fun decision => decision.streamId == streamId
+
+private def removeActiveExtendedConnectDecision
+    (decisions : Array ActiveExtendedConnectDecision) (streamId : Nat) :
+    Array ActiveExtendedConnectDecision :=
+  decisions.filter fun decision => decision.streamId != streamId
+
+private def activeExtendedConnectDecisionsForStream
+    (decisions : Array ActiveExtendedConnectDecision) (streamId : Nat) :
+    Array ActiveExtendedConnectDecision :=
+  decisions.filter fun decision => decision.streamId == streamId
+
+/-- One accepted extended CONNECT stream. The HTTP/2 connection owns the
+handler task and an unbounded task-backed inbound channel; memory remains
+bounded by the stream receive window because payload credit is returned only
+on `Tunnel.recv?`. -/
+structure ActiveTunnel where
+  streamId : Nat
+  inbound : Std.CloseableChannel (Except Status (ByteArray × Nat))
+  wakeup : Std.Notify
+  cancelled : IO.Ref Bool
+  terminal : IO.Ref (Option (Except Status Unit))
+  task : Option (Task (Except IO.Error Unit)) := none
+  sendClosed : Bool := false
+  recvClosed : Bool := false
+
+private def findActiveTunnel? (tunnels : Array ActiveTunnel) (streamId : Nat) :
+    Option ActiveTunnel :=
+  tunnels.find? fun tunnel => tunnel.streamId == streamId
+
+private def removeActiveTunnel (tunnels : Array ActiveTunnel) (streamId : Nat) :
+    Array ActiveTunnel :=
+  tunnels.filter fun tunnel => tunnel.streamId != streamId
+
+private def replaceActiveTunnel (tunnels : Array ActiveTunnel) (tunnel : ActiveTunnel) :
+    Array ActiveTunnel :=
+  (removeActiveTunnel tunnels tunnel.streamId).push tunnel
+
 def initialFlowControlWindow : Nat := 65535
 
 /-- Advertised per-stream receive window (`SETTINGS_INITIAL_WINDOW_SIZE`): the
@@ -374,6 +425,12 @@ structure State where
   closing : Bool := false
   prefaceReceived : Bool := false
   clientSettingsReceived : Bool := false
+  /-- This endpoint advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1. -/
+  extendedConnectEnabled : Bool := false
+  /-- The peer's last SETTINGS_ENABLE_CONNECT_PROTOCOL state. Receipt by a
+  server has no feature effect, but RFC 8441 still constrains its values and
+  forbids retracting 1 back to 0. -/
+  peerExtendedConnectEnabled : Bool := false
   prefaceBuffer : ByteArray := ByteArray.empty
   decoder : Frame.DecodeState := {}
   hpack : Hpack.State := {}
@@ -413,6 +470,8 @@ structure State where
   activeRequestStreams : Array ActiveRequestStream := #[]
   activeDispatches : Array ActiveDispatch := #[]
   activeAuthorizations : Array ActiveAuthorization := #[]
+  activeExtendedConnectDecisions : Array ActiveExtendedConnectDecision := #[]
+  activeTunnels : Array ActiveTunnel := #[]
   /-- Requests detached from inbound buffering whose gated handler task has not
   yet been published in `activeDispatches`.  This is an ownership token, not
   merely a diagnostic: graceful drain must count it, and a concurrent stream
@@ -427,7 +486,8 @@ structure State where
 
 def serverSettingsFrame (maxConcurrentStreams : Option Nat := none)
     (maxHeaderListSize : Option Nat := none)
-    (initialWindowSize : Nat := defaultStreamWindow) : Except Status Frame :=
+    (initialWindowSize : Nat := defaultStreamWindow)
+    (enableExtendedConnect : Bool := false) : Except Status Frame :=
   let settings := #[]
   let settings := match maxConcurrentStreams with
     | none => settings
@@ -440,16 +500,23 @@ def serverSettingsFrame (maxConcurrentStreams : Option Nat := none)
       settings
     else
       settings.push { id := SettingId.initialWindowSize, value := initialWindowSize }
+  let settings :=
+    if enableExtendedConnect then
+      settings.push { id := SettingId.enableConnectProtocol, value := 1 }
+    else
+      settings
   Settings.frame settings
 
 def initialState (maxConcurrentStreams : Option Nat := none)
     (maxHeaderListSize : Option Nat := none)
-    (initialWindowSize : Nat := defaultStreamWindow) : State :=
+    (initialWindowSize : Nat := defaultStreamWindow)
+    (enableExtendedConnect : Bool := false) : State :=
   {
     (default : State) with
     inboundMaxConcurrentStreams := maxConcurrentStreams,
     inboundMaxHeaderListSize := maxHeaderListSize,
-    inboundInitialStreamWindow := initialWindowSize
+    inboundInitialStreamWindow := initialWindowSize,
+    extendedConnectEnabled := enableExtendedConnect
   }
 
 def isDrainedAfterOutboundGoAway (state : State) : Bool :=
@@ -462,13 +529,17 @@ def isDrainedAfterOutboundGoAway (state : State) : Bool :=
         && state.activeRequestStreams.isEmpty
         && state.activeDispatches.isEmpty
         && state.activeAuthorizations.isEmpty
+        && state.activeExtendedConnectDecisions.isEmpty
+        && state.activeTunnels.isEmpty
         && state.pendingDispatchPublications.isEmpty
         && state.pendingOutbound.isEmpty
 
 def serverPrefaceBytes (maxConcurrentStreams : Option Nat := none)
     (maxHeaderListSize : Option Nat := none)
-    (initialWindowSize : Nat := defaultStreamWindow) : Except Status ByteArray := do
+    (initialWindowSize : Nat := defaultStreamWindow)
+    (enableExtendedConnect : Bool := false) : Except Status ByteArray := do
   let frame ← serverSettingsFrame maxConcurrentStreams maxHeaderListSize initialWindowSize
+    enableExtendedConnect
   Frame.encode frame
 
 private def findStream? (streams : Array StreamState) (streamId : Nat) : Option StreamState :=
@@ -1444,8 +1515,15 @@ private def applyPeerSetting (state : State) (setting : Setting) : Except Status
       pure state
   | .maxHeaderListSize =>
       pure state
-  | .unknown _ =>
-      pure state
+  | .unknown 0x8 =>
+      if setting.value > 1 then
+        throw (Status.internal "HTTP/2 SETTINGS_ENABLE_CONNECT_PROTOCOL must be 0 or 1")
+      else if state.peerExtendedConnectEnabled && setting.value == 0 then
+        throw (Status.internal
+          "HTTP/2 SETTINGS_ENABLE_CONNECT_PROTOCOL cannot be disabled after being enabled")
+      else
+        pure { state with peerExtendedConnectEnabled := setting.value == 1 }
+  | .unknown _ => pure state
 
 private def applyPeerSettings (state : State) (settings : Array Setting) : Except Status State :=
   settings.foldlM (init := state) applyPeerSetting
@@ -1521,6 +1599,12 @@ structure RequestStreamFeed where
   error : Option Status := none
   close : Bool := false
 
+private structure TunnelFeed where
+  inbound : Std.CloseableChannel (Except Status (ByteArray × Nat))
+  item : Option (ByteArray × Nat) := none
+  close : Bool := false
+  failure : Option Status := none
+
 /-- A validated custom header-authorization phase that must run after the
 connection-state transition has been published.  In particular, no user IO
 runs while the connection-state mutex is held. -/
@@ -1534,19 +1618,30 @@ private structure PendingAuthorization where
   scheduler : DeadlineScheduler
   active : ActiveAuthorization
 
+private structure PendingExtendedConnect where
+  streamId : Nat
+  request : ExtendedConnect.Request
+  handler : ExtendedConnect.Handler
+  peerClosed : Bool
+
 private inductive RequestHeaderAuthorization where
   | accepted
   | rejected (frames : Array Frame)
   | pending (authorization : PendingAuthorization)
+  | extendedConnect (pending : PendingExtendedConnect)
 
 structure SharedFrameResult where
   emitted : Array Frame := #[]
   detached : Option DetachedDispatch := none
   requestStreaming : Option RequestStreamingDispatch := none
   requestFeeds : Array RequestStreamFeed := #[]
+  private tunnelFeeds : Array TunnelFeed := #[]
   cancelDispatches : Array ActiveDispatch := #[]
   cancelAuthorizations : Array ActiveAuthorization := #[]
+  private cancelExtendedConnectDecisions : Array ActiveExtendedConnectDecision := #[]
+  private cancelTunnels : Array ActiveTunnel := #[]
   private pendingAuthorization : Option PendingAuthorization := none
+  private pendingExtendedConnect : Option PendingExtendedConnect := none
 
 /-- Incremental request-body dispatch applies exactly to entries whose shape
 consumes a `MessageStream`; aggregate shapes buffer the body instead. -/
@@ -1654,8 +1749,45 @@ theorem rejectStreamAtHeaders_tables (state : State) (streamId : Nat)
   unfold rejectStreamAtHeaders
   split <;> exact ⟨rfl, rfl⟩
 
+private def looksLikeExtendedConnect (metadata : Metadata) : Bool :=
+  metadata.any fun header =>
+    let name := header.name.toLower
+    name == ":protocol" || (name == ":method" && header.value == "CONNECT")
+
+private def rejectExtendedConnectAtHeaders (state : State) (streamId : Nat)
+    (headers : Transport.RequestHeadersFrames) : Except Status (State × RequestHeaderAuthorization) := do
+  let rst ← RstStream.frame streamId ErrorCode.protocolError
+  let state := rejectStreamAtHeaders state streamId headers.hpack state.outboundHpack
+    headers.endStream
+  let state := if headers.endStream then state else drainResetInboundStreamBody state streamId
+  pure (state, .rejected #[rst])
+
+private def authorizeExtendedConnectHeaders (state : State) (streamId : Nat)
+    (headers : Transport.RequestHeadersFrames)
+    (handler? : Option ExtendedConnect.Handler) :
+    Except Status (State × RequestHeaderAuthorization) := do
+  if !state.extendedConnectEnabled then
+    rejectExtendedConnectAtHeaders state streamId headers
+  else
+    match handler? with
+    | none => rejectExtendedConnectAtHeaders state streamId headers
+    | some handler =>
+        match ExtendedConnect.decodeRequest headers.metadata with
+        | .error _ => rejectExtendedConnectAtHeaders state streamId headers
+        | .ok request =>
+            let state := { state with hpack := headers.hpack }
+            let state :=
+              if headers.endStream then removeInboundStreamState state streamId else state
+            pure (state, .extendedConnect {
+              streamId := streamId,
+              request := request,
+              handler := handler,
+              peerClosed := headers.endStream
+            })
+
 private def authorizeRequestHeadersForStream (registry : Registry) (state : State)
-    (streamId : Nat) : IO (Except Status (State × RequestHeaderAuthorization)) := do
+    (streamId : Nat) (extendedConnect? : Option ExtendedConnect.Handler := none) :
+    IO (Except Status (State × RequestHeaderAuthorization)) := do
   let decoded : Except Status (StreamState × Frame × Transport.RequestHeadersFrames) := do
     let stream ← match findStream? state.streams streamId with
       | some stream => pure stream
@@ -1687,6 +1819,8 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
           let state :=
             if headers.endStream then state else drainResetInboundStreamBody state streamId
           pure (.ok (state, .rejected #[rst]))
+    else if looksLikeExtendedConnect headers.metadata then
+      pure (authorizeExtendedConnectHeaders state streamId headers extendedConnect?)
     else
       match Transport.preflightEarlyRequest registry state.outboundHpack streamId
           headers.metadata state.outboundMaxFramePayloadLength with
@@ -1756,14 +1890,17 @@ private def authorizeRequestHeadersForStream (registry : Registry) (state : Stat
                 authorizeNow
           | none => authorizeNow
 
-private def earlyRequestRejectionForStream? (registry : Registry) (state : State) (streamId : Nat) :
+private def earlyRequestRejectionForStream? (registry : Registry) (state : State) (streamId : Nat)
+    (extendedConnect? : Option ExtendedConnect.Handler := none) :
     IO (Except Status (State × Option SharedFrameResult)) := do
-  match ← authorizeRequestHeadersForStream registry state streamId with
+  match ← authorizeRequestHeadersForStream registry state streamId extendedConnect? with
   | .error status => pure (.error status)
   | .ok (state, .accepted) => pure (.ok (state, none))
   | .ok (state, .rejected frames) => pure (.ok (state, some { emitted := frames }))
   | .ok (state, .pending authorization) =>
       pure (.ok (state, some { pendingAuthorization := some authorization }))
+  | .ok (state, .extendedConnect pending) =>
+      pure (.ok (state, some { pendingExtendedConnect := some pending }))
 
 private def processIgnoredInboundData (state : State) (frame : Frame) :
     Except Status (State × Array Frame) := do
@@ -2486,6 +2623,504 @@ private def feedRequestStream (feed : RequestStreamFeed) : IO (Except Status Uni
         feed.producer.close.run
       else
         pure (.ok ())
+
+private def closeTunnelInbound
+    (inbound : Std.CloseableChannel (Except Status (ByteArray × Nat))) : BaseIO Unit := do
+  discard <| inbound.close.toBaseIO
+
+private def sendTunnelInbound
+    (inbound : Std.CloseableChannel (Except Status (ByteArray × Nat)))
+    (event : Except Status (ByteArray × Nat)) : BaseIO (Except Status Unit) := do
+  if ← inbound.trySend event then
+    pure (.ok ())
+  else
+    pure (.error (Status.cancelled "extended CONNECT tunnel receive side is closed"))
+
+private def feedTunnel (feed : TunnelFeed) : IO (Except Status Unit) := do
+  match feed.item with
+  | some item =>
+      match ← sendTunnelInbound feed.inbound (.ok item) with
+      | .error status => return .error status
+      | .ok () => pure ()
+  | none => pure ()
+  match feed.failure with
+  | some status =>
+      let result ← sendTunnelInbound feed.inbound (.error status)
+      closeTunnelInbound feed.inbound
+      pure result
+  | none =>
+      if feed.close then closeTunnelInbound feed.inbound
+      pure (.ok ())
+
+private def signalTunnels (tunnels : Array ActiveTunnel) : IO Unit := do
+  for tunnel in tunnels do
+    tunnel.cancelled.set true
+    let status := Status.cancelled "extended CONNECT tunnel was reset"
+    tunnel.terminal.set (some (.error status))
+    tunnel.wakeup.notify
+    discard <| sendTunnelInbound tunnel.inbound (.error status)
+    closeTunnelInbound tunnel.inbound
+    if let some task := tunnel.task then IO.cancel task
+
+private def signalExtendedConnectDecisions
+    (decisions : Array ActiveExtendedConnectDecision) : IO Unit := do
+  for decision in decisions do
+    decision.cancelled.set true
+    IO.cancel decision.task
+
+private def finishExtendedConnectDecisionCancellationOwned
+    (decisions : Array ActiveExtendedConnectDecision) : Std.Async.Async Unit := do
+  for decision in decisions do
+    try Std.Async.Async.ofAsyncTask decision.task catch _ => pure ()
+
+private def finishTunnelCancellationOwned (tunnels : Array ActiveTunnel) :
+    Std.Async.Async Unit := do
+  for tunnel in tunnels do
+    if let some task := tunnel.task then
+      try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+
+private def runTunnelPipe : IO
+    (Except Status (Std.CloseableChannel (Except Status (ByteArray × Nat)))) := do
+  pure (.ok (← Std.CloseableChannel.new none))
+
+private inductive TunnelSendStep where
+  | frame (frame : Frame) (bytes : Nat)
+  | wait (waiter : Std.Async.AsyncTask Unit)
+  | failed (status : Status)
+
+private partial def sendActiveTunnelChunks (stateMutex : Std.Mutex State)
+    (emit : Array Frame → Std.Async.Async (Except Status Unit))
+    (streamId : Nat) (payload : ByteArray) (offset : Nat) :
+    Std.Async.Async (Except Status Unit) := do
+  if offset >= payload.size then
+    pure (.ok ())
+  else
+    let step ← stateMutex.atomically do
+      let state ← get
+      match findActiveTunnel? state.activeTunnels streamId with
+      | none => pure (TunnelSendStep.failed
+          (Status.cancelled "extended CONNECT tunnel is no longer active"))
+      | some tunnel =>
+          if ← tunnel.cancelled.get then
+            pure (TunnelSendStep.failed
+              (Status.cancelled "extended CONNECT tunnel was cancelled"))
+          else if tunnel.sendClosed then
+            pure (TunnelSendStep.failed
+              (Status.internal "send after extended CONNECT closeSend"))
+          else
+            let streamWindow := outboundStreamWindow state streamId
+            let available := Nat.min state.outboundConnectionWindow streamWindow.toNat
+            if available == 0 || !state.pendingOutbound.isEmpty then
+              let waiter ← tunnel.wakeup.wait
+              pure (TunnelSendStep.wait waiter)
+            else
+              let size := Nat.min (Nat.min available state.outboundMaxFramePayloadLength)
+                (payload.size - offset)
+              let chunk := payload.extract offset (offset + size)
+              let frame : Frame := {
+                header := {
+                  length := size,
+                  frameType := FrameType.data,
+                  streamId := streamId
+                },
+                payload := chunk
+              }
+              let state := setOutboundStreamWindow
+                { state with outboundConnectionWindow := state.outboundConnectionWindow - size }
+                streamId (streamWindow - Int.ofNat size)
+              set state
+              pure (TunnelSendStep.frame frame size)
+    match step with
+    | .failed status => pure (.error status)
+    | .wait waiter =>
+        try Std.Async.Async.ofAsyncTask waiter catch _ => pure ()
+        sendActiveTunnelChunks stateMutex emit streamId payload offset
+    | .frame frame bytes =>
+        match ← emit #[frame] with
+        | .error status => pure (.error status)
+        | .ok () => sendActiveTunnelChunks stateMutex emit streamId payload (offset + bytes)
+
+private def grantTunnelStreamCredit (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (streamId credit : Nat) : IO (Except Status Unit) := do
+  let grant ← stateMutex.atomically do
+    let state ← get
+    match findActiveTunnel? state.activeTunnels streamId with
+    | some tunnel =>
+        if tunnel.recvClosed || credit == 0 then
+          pure false
+        else
+          set (replenishInboundStreamWindowBy state streamId credit)
+          pure true
+    | none => pure false
+  if !grant then
+    pure (.ok ())
+  else
+    match WindowUpdate.frame streamId credit with
+    | .error status => pure (.error status)
+    | .ok update => emitFrameBatch emit #[update]
+
+private def recvActiveTunnel (stateMutex : Std.Mutex State) (emit : Array Frame → IO Unit)
+    (streamId : Nat) (inbound : Std.CloseableChannel (Except Status (ByteArray × Nat))) :
+    Std.Async.Async (Except Status (Option ByteArray)) := do
+  match ← Std.Async.Async.ofTask (← inbound.recv) with
+  | none => pure (.ok none)
+  | some (.error status) => pure (.error status)
+  | some (.ok (bytes, credit)) =>
+      match ← grantTunnelStreamCredit stateMutex emit streamId credit with
+      | .error status => pure (.error status)
+      | .ok () => pure (.ok (some bytes))
+
+private def closeActiveTunnelSend (stateMutex : Std.Mutex State)
+    (emit : Array Frame → Std.Async.Async (Except Status Unit)) (streamId : Nat) :
+    Std.Async.Async (Except Status Unit) := do
+  let frame? : Except Status (Option Frame) ← stateMutex.atomically do
+    let state ← get
+    match findActiveTunnel? state.activeTunnels streamId with
+    | none => pure (.error
+        (Status.cancelled "extended CONNECT tunnel is no longer active"))
+    | some tunnel =>
+        if ← tunnel.cancelled.get then
+          pure (.error (Status.cancelled "extended CONNECT tunnel was cancelled"))
+        else if tunnel.sendClosed then
+          pure (.ok none)
+        else
+          let tunnel := { tunnel with sendClosed := true }
+          set (removeOutboundStreamState
+            { state with activeTunnels := replaceActiveTunnel state.activeTunnels tunnel }
+            streamId)
+          tunnel.wakeup.notify
+          pure (.ok (some {
+            header := {
+              length := 0,
+              frameType := FrameType.data,
+              flags := FrameFlag.endStream,
+              streamId := streamId
+            }
+          }))
+  match frame? with
+  | .error status => pure (.error status)
+  | .ok none => pure (.ok ())
+  | .ok (some frame) => emit #[frame]
+
+private def cancelActiveTunnel (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (streamId : Nat) (terminal : IO.Ref (Option (Except Status Unit))) :
+    Std.Async.Async Unit := do
+  let active? ← stateMutex.atomically do
+    let state ← get
+    match findActiveTunnel? state.activeTunnels streamId with
+    | none => pure none
+    | some active =>
+        active.cancelled.set true
+        let state := { state with
+          streams := removeStream state.streams streamId,
+          activeTunnels := removeActiveTunnel state.activeTunnels streamId }
+        let state := removeInboundStreamState (removeOutboundStreamState state streamId) streamId
+        let state := if !active.recvClosed then
+          drainResetInboundStreamBody state streamId
+        else
+          state
+        set state
+        pure (some active)
+  match active? with
+  | none => pure ()
+  | some active =>
+      let status := Status.cancelled "extended CONNECT tunnel cancelled locally"
+      terminal.set (some (.error status))
+      active.wakeup.notify
+      discard <| sendTunnelInbound active.inbound (.error status)
+      closeTunnelInbound active.inbound
+      match RstStream.frame streamId ErrorCode.cancel with
+      | .error _ => pure ()
+      | .ok rst => discard <| emitFrameBatch emit #[rst]
+
+private partial def waitActiveTunnel (stateMutex : Std.Mutex State) (streamId : Nat)
+    (wakeup : Std.Notify) (terminal : IO.Ref (Option (Except Status Unit))) :
+    Std.Async.Async (Except Status Unit) := do
+  match ← terminal.get with
+  | some result => pure result
+  | none =>
+      let done ← stateMutex.atomically do
+        let state ← get
+        match findActiveTunnel? state.activeTunnels streamId with
+        | some tunnel => pure (tunnel.sendClosed && tunnel.recvClosed)
+        | none => pure true
+      if done then
+        pure (.ok ())
+      else
+        let waiter ← wakeup.wait
+        try Std.Async.Async.ofAsyncTask waiter catch _ => pure ()
+        waitActiveTunnel stateMutex streamId wakeup terminal
+
+private def makeActiveTunnel (stateMutex : Std.Mutex State) (emit : Array Frame → IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (active : ActiveTunnel) : ExtendedConnect.Tunnel := {
+  sendBytesImpl := fun bytes =>
+    sendActiveTunnelChunks stateMutex emitAcknowledged active.streamId bytes 0
+  recvBytesImpl := recvActiveTunnel stateMutex emit active.streamId active.inbound
+  closeSendImpl := closeActiveTunnelSend stateMutex emitAcknowledged active.streamId
+  cancelImpl := cancelActiveTunnel stateMutex emit active.streamId active.terminal
+  waitImpl := waitActiveTunnel stateMutex active.streamId active.wakeup active.terminal
+}
+
+private def encodeExtendedResponse (state : State) (streamId : Nat)
+    (response : ExtendedConnect.Response) (endStream : Bool) :
+    Except Status (State × Array Frame) := do
+  let metadata ← ExtendedConnect.encodeResponse response
+  let encoded ← Hpack.encodeHeaderBlock state.outboundHpack metadata
+  let frames ← Transport.headerBlockFrames streamId encoded.1 endStream
+    state.outboundMaxFramePayloadLength
+  pure ({ state with outboundHpack := encoded.2 }, frames)
+
+private def extendedInternalErrorResponse : ExtendedConnect.Response :=
+  { status := 500 }
+
+private def commitExtendedRejection (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (pending : PendingExtendedConnect)
+    (response : ExtendedConnect.Response) : Std.Async.Async (Except Status Unit) := do
+  let response := if ExtendedConnect.isSuccess response then
+      extendedInternalErrorResponse
+    else
+      response
+  let frames? : Except Status (Array Frame) ← stateMutex.atomically do
+    let state ← get
+    if state.closing ||
+        (findActiveExtendedConnectDecision?
+          state.activeExtendedConnectDecisions pending.streamId).isNone then
+      pure (.error (Status.cancelled "HTTP/2 connection is closing"))
+    else
+      let encoded : Except Status (State × Array Frame) :=
+        match encodeExtendedResponse state pending.streamId response true with
+        | .ok encoded => .ok encoded
+        | .error _ => encodeExtendedResponse state pending.streamId
+            extendedInternalErrorResponse true
+      match encoded with
+      | .error status => pure (.error status)
+      | .ok (state, frames) =>
+          let state := {
+            state with
+            streams := removeStream state.streams pending.streamId,
+            activeExtendedConnectDecisions := removeActiveExtendedConnectDecision
+              state.activeExtendedConnectDecisions pending.streamId
+          }
+          let state := if pending.peerClosed then
+            removeInboundStreamState state pending.streamId
+          else
+            ignoreInboundStreamBody state pending.streamId
+          set (removeOutboundStreamState state pending.streamId)
+          pure (.ok frames)
+  match frames? with
+  | .error status => pure (.error status)
+  | .ok frames => emitFrameBatch emit frames
+
+private def retireTunnelHandler (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (active : ActiveTunnel) : Std.Async.Async Unit := do
+  match ← closeActiveTunnelSend stateMutex emitAcknowledged active.streamId with
+  | .error _ => pure ()
+  | .ok () =>
+      let peerClosed ← stateMutex.atomically do
+        let state ← get
+        pure (((findActiveTunnel? state.activeTunnels active.streamId).map
+          (fun tunnel => tunnel.recvClosed)).getD true)
+      if peerClosed then
+        active.terminal.set (some (.ok ()))
+        stateMutex.atomically do
+          let state ← get
+          set { state with
+            streams := removeStream state.streams active.streamId,
+            activeTunnels := removeActiveTunnel state.activeTunnels active.streamId }
+        active.wakeup.notify
+      else
+        cancelActiveTunnel stateMutex emit active.streamId active.terminal
+
+private def commitExtendedAcceptance (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (pending : PendingExtendedConnect)
+    (acceptance : ExtendedConnect.Acceptance) : Std.Async.Async (Except Status Unit) := do
+  let response : ExtendedConnect.Response := {
+    status := acceptance.status,
+    headers := acceptance.headers
+  }
+  if !ExtendedConnect.isSuccess response then
+    return ← commitExtendedRejection stateMutex emit pending extendedInternalErrorResponse
+  let inbound ← match ← runTunnelPipe with
+    | .error status => return .error status
+    | .ok producer => pure producer
+  let wakeup ← Std.Notify.new
+  let cancelled ← IO.mkRef false
+  let terminal ← IO.mkRef (none : Option (Except Status Unit))
+  let registered ← IO.Promise.new
+  let activeRef ← IO.mkRef (none : Option ActiveTunnel)
+  let task ← Std.Async.Async.toIO do
+    match ← Std.Async.Async.ofTask registered.result? with
+    | none => pure ()
+    | some () =>
+        match ← activeRef.get with
+        | none => pure ()
+        | some active =>
+            let tunnel := makeActiveTunnel stateMutex emit emitAcknowledged active
+            try
+              acceptance.run tunnel
+              retireTunnelHandler stateMutex emit emitAcknowledged active
+            catch _ =>
+              cancelActiveTunnel stateMutex emit active.streamId active.terminal
+  let prepared? : Except Status (Array Frame × Array (ByteArray × Nat) × Bool) ←
+      stateMutex.atomically do
+    let state ← get
+    if state.closing || (← cancelled.get) then
+      pure (.error (Status.cancelled "HTTP/2 connection is closing"))
+    else
+      match findActiveExtendedConnectDecision?
+          state.activeExtendedConnectDecisions pending.streamId with
+      | none => pure (.error (Status.cancelled
+          "extended CONNECT policy decision is no longer active"))
+      | some _ =>
+          match findStream? state.streams pending.streamId with
+          | none => pure (.error (Status.cancelled
+              "extended CONNECT stream is no longer active"))
+          | some stream =>
+              match encodeExtendedResponse state pending.streamId response false with
+              | .error status => pure (.error status)
+              | .ok (state, frames) =>
+                  let buffered := stream.frames.filterMap fun frame =>
+                    if frame.header.frameType == FrameType.data && !frame.payload.isEmpty then
+                      some (frame.payload, frame.payload.size)
+                    else
+                      none
+                  let recvClosed := pending.peerClosed || stream.frames.any fun frame =>
+                    frame.header.frameType == FrameType.data &&
+                      FrameFlag.has frame.header.flags FrameFlag.endStream
+                  let active : ActiveTunnel := {
+                    streamId := pending.streamId,
+                    inbound := inbound,
+                    wakeup := wakeup,
+                    cancelled := cancelled,
+                    terminal := terminal,
+                    task := some task,
+                    recvClosed := recvClosed
+                  }
+                  activeRef.set (some active)
+                  let stream := { stream with frames := stream.frames.extract 0 1 }
+                  set {
+                    state with
+                    streams := replaceStream state.streams stream,
+                    activeExtendedConnectDecisions := removeActiveExtendedConnectDecision
+                      state.activeExtendedConnectDecisions pending.streamId,
+                    activeTunnels := state.activeTunnels.push active
+                  }
+                  pure (.ok (frames, buffered, recvClosed))
+  match prepared? with
+  | .error status =>
+      cancelled.set true
+      registered.resolve ()
+      IO.cancel task
+      try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+      pure (.error status)
+  | .ok (frames, buffered, recvClosed) =>
+      match ← emitFrameBatch emit frames with
+      | .error status =>
+          cancelled.set true
+          IO.cancel task
+          registered.resolve ()
+          try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+          cancelActiveTunnel stateMutex emit pending.streamId terminal
+          pure (.error status)
+      | .ok () =>
+          for item in buffered do
+            match ← sendTunnelInbound inbound (.ok item) with
+            | .ok () => pure ()
+            | .error status =>
+                cancelled.set true
+                IO.cancel task
+                registered.resolve ()
+                try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+                cancelActiveTunnel stateMutex emit pending.streamId terminal
+                return .error status
+          if recvClosed then closeTunnelInbound inbound
+          registered.resolve ()
+          pure (.ok ())
+
+private def runPendingExtendedConnect (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (pending : PendingExtendedConnect) :
+    Std.Async.Async (Except Status Unit) := do
+  let decision ← try
+      pending.handler pending.request
+    catch _ =>
+      pure (ExtendedConnect.Decision.reject { status := 500 })
+  match decision with
+  | .reject rejection =>
+      commitExtendedRejection stateMutex emit pending {
+        status := rejection.status,
+        headers := rejection.headers
+      }
+  | .accept acceptance =>
+      commitExtendedAcceptance stateMutex emit emitAcknowledged pending acceptance
+
+private def retireFailedExtendedConnectDecision (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit) (pending : PendingExtendedConnect) : IO Unit := do
+  let shouldReset ← stateMutex.atomically do
+    let state ← get
+    match findActiveExtendedConnectDecision?
+        state.activeExtendedConnectDecisions pending.streamId with
+    | none => pure false
+    | some _ =>
+        let state := {
+          state with
+          streams := removeStream state.streams pending.streamId,
+          activeExtendedConnectDecisions := removeActiveExtendedConnectDecision
+            state.activeExtendedConnectDecisions pending.streamId
+        }
+        let state := removeInboundStreamState
+          (removeOutboundStreamState state pending.streamId) pending.streamId
+        set <| if pending.peerClosed then state
+          else drainResetInboundStreamBody state pending.streamId
+        pure true
+  if shouldReset then
+    match RstStream.frame pending.streamId ErrorCode.internalError with
+    | .error _ => pure ()
+    | .ok rst => discard <| emitFrameBatch emit #[rst]
+
+/-- Publish one policy callback as an exact connection-owned task. The reader
+returns immediately after publication, so a slow decision cannot stall frames
+for unrelated streams. -/
+private def spawnPendingExtendedConnect (stateMutex : Std.Mutex State)
+    (emit : Array Frame → IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (pending : PendingExtendedConnect) : Std.Async.Async (Except Status Unit) := do
+  let cancelled ← IO.mkRef false
+  let registered ← IO.Promise.new
+  let task ← Std.Async.Async.toIO do
+    match ← Std.Async.Async.ofTask registered.result? with
+    | none => pure ()
+    | some () =>
+        unless ← cancelled.get do
+          match ← runPendingExtendedConnect stateMutex emit emitAcknowledged pending with
+          | .ok () => pure ()
+          | .error _ => retireFailedExtendedConnectDecision stateMutex emit pending
+  let active : ActiveExtendedConnectDecision := {
+    streamId := pending.streamId,
+    task := task,
+    cancelled := cancelled
+  }
+  let published ← stateMutex.atomically do
+    let state ← get
+    if state.closing || (findStream? state.streams pending.streamId).isNone then
+      pure false
+    else
+      set { state with
+        activeExtendedConnectDecisions := state.activeExtendedConnectDecisions.push active }
+      pure true
+  unless published do
+    cancelled.set true
+    IO.cancel task
+  registered.resolve ()
+  unless published do
+    try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+  pure (.ok ())
 
 /-- Wait for the dispatch to be registered in connection state before running the
 handler. Resolved immediately after the spawn site's registration, so the wait is
@@ -3470,30 +4105,40 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
   pure (.ok ())
 
 def signalCancelActiveShared (stateMutex : Std.Mutex State) : IO Unit := do
-  let (dispatches, authorizations) ← stateMutex.atomically do
+  let (dispatches, authorizations, decisions, tunnels) ← stateMutex.atomically do
     let state ← get
     for dispatch in state.activeDispatches do
       dispatch.cancelled.set true
     for authorization in state.activeAuthorizations do
       authorization.cancelled.set true
+    for decision in state.activeExtendedConnectDecisions do
+      decision.cancelled.set true
     set { state with closing := true }
-    pure (state.activeDispatches, state.activeAuthorizations)
+    pure (state.activeDispatches, state.activeAuthorizations,
+      state.activeExtendedConnectDecisions, state.activeTunnels)
   -- This entry point is safe for shutdown/error callbacks: it never enters
   -- arbitrary MessageStream.cancel IO and never waits for a handler.
   signalAuthorizations authorizations
   signalDispatches dispatches
+  signalExtendedConnectDecisions decisions
+  signalTunnels tunnels
 
 def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async State := do
-  let (state, dispatches, authorizations, requestStreams, scheduler?) ← stateMutex.atomically do
+  let (state, dispatches, authorizations, decisions, tunnels, requestStreams, scheduler?) ←
+      stateMutex.atomically do
     let state ← get
     let dispatches := state.activeDispatches
     let authorizations := state.activeAuthorizations
+    let decisions := state.activeExtendedConnectDecisions
+    let tunnels := state.activeTunnels
     let requestStreams := state.activeRequestStreams
     let scheduler? := state.deadlineScheduler
     for dispatch in dispatches do
       dispatch.cancelled.set true
     for authorization in authorizations do
       authorization.cancelled.set true
+    for decision in decisions do
+      decision.cancelled.set true
     let state := {
       state with
       closing := true,
@@ -3504,6 +4149,8 @@ def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async Sta
       activeRequestStreams := #[],
       activeDispatches := #[],
       activeAuthorizations := #[],
+      activeExtendedConnectDecisions := #[],
+      activeTunnels := #[],
       pendingDispatchPublications := #[],
       pendingOutbound := #[],
       inboundStreamWindows := #[],
@@ -3511,12 +4158,14 @@ def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async Sta
       deadlineScheduler := none
     }
     set state
-    pure (state, dispatches, authorizations, requestStreams, scheduler?)
+    pure (state, dispatches, authorizations, decisions, tunnels, requestStreams, scheduler?)
   -- Wake every deadline/authorization race before joining any arbitrary user
   -- callback.  A callback may be uncooperative, but no other owned phase is
   -- left waiting merely because it was signalled later in the loop.
   signalAuthorizations authorizations
   signalDispatches dispatches
+  signalExtendedConnectDecisions decisions
+  signalTunnels tunnels
   -- The scheduler is infrastructure, not arbitrary user IO. Retire it after
   -- every child has been signalled but before joining callbacks that may be
   -- uncooperative, so teardown never leaks the shared timer task.
@@ -3525,6 +4174,8 @@ def cancelActiveSharedOwned (stateMutex : Std.Mutex State) : Std.Async.Async Sta
   | some scheduler => scheduler.shutdown
   finishDispatchCancellationOwned dispatches
   finishAuthorizationCancellationOwned authorizations
+  finishExtendedConnectDecisionCancellationOwned decisions
+  finishTunnelCancellationOwned tunnels
   -- Streaming dispatches own their producer cancellation through
   -- requestStreamCancel. Retain ownership for any defensive orphan as well.
   for requestStream in requestStreams do
@@ -3611,6 +4262,9 @@ private def processGoAway (state : State) (frame : Frame) : Except Status (State
 private def hasOpenInboundStream (state : State) (streamId : Nat) : Bool :=
   (findStream? state.streams streamId).isSome
     || (findActiveRequestStream? state.activeRequestStreams streamId).isSome
+    || (findActiveExtendedConnectDecision?
+      state.activeExtendedConnectDecisions streamId).isSome
+    || (findActiveTunnel? state.activeTunnels streamId).isSome
     || !(activeDispatchesForStream state.activeDispatches streamId).isEmpty
 
 /-- Drop only `streamId`'s state after a locally generated RST_STREAM.  When
@@ -3622,7 +4276,11 @@ private def resetLocalStream (state : State) (streamId : Nat) (peerEnded : Bool 
   -- observed cancellation and joined any child published concurrently with
   -- this reset.  Removing the marker here could make drain accounting report
   -- completion during the child-publication gap.
-  let state := { state with streams := removeStream state.streams streamId }
+  let state := { state with
+    streams := removeStream state.streams streamId,
+    activeExtendedConnectDecisions := removeActiveExtendedConnectDecision
+      state.activeExtendedConnectDecisions streamId,
+    activeTunnels := removeActiveTunnel state.activeTunnels streamId }
   let state := removeInboundStreamState (removeOutboundStreamState state streamId) streamId
   if wasOpen && !peerEnded then drainResetInboundStreamBody state streamId else state
 
@@ -3653,12 +4311,18 @@ def resetStreamFlowControl (state : State) (frame : Frame) :
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
   let cancelAuthorizations :=
     activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
+  let cancelExtendedConnectDecisions := activeExtendedConnectDecisionsForStream
+    state.activeExtendedConnectDecisions frame.header.streamId
+  let cancelTunnels := state.activeTunnels.filter fun tunnel =>
+    tunnel.streamId == frame.header.streamId
   let state := resetLocalStream state frame.header.streamId
     (peerEnded := FrameFlag.has frame.header.flags FrameFlag.endStream)
   pure (state, {
     emitted := #[connectionUpdate, rst],
     cancelDispatches := cancelDispatches,
-    cancelAuthorizations := cancelAuthorizations
+    cancelAuthorizations := cancelAuthorizations,
+    cancelExtendedConnectDecisions := cancelExtendedConnectDecisions,
+    cancelTunnels := cancelTunnels
   })
 
 /-- A stream receive-window violation consumes no lasting connection credit,
@@ -3718,11 +4382,14 @@ private def resetPriorityFrameSize (state : State) (frame : Frame) :
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
   let cancelAuthorizations :=
     activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
+  let cancelExtendedConnectDecisions := activeExtendedConnectDecisionsForStream
+    state.activeExtendedConnectDecisions frame.header.streamId
   let state := resetLocalStream state frame.header.streamId
   pure (state, {
     emitted := #[rst],
     cancelDispatches := cancelDispatches,
-    cancelAuthorizations := cancelAuthorizations
+    cancelAuthorizations := cancelAuthorizations,
+    cancelExtendedConnectDecisions := cancelExtendedConnectDecisions
   })
 
 /-- Classify the frame-local failures whose per-frame-type processors would
@@ -3745,6 +4412,7 @@ private def containStreamError? (state : State) (frame : Frame) :
       discard <| stripPadding frame "DATA"
       let validOpenStream :=
         (findActiveRequestStream? state.activeRequestStreams frame.header.streamId).isSome
+          || (findActiveTunnel? state.activeTunnels frame.header.streamId).isSome
           || ((findStream? state.streams frame.header.streamId).map streamHeaderComplete).getD false
       if validOpenStream && streamWindowOverrun state frame then
         some <$> resetStreamFlowControl state frame
@@ -3786,14 +4454,23 @@ private def processRstStreamShared (state : State) (frame : Frame) :
   let cancelDispatches := activeDispatchesForStream state.activeDispatches frame.header.streamId
   let cancelAuthorizations :=
     activeAuthorizationsForStream state.activeAuthorizations frame.header.streamId
+  let cancelExtendedConnectDecisions := activeExtendedConnectDecisionsForStream
+    state.activeExtendedConnectDecisions frame.header.streamId
+  let cancelTunnels := state.activeTunnels.filter fun tunnel =>
+    tunnel.streamId == frame.header.streamId
   let state := {
     state with
-    streams := removeStream state.streams frame.header.streamId
+    streams := removeStream state.streams frame.header.streamId,
+    activeExtendedConnectDecisions := removeActiveExtendedConnectDecision
+      state.activeExtendedConnectDecisions frame.header.streamId,
+    activeTunnels := removeActiveTunnel state.activeTunnels frame.header.streamId
   }
   let state := removeInboundStreamState state frame.header.streamId
   pure (removeOutboundStreamState state frame.header.streamId, {
     cancelDispatches := cancelDispatches,
-    cancelAuthorizations := cancelAuthorizations
+    cancelAuthorizations := cancelAuthorizations,
+    cancelExtendedConnectDecisions := cancelExtendedConnectDecisions,
+    cancelTunnels := cancelTunnels
   })
 
 /-- HPACK is connection-wide, so even a field block that crossed a local reset
@@ -3885,6 +4562,9 @@ private def processHeaders (registry : Registry) (state : State) (frame : Frame)
               | .ok (_, .pending _) =>
                   pure (.error (Status.internal
                     "managed header authorization reached synchronous frame processing"))
+              | .ok (_, .extendedConnect _) =>
+                  pure (.error (Status.internal
+                    "managed extended CONNECT reached synchronous frame processing"))
               | .ok (state, .accepted) =>
                   if FrameFlag.has frame.header.flags FrameFlag.endStream then
                     finalizeStream registry state frame.header.streamId
@@ -3927,6 +4607,9 @@ private def processHeadersWith (registry : Registry) (state : State) (frame : Fr
               | .ok (_, .pending _) =>
                   pure (.error (Status.internal
                     "managed header authorization reached synchronous frame processing"))
+              | .ok (_, .extendedConnect _) =>
+                  pure (.error (Status.internal
+                    "managed extended CONNECT reached synchronous frame processing"))
               | .ok (state, .accepted) =>
                   if FrameFlag.has frame.header.flags FrameFlag.endStream then
                     finalizeStreamWith registry state frame.header.streamId emit
@@ -3952,6 +4635,9 @@ private def processContinuation (registry : Registry) (state : State) (frame : F
                 | .ok (_, .pending _) =>
                     pure (.error (Status.internal
                       "managed header authorization reached synchronous frame processing"))
+                | .ok (_, .extendedConnect _) =>
+                    pure (.error (Status.internal
+                      "managed extended CONNECT reached synchronous frame processing"))
                 | .ok (state, .accepted) =>
                     if FrameFlag.has headersFrame.header.flags FrameFlag.endStream then
                       finalizeStream registry state frame.header.streamId
@@ -3982,6 +4668,9 @@ private def processContinuationWith (registry : Registry) (state : State) (frame
                 | .ok (_, .pending _) =>
                     pure (.error (Status.internal
                       "managed header authorization reached synchronous frame processing"))
+                | .ok (_, .extendedConnect _) =>
+                    pure (.error (Status.internal
+                      "managed extended CONNECT reached synchronous frame processing"))
                 | .ok (state, .accepted) =>
                     if FrameFlag.has headersFrame.header.flags FrameFlag.endStream then
                       finalizeStreamWith registry state frame.header.streamId emit
@@ -4211,7 +4900,8 @@ def prepareHeadersShared (state : State) (frame : Frame) :
       pure (state, none)
 
 private def processHeadersShared (registry : Registry) (state : State) (frame : Frame)
-    (receivedAt : Option Nat := none) :
+    (receivedAt : Option Nat := none)
+    (extendedConnect? : Option ExtendedConnect.Handler := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   match prepareHeadersShared state frame with
   | .error status => pure (.error status)
@@ -4219,7 +4909,8 @@ private def processHeadersShared (registry : Registry) (state : State) (frame : 
   | .ok (state, none) =>
       if FrameFlag.has frame.header.flags FrameFlag.endHeaders then
         let state := recordEndHeadersReceivedAt state frame.header.streamId receivedAt
-        match ← earlyRequestRejectionForStream? registry state frame.header.streamId with
+        match ← earlyRequestRejectionForStream? registry state frame.header.streamId
+            extendedConnect? with
         | .error status => pure (.error status)
         | .ok (state, some result) => pure (.ok (state, result))
         | .ok (state, none) =>
@@ -4238,7 +4929,8 @@ private def processHeadersShared (registry : Registry) (state : State) (frame : 
         pure (.ok (state, {}))
 
 private def processContinuationShared (registry : Registry) (state : State) (frame : Frame)
-    (receivedAt : Option Nat := none) :
+    (receivedAt : Option Nat := none)
+    (extendedConnect? : Option ExtendedConnect.Handler := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   match appendContinuationFrame state.streams frame with
   | .error status => pure (.error status)
@@ -4252,7 +4944,8 @@ private def processContinuationShared (registry : Registry) (state : State) (fra
       | none => pure (.error
           (Status.internal "HTTP/2 CONTINUATION frame arrived before request HEADERS"))
       | some headersFrame =>
-        match ← earlyRequestRejectionForStream? registry state frame.header.streamId with
+        match ← earlyRequestRejectionForStream? registry state frame.header.streamId
+            extendedConnect? with
         | .error status => pure (.error status)
         | .ok (state, some result) => pure (.ok (state, result))
         | .ok (state, none) =>
@@ -4395,14 +5088,44 @@ private def resetClosedStreamData (state : State) (frame : Frame) :
   let cancelDispatches := activeDispatchesForStream state.activeDispatches streamId
   let cancelAuthorizations :=
     activeAuthorizationsForStream state.activeAuthorizations streamId
+  let cancelExtendedConnectDecisions := activeExtendedConnectDecisionsForStream
+    state.activeExtendedConnectDecisions streamId
   let state := removeOutboundStreamState state streamId
   let (state, updates) ← processResetInboundData
     (drainResetInboundStreamBody state streamId) frame
   pure (state, {
     emitted := updates.push rst,
     cancelDispatches := cancelDispatches,
-    cancelAuthorizations := cancelAuthorizations
+    cancelAuthorizations := cancelAuthorizations,
+    cancelExtendedConnectDecisions := cancelExtendedConnectDecisions
   })
+
+/-- Buffer request DATA while an asynchronous extended CONNECT policy decision
+is pending. Connection credit and padding credit are returned immediately;
+payload stream credit is deferred until an accepted tunnel consumes the bytes,
+bounding undecided-stream memory by its advertised receive window. -/
+private def processPendingExtendedConnectData (state : State) (frame : Frame) :
+    Except Status (State × SharedFrameResult) :=
+  match findStream? state.streams frame.header.streamId with
+  | none => .error (Status.internal
+      "extended CONNECT DATA arrived without retained stream state")
+  | some stream =>
+      if !streamHeaderComplete stream then
+        .error (Status.internal "extended CONNECT DATA arrived before END_HEADERS")
+      else do
+        let consumed ← consumeInboundDataWindow state frame
+        let stripped ← stripPadding frame "DATA"
+        let paddingBytes := frame.payload.size - stripped.payload.size
+        let updates ← activeDataWindowUpdates frame.header.streamId frame.payload.size paddingBytes
+        let credited := replenishInboundStreamWindowBy
+          (replenishInboundConnectionWindow consumed frame.payload.size)
+          frame.header.streamId paddingBytes
+        let buffered := appendStreamFrameToState credited stripped
+        let buffered := if FrameFlag.has stripped.header.flags FrameFlag.endStream then
+            removeInboundStreamState buffered frame.header.streamId
+          else
+            buffered
+        pure (buffered, { emitted := updates })
 
 /-- DATA for a unary request: the body is buffered on the stream and both
 windows are credited immediately, since the whole request is dispatched at
@@ -4498,6 +5221,37 @@ namespace TestSupport
 
 end TestSupport
 
+private def processActiveTunnelData (state : State) (frame : Frame)
+    (active : ActiveTunnel) : Except Status (State × SharedFrameResult) := do
+  if active.recvClosed then
+    let (state, result) ← resetClosedStreamData state frame
+    pure ({ state with
+      activeTunnels := removeActiveTunnel state.activeTunnels frame.header.streamId },
+      { result with cancelTunnels := #[active] })
+  else
+    let consumed ← consumeInboundDataWindow state frame
+    let stripped ← stripPadding frame "DATA"
+    let normalized ← Transport.normalizeDataFrame stripped
+    let paddingBytes := frame.payload.size - normalized.payload.size
+    let updates ← activeDataWindowUpdates frame.header.streamId frame.payload.size paddingBytes
+    let credited := replenishInboundStreamWindowBy
+      (replenishInboundConnectionWindow consumed frame.payload.size)
+      frame.header.streamId paddingBytes
+    let recvClosed := FrameFlag.has normalized.header.flags FrameFlag.endStream
+    let active := { active with recvClosed := recvClosed }
+    let state := { credited with
+      activeTunnels := replaceActiveTunnel credited.activeTunnels active }
+    let state := if recvClosed then removeInboundStreamState state frame.header.streamId else state
+    pure (state, {
+      emitted := updates,
+      tunnelFeeds := #[{
+        inbound := active.inbound,
+        item := if normalized.payload.isEmpty then none
+          else some (normalized.payload, normalized.payload.size),
+        close := recvClosed
+      }]
+    })
+
 def processDataShared (registry : Registry) (state : State) (frame : Frame) :
     Except Status (State × SharedFrameResult) :=
   match requireClientStreamId frame.header.streamId "DATA" with
@@ -4508,11 +5262,21 @@ def processDataShared (registry : Registry) (state : State) (frame : Frame) :
       | .error status => .error status
       | .ok (drained, updates) => .ok (drained, { emitted := updates })
     else
-      match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
-      | some active => processActiveRequestData registry state frame active
+      match findStream? state.streams frame.header.streamId with
+      | some _ =>
+        match findActiveExtendedConnectDecision?
+            state.activeExtendedConnectDecisions frame.header.streamId with
+        | some _ => processPendingExtendedConnectData state frame
+        | none =>
+          match findActiveTunnel? state.activeTunnels frame.header.streamId with
+          | some active => processActiveTunnelData state frame active
+          | none =>
+            match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
+            | some active => processActiveRequestData registry state frame active
+            | none => processUnaryRequestData state frame
       | none =>
-        match findStream? state.streams frame.header.streamId with
-        | some _ => processUnaryRequestData state frame
+        match findActiveRequestStream? state.activeRequestStreams frame.header.streamId with
+        | some active => processActiveRequestData registry state frame active
         | none =>
             -- No buffered stream, no incremental feed, not draining: either the
             -- id has already been opened and closed (RFC 9113 §6.1 stream error
@@ -4559,7 +5323,8 @@ def processNonHeaderFrameShared (registry : Registry) (state : State) (frame : F
       throw (Status.internal "unreachable HTTP/2 header dispatch")
 
 private def processFrameShared (registry : Registry) (state : State) (frame : Frame)
-    (receivedAt : Option Nat := none) :
+    (receivedAt : Option Nat := none)
+    (extendedConnect? : Option ExtendedConnect.Handler := none) :
     IO (Except Status (State × SharedFrameResult)) := do
   let validated : Except Status Unit := do
     requireInboundFrameSize state frame
@@ -4578,26 +5343,32 @@ private def processFrameShared (registry : Registry) (state : State) (frame : Fr
               | .error status => pure (.error status)
               | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
             else
-              processHeadersShared registry state frame receivedAt
+              processHeadersShared registry state frame receivedAt extendedConnect?
     | .continuation =>
         if containsStreamId state.resetInboundStreams frame.header.streamId then
           match processResetContinuation state frame with
           | .error status => pure (.error status)
           | .ok (state, emitted) => pure (.ok (state, { emitted := emitted }))
         else
-          processContinuationShared registry state frame receivedAt
+          processContinuationShared registry state frame receivedAt extendedConnect?
     | _ => pure (processNonHeaderFrameShared registry state frame)
 
 private def finishSharedFrameResult (registry : Registry) (stateMutex : Std.Mutex State)
-    (emit : Array Frame -> IO Unit) (result : SharedFrameResult) :
+    (emit : Array Frame -> IO Unit)
+    (emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit))
+    (result : SharedFrameResult) :
     Std.Async.Async (Except Status Unit) := do
   -- Select and signal a stream error first, then publish its wire frame.  User
   -- cleanup cannot suppress the peer-visible RST_STREAM; cleanup is still
   -- joined even when emission reports a transport error.
   signalAuthorizations result.cancelAuthorizations
   signalDispatches result.cancelDispatches
+  signalExtendedConnectDecisions result.cancelExtendedConnectDecisions
+  signalTunnels result.cancelTunnels
   let emitResult ← emitFrameBatch emit result.emitted
   finishDispatchCancellationOwned result.cancelDispatches
+  finishExtendedConnectDecisionCancellationOwned result.cancelExtendedConnectDecisions
+  finishTunnelCancellationOwned result.cancelTunnels
   -- Authorization retains a single original owner from prepare through
   -- retire. A concurrent reset only signals that owner: stealing its join
   -- handle here could let the original owner retire the active marker while
@@ -4605,6 +5376,16 @@ private def finishSharedFrameResult (registry : Registry) (stateMutex : Std.Mute
   match emitResult with
   | .error status => pure (.error status)
   | .ok () =>
+      for feed in result.tunnelFeeds do
+        match ← feedTunnel feed with
+        | .ok () => pure ()
+        | .error status => return .error status
+      match result.pendingExtendedConnect with
+      | some pending =>
+          match ← spawnPendingExtendedConnect stateMutex emit emitAcknowledged pending with
+          | .error status => return .error status
+          | .ok () => pure ()
+      | none => pure ()
       for feed in result.requestFeeds do
         match ← feedRequestStream feed with
         | .ok () => pure ()
@@ -4622,7 +5403,10 @@ private def finishSharedFrameResult (registry : Registry) (stateMutex : Std.Mute
           pure (.ok ())
 
 def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State) (frame : Frame)
-    (emit : Array Frame -> IO Unit) (receivedAt : Option Nat := none) :
+    (emit : Array Frame -> IO Unit) (receivedAt : Option Nat := none)
+    (extendedConnect? : Option ExtendedConnect.Handler := none)
+    (emitTunnelAcknowledged? :
+      Option (Array Frame → Std.Async.Async (Except Status Unit)) := none) :
     Std.Async.Async (Except Status Unit) := do
   match ← stateMutex.atomically (do
     let state ← get
@@ -4639,7 +5423,7 @@ def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
           match containStreamError? state frame with
           | .error status => pure (.error status)
           | .ok (some result) => pure (.ok result)
-          | .ok none => processFrameShared registry state frame receivedAt
+          | .ok none => processFrameShared registry state frame receivedAt extendedConnect?
     match step with
     | .error status => pure (Except.error status)
     | .ok (state, result) =>
@@ -4669,9 +5453,18 @@ def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
             pure (scheduler, some deadline)
           else
             none
-        pure (Except.ok (result, deadlineUpdate?))) with
+        pure (Except.ok (result, deadlineUpdate?, state.activeTunnels))) with
   | .error status => pure (Except.error status)
-  | .ok (result, deadlineUpdate?) =>
+  | .ok (result, deadlineUpdate?, activeTunnels) =>
+      let emitAcknowledged : Array Frame → Std.Async.Async (Except Status Unit) :=
+        match emitTunnelAcknowledged? with
+        | some emitAcknowledged => emitAcknowledged
+        | none => fun frames => do pure (← emitFrameBatch emit frames)
+      -- A tunnel sender can be waiting on either connection or stream credit,
+      -- or behind queued HTTP/2 output. Any inbound transition may release one
+      -- of those conditions, so wake it after the new state is visible.
+      for tunnel in activeTunnels do
+        tunnel.wakeup.notify
       -- Publish timer ownership before emission, stream feeding, or user IO.
       -- Untimed calls and unchanged body DATA avoid the scheduler mutex.
       match deadlineUpdate? with
@@ -4680,7 +5473,7 @@ def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
           reconcilePendingBodyDeadline scheduler stateMutex emit
             frame.header.streamId deadline?
       match result.pendingAuthorization with
-      | none => finishSharedFrameResult registry stateMutex emit result
+      | none => finishSharedFrameResult registry stateMutex emit emitAcknowledged result
       | some authorization =>
           -- The deadline winner is committed and enqueued before joining a
           -- cancelled callback.  Thus cooperative cancellation latency—or an
@@ -4694,7 +5487,7 @@ def processFrameSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
                   -- to wait for its body. Install that owner before any output
                   -- or handler publication can block this frame task.
                   reconcileCurrentPendingBodyDeadline stateMutex emit authorization.streamId
-                  finishSharedFrameResult registry stateMutex emit resolved
+                  finishSharedFrameResult registry stateMutex emit emitAcknowledged resolved
             catch error =>
               cancelDeadlineChildRef authorization.active.deadlineChild
               pure (.error (Status.ofIOError error))
@@ -4733,10 +5526,14 @@ private def processFramesWith (registry : Registry) (frames : Array Frame) (i : 
 
 private def processFramesSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
     (frames : Array Frame) (i : Nat) (emit : Array Frame -> IO Unit)
-    (receivedAt : Option Nat := none) :
+    (receivedAt : Option Nat := none)
+    (extendedConnect? : Option ExtendedConnect.Handler := none)
+    (emitTunnelAcknowledged? :
+      Option (Array Frame → Std.Async.Async (Except Status Unit)) := none) :
     Std.Async.Async (Except Status Unit) := do
   for j in [i:frames.size] do
-    match ← processFrameSharedWithOwned registry stateMutex frames[j]! emit receivedAt with
+    match ← processFrameSharedWithOwned registry stateMutex frames[j]! emit receivedAt
+        extendedConnect? emitTunnelAcknowledged? with
     | .error status => return .error status
     | .ok () => pure ()
   pure (.ok ())
@@ -4771,7 +5568,11 @@ def processBytesWith (registry : Registry) (state : State) (chunk : ByteArray)
 
 def processBytesSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State)
     (chunk : ByteArray)
-    (emit : Array Frame -> IO Unit) : Std.Async.Async (Except Status Unit) := do
+    (emit : Array Frame -> IO Unit)
+    (extendedConnect? : Option ExtendedConnect.Handler := none)
+    (emitTunnelAcknowledged? :
+      Option (Array Frame → Std.Async.Async (Except Status Unit)) := none) :
+    Std.Async.Async (Except Status Unit) := do
   -- All complete frames decoded from this receive chunk were already present
   -- at this instant.  Carry it through sequential frame processing so a slow
   -- earlier stream cannot extend a later stream's grpc-timeout.
@@ -4791,7 +5592,10 @@ def processBytesSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex St
               set { state with decoder := { buffered := decoded.buffered } }
               pure (Except.ok decoded.frames)) with
   | .error status => pure (Except.error status)
-  | .ok frames => processFramesSharedWith registry stateMutex frames 0 emit (some receivedAt)
+  | .ok frames =>
+      processFramesSharedWith registry stateMutex frames 0 emit (some receivedAt)
+        (extendedConnect? := extendedConnect?)
+        (emitTunnelAcknowledged? := emitTunnelAcknowledged?)
 
 /-- Synchronous compatibility wrapper around the connection-owner variant. -/
 def processBytesSharedWith (registry : Registry) (stateMutex : Std.Mutex State) (chunk : ByteArray)
@@ -4818,13 +5622,21 @@ def processBytesEncodedWith (registry : Registry) (state : State) (chunk : ByteA
     | .error status => throw (IO.userError status.messageD)
 
 def processBytesEncodedSharedWithOwned (registry : Registry) (stateMutex : Std.Mutex State)
-    (chunk : ByteArray) (emit : ByteArray -> IO Unit) :
+    (chunk : ByteArray) (emit : ByteArray -> IO Unit)
+    (extendedConnect? : Option ExtendedConnect.Handler := none)
+    (emitTunnelAcknowledged? :
+      Option (ByteArray → Std.Async.Async (Except Status Unit)) := none) :
     Std.Async.Async (Except Status Unit) := do
-  processBytesSharedWithOwned registry stateMutex chunk fun frames => do
+  let emitFramesAcknowledged? := emitTunnelAcknowledged?.map fun emitAcknowledged frames => do
+    match encodeFrames frames with
+    | .error status => pure (.error status)
+    | .ok bytes => if bytes.isEmpty then pure (.ok ()) else emitAcknowledged bytes
+  processBytesSharedWithOwned registry stateMutex chunk (fun frames => do
     match encodeFrames frames with
     | .ok bytes =>
         if bytes.isEmpty then pure () else emit bytes
-    | .error status => throw (IO.userError status.messageD)
+    | .error status => throw (IO.userError status.messageD)) extendedConnect?
+      emitFramesAcknowledged?
 
 /-- Synchronous compatibility wrapper around the connection-owner variant. -/
 def processBytesEncodedSharedWith (registry : Registry) (stateMutex : Std.Mutex State)
@@ -5399,6 +6211,13 @@ private theorem applyPeerSetting_ok {state state' : State} {setting : Setting}
   next => exact applyMaxFrameSize_ok h
   next => cases h; exact ⟨rfl, rfl, rfl⟩
   next => cases h; exact ⟨rfl, rfl, rfl⟩
+  next =>
+    split at h
+    next => cases h
+    next =>
+      split at h
+      next => cases h
+      next => cases h; exact ⟨rfl, rfl, rfl⟩
   next => cases h; exact ⟨rfl, rfl, rfl⟩
 
 private theorem applyPeerSettings_ok {settings : Array Setting} {state state' : State}
@@ -6321,7 +7140,14 @@ private theorem applyPeerSetting_wellFormed {state state' : State} {setting : Se
   next => exact applyMaxFrameSize_wellFormed h heq
   next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
   next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
-  next => cases heq; exact h.ofSame (SameOutbound.refl state) (fun _ hs => hs) rfl
+  next =>
+    split at heq
+    next => cases heq
+    next =>
+      split at heq
+      next => cases heq
+      next => cases heq; exact h.ofSame (SameOutbound.refl _) (fun _ hs => hs) rfl
+  next => cases heq; exact h
 
 private theorem applyPeerSettings_wellFormed {settings : Array Setting} {state state' : State}
     (h : WellFormed state) (heq : applyPeerSettings state settings = .ok state') :
@@ -6793,6 +7619,110 @@ private theorem resetClosedStreamData_wellFormed {state : State} {frame : Frame}
             frame.header.streamId := hs
         exact (Array.mem_filter.mp hs').1
 
+private theorem processPendingExtendedConnectData_wellFormed {state : State}
+    {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
+    (heq : processPendingExtendedConnectData state frame = .ok res) :
+    WellFormed res.1 := by
+  unfold processPendingExtendedConnectData at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next => cases heq
+  next stream hfind =>
+    split at heq
+    next => cases heq
+    next hnot =>
+      have hcomplete : streamHeaderComplete stream = true := by simpa using hnot
+      split at heq
+      next => cases heq
+      next consumed hcons =>
+        split at heq
+        next => cases heq
+        next stripped hstrip =>
+          split at heq
+          next => cases heq
+          next updates hupdates =>
+            let credited := replenishInboundStreamWindowBy
+              (replenishInboundConnectionWindow consumed frame.payload.size)
+              frame.header.streamId (frame.payload.size - stripped.payload.size)
+            have hstreams : credited.streams = state.streams :=
+              (replenishInboundStreamWindowBy_fields _ _ _).1.trans
+                ((replenishInboundConnectionWindow_fields _ _).1.trans
+                  (consumeInboundDataWindow_ok hcons).1)
+            have hcredited : WellFormed credited :=
+              h.ofFields
+                (SameOutbound.trans (replenishInboundStreamWindowBy_same _ _ _)
+                  (SameOutbound.trans (replenishInboundConnectionWindow_same _ _)
+                    (consumeInboundDataWindow_same hcons)))
+                hstreams
+                ((replenishInboundStreamWindowBy_fields _ _ _).2.trans
+                  ((replenishInboundConnectionWindow_fields _ _).2.trans
+                    (consumeInboundDataWindow_ok hcons).2.2.2))
+            have hfindCredited : findStream? credited.streams frame.header.streamId =
+                some stream := by rw [hstreams]; exact hfind
+            have hbuffered : WellFormed (appendStreamFrameToState credited stripped) := by
+              refine hcredited.ofStreams (SameOutbound.refl _) rfl ?_
+              intro s hs
+              exact appendStreamFrame_wellFormed hcredited hfindCredited hcomplete
+                (stripPadding_streamId hstrip) s hs
+            cases heq
+            simp only []
+            split
+            · exact hbuffered.ofSame (removeInboundStreamState_same _ _)
+                (fun _ hs => hs) rfl
+            · exact hbuffered
+
+/-- Tunnel DATA changes only receive-side flow-control and tunnel bookkeeping;
+the buffered stream and outbound invariants remain intact. -/
+private theorem processActiveTunnelData_wellFormed {state : State} {frame : Frame}
+    {active : ActiveTunnel} {res : State × SharedFrameResult}
+    (h : WellFormed state)
+    (heq : processActiveTunnelData state frame active = .ok res) :
+    WellFormed res.1 := by
+  unfold processActiveTunnelData at heq
+  simp only [bind, Except.bind, pure, Except.pure] at heq
+  split at heq
+  next =>
+    split at heq
+    next => cases heq
+    next pair hreset =>
+      obtain ⟨resetState, resetResult⟩ := pair
+      cases heq
+      exact (resetClosedStreamData_wellFormed h hreset).ofSame
+        (SameOutbound.refl _) (fun _ hs => hs) rfl
+  next =>
+    split at heq
+    next => cases heq
+    next consumed hcons =>
+      split at heq
+      next => cases heq
+      next stripped hstrip =>
+        split at heq
+        next => cases heq
+        next normalized hnormalized =>
+          split at heq
+          next => cases heq
+          next updates hupdates =>
+            have hcredited : WellFormed
+                (replenishInboundStreamWindowBy
+                  (replenishInboundConnectionWindow consumed frame.payload.size)
+                  frame.header.streamId (frame.payload.size - normalized.payload.size)) :=
+              h.ofFields
+                (SameOutbound.trans (replenishInboundStreamWindowBy_same _ _ _)
+                  (SameOutbound.trans (replenishInboundConnectionWindow_same _ _)
+                    (consumeInboundDataWindow_same hcons)))
+                ((replenishInboundStreamWindowBy_fields _ _ _).1.trans
+                  ((replenishInboundConnectionWindow_fields _ _).1.trans
+                    (consumeInboundDataWindow_ok hcons).1))
+                ((replenishInboundStreamWindowBy_fields _ _ _).2.trans
+                  ((replenishInboundConnectionWindow_fields _ _).2.trans
+                    (consumeInboundDataWindow_ok hcons).2.2.2))
+            cases heq
+            simp only []
+            split
+            · exact hcredited.ofSame (removeInboundStreamState_same _ _)
+                (fun _ hs => hs) rfl
+            · exact hcredited.ofSame (SameOutbound.refl _) (fun _ hs => hs) rfl
+
 /-- Every pure DATA step preserves well-formedness. -/
 private theorem processDataShared_wellFormed {registry : Registry} {state : State}
     {frame : Frame} {res : State × SharedFrameResult} (h : WellFormed state)
@@ -6810,10 +7740,19 @@ private theorem processDataShared_wellFormed {registry : Registry} {state : Stat
         exact processDrainingInboundData_wellFormed h hproc
     next =>
       split at heq
-      next => exact processActiveRequestData_wellFormed h heq
       next =>
         split at heq
-        next => exact processUnaryRequestData_wellFormed h heq
+        next => exact processPendingExtendedConnectData_wellFormed h heq
+        next =>
+          split at heq
+          next => exact processActiveTunnelData_wellFormed h heq
+          next =>
+            split at heq
+            next => exact processActiveRequestData_wellFormed h heq
+            next => exact processUnaryRequestData_wellFormed h heq
+      next =>
+        split at heq
+        next => exact processActiveRequestData_wellFormed h heq
         next =>
           split at heq
           next => exact resetClosedStreamData_wellFormed h heq

@@ -232,7 +232,8 @@ private def headerBlockFramesLoop (streamId maxSize offset : Nat) (block : ByteA
         offset := stop
       return frames
 
-private def headerBlockFrames (streamId : Nat) (block : ByteArray) (endStream : Bool)
+/-- Split one encoded field section into an ordered HEADERS/CONTINUATION batch. -/
+def headerBlockFrames (streamId : Nat) (block : ByteArray) (endStream : Bool)
     (maxSize : Nat := defaultMaxFramePayloadLength) : Except Status (Array Frame) := do
   if maxSize == 0 then
     throw (Status.internal "HTTP/2 header block frame max size must be positive")

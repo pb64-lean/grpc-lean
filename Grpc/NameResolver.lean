@@ -94,6 +94,10 @@ abbrev Lookup :=
   String → UInt16 →
     IO (Except Grpc.Dns.Error (Array String))
 
+abbrev AsyncLookup :=
+  String → UInt16 →
+    Std.Async.Async (Except Grpc.Dns.Error (Array String))
+
 private def canonicalNumeric
     (value : String) : Except Error Std.Net.IPAddr :=
   match Std.Net.IPv4Addr.ofString value with
@@ -137,10 +141,30 @@ def resolveHostWith
       else
         pure (refineAddresses port raw)
 
+/-- Async injected-lookup variant of `resolveHostWith`. -/
+def resolveHostWithAsync (lookup : AsyncLookup) (host : String) (port : UInt16) :
+    Std.Async.Async (Except Error (Array Address)) := do
+  match ← lookup host port with
+  | .error error => pure (.error (.lookup error))
+  | .ok raw =>
+      if raw.size > maximumRawAddresses then
+        pure (.error (.tooManyAddresses maximumRawAddresses))
+      else
+        pure (refineAddresses port raw)
+
+/-- Resolve one host and port asynchronously through the production lookup.
+Cancellation is cooperative; the exact native DNS request is retained until
+libuv settles before a cancelled result returns. -/
+def resolveHostAsync (host : String) (port : UInt16)
+    (cancellation? : Option Std.CancellationToken := none) :
+    Std.Async.Async (Except Error (Array Address)) :=
+  resolveHostWithAsync
+    (fun host port => Grpc.Dns.getAddrInfoAsync host port cancellation?) host port
+
 /-- Resolve one host and port through the production native lookup. -/
 def resolveHost (host : String) (port : UInt16) :
     IO (Except Error (Array Address)) :=
-  resolveHostWith Grpc.Dns.getAddrInfo host port
+  Std.Async.Async.block (resolveHostAsync host port)
 
 /--
 Resolve one refined URI host and port using an injected lookup.  Typed IP
@@ -155,10 +179,25 @@ def resolveUriHostWith
   | .ipv6 address => pure (.ok #[.mk (.v6 address) port])
   | .name name => resolveHostWith lookup name.val port
 
+/-- Async injected-lookup variant of `resolveUriHostWith`. Typed literals
+remain immediate and never reach DNS. -/
+def resolveUriHostWithAsync (lookup : AsyncLookup) (host : Std.Http.URI.Host)
+    (port : UInt16) : Std.Async.Async (Except Error (Array Address)) :=
+  match host with
+  | .ipv4 address => pure (.ok #[.mk (.v4 address) port])
+  | .ipv6 address => pure (.ok #[.mk (.v6 address) port])
+  | .name name => resolveHostWithAsync lookup name.val port
+
+def resolveUriHostAsync (host : Std.Http.URI.Host) (port : UInt16)
+    (cancellation? : Option Std.CancellationToken := none) :
+    Std.Async.Async (Except Error (Array Address)) :=
+  resolveUriHostWithAsync
+    (fun host port => Grpc.Dns.getAddrInfoAsync host port cancellation?) host port
+
 /-- Resolve one refined URI host and port through the production lookup. -/
 def resolveUriHost (host : Std.Http.URI.Host) (port : UInt16) :
     IO (Except Error (Array Address)) :=
-  resolveUriHostWith Grpc.Dns.getAddrInfo host port
+  Std.Async.Async.block (resolveUriHostAsync host port)
 
 /--
 Resolve an endpoint using an injected single-operation lookup.
@@ -171,7 +210,16 @@ def resolveWith
     IO (Except Error (Array Address)) := do
   resolveUriHostWith lookup endpoint.host endpoint.effectivePort
 
+def resolveWithAsync (lookup : AsyncLookup) (endpoint : Endpoint) :
+    Std.Async.Async (Except Error (Array Address)) :=
+  resolveUriHostWithAsync lookup endpoint.host endpoint.effectivePort
+
+def resolveAsync (endpoint : Endpoint)
+    (cancellation? : Option Std.CancellationToken := none) :
+    Std.Async.Async (Except Error (Array Address)) :=
+  resolveUriHostAsync endpoint.host endpoint.effectivePort cancellation?
+
 def resolve (endpoint : Endpoint) : IO (Except Error (Array Address)) :=
-  resolveWith Grpc.Dns.getAddrInfo endpoint
+  Std.Async.Async.block (resolveAsync endpoint)
 
 end Grpc.NameResolver

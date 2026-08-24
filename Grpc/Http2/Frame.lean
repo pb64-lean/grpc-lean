@@ -1019,6 +1019,14 @@ inductive SettingId where
 
 namespace SettingId
 
+/-- RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL` (wire identifier `0x8`).
+
+This is intentionally a named value of the existing `unknown` constructor
+rather than a new constructor.  HTTP/2 setting identifiers are extensible, and
+keeping the representation preserves source compatibility for callers that
+exhaustively match the original constructors. -/
+def enableConnectProtocol : SettingId := .unknown 0x8
+
 def toNat : SettingId -> Nat
   | .headerTableSize => 1
   | .enablePush => 2
