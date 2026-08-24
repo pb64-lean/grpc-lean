@@ -663,6 +663,12 @@ lean_test(
 )
 
 lean_test(
+    name = "cancellation_parking_test",
+    srcs = ["Test/CancellationParkingTest.lean"],
+    deps = [":grpc_lean"],
+)
+
+lean_test(
     name = "streaming_test",
     srcs = ["Test/StreamingTest.lean"],
     # Loopback sockets are blocked in the darwin sandbox; run unsandboxed.

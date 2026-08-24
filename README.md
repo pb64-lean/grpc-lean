@@ -296,11 +296,14 @@ Unsupported or intentionally ignored:
   accepted but not enforced against outbound work.
 - Connection-scoped malformed framing answers GOAWAY; stream-scoped failures
   answer RST_STREAM and leave unrelated streams serving (see the table above).
-- Cancellation cleanup is owned at connection granularity. A stream reset is
-  emitted before user cleanup begins, but a `MessageStream.cancel` callback or
-  handler that never returns parks that connection owner; unrelated streams on
-  the same connection cannot progress until it returns. This is deliberate
-  exact ownership, not per-stream retirement concurrency.
+- Ordinary handlers and response streams run beneath retained per-stream tasks,
+  so slow work and managed deadline publication do not block unrelated streams.
+  Reset and teardown retirement remain owned at connection granularity: after
+  signalling cancellation and emitting any locally required RST_STREAM, the
+  connection owner takes stream-cancel callbacks and joins the exact tasks
+  before processing later frames. A callback or handler that never returns can
+  therefore park that owner. This is deliberate exact ownership, not detached
+  per-stream retirement.
 - No HTTP/1.1 → h2c upgrade; plaintext is prior-knowledge h2c only.
 - Outbound plaintext and TLS writer channels are unbounded; flow
   control bounds DATA progress, but sustained encoded control/response
