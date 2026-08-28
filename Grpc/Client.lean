@@ -517,11 +517,27 @@ private def handleProtocolEvent (maxReceiveMessageSize : Nat) (state : ConnState
   | .settingsChanged _ | .settingsAcknowledged | .pingAcknowledged _ | .priority _ =>
       pure (state, outbound)
 
+private def closeFlushTimeoutMs : Nat := 200
+
+private def waitTaskWithin (task : AsyncTask α) (timeoutMs : Nat) : Async Bool := do
+  let mut finished ← IO.hasFinished task
+  for _ in [0:timeoutMs] do
+    if finished then break
+    Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 1)
+    finished ← IO.hasFinished task
+  pure finished
+
+private def retireFinishedTask (task : AsyncTask α) : Async Unit := do
+  if ← IO.hasFinished task then
+    try discard <| Async.ofAsyncTask task catch _ => pure ()
+
+private def retireTaskWithin (task : AsyncTask α) (timeoutMs : Nat) : Async Unit := do
+  unless ← waitTaskWithin task timeoutMs do IO.cancel task
+  retireFinishedTask task
+
 private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
   try
-    Async.race
-      socket.shutdown
-      (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 200))
+    retireTaskWithin (← Async.toIO socket.shutdown) closeFlushTimeoutMs
   catch _ =>
     pure ()
 
@@ -676,15 +692,7 @@ private partial def writerLoop (connection : Connection) : Async Unit := do
           (reason := Std.CancellationReason.shutdown)
 
 private def awaitBackgroundTask (task : AsyncTask Unit) : Async Unit := do
-  let finished ← Async.race
-    (do
-      try Async.ofAsyncTask task catch _ => pure ()
-      pure true)
-    (do
-      Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 200)
-      pure false)
-  unless finished do
-    IO.cancel task
+  retireTaskWithin task closeFlushTimeoutMs
 
 private def joinBackgroundTasks (connection : Connection) : Async Unit := do
   let background ← connection.background.get
@@ -948,11 +956,10 @@ def connectTls (config : Config := {})
 
 The socket API exposes a write-side shutdown rather than an explicit handle
 close. The FIN lets a peer observe EOF; each drain and shutdown wait is bounded,
-so a non-reading peer cannot make `close` hang or park a worker. `Async.race`
-does not cancel its losing branch: when the timer wins, the native shutdown
-promise and descriptor reference can remain suspended until the OS settles it.
-A hard `uv_close` is not exposed; finalization releases the native handle after
-remaining `Connection`/promise references are gone.
+so a non-reading peer cannot make `close` hang or park a worker. Each bounded
+operation retains its exact task, cancels it when the bound expires, and consumes
+it if it has settled. A hard `uv_close` is not exposed; finalization releases the
+native handle after remaining `Connection`/promise references are gone.
 -/
 def close (connection : Connection) : Async Unit :=
   closeConnection connection
