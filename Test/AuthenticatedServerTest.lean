@@ -10,10 +10,10 @@ def expect (condition : Bool) (failure : String) : IO Unit := do
 def fail (failure : String) : IO α :=
   throw (IO.userError failure)
 
-def expectOk (result : Except Status α) (description : String) : IO α :=
+def expectOk [Repr ε] (result : Except ε α) (description : String) : IO α :=
   match result with
   | .ok value => pure value
-  | .error status => fail s!"{description}: {status.code}: {status.messageD}"
+  | .error error => fail s!"{description}: {(repr error).pretty}"
 
 def protectedMethod : MethodName := {
   service := "test.authenticated.v1.Service"
@@ -28,11 +28,11 @@ def publicMethod : MethodName := {
 def identityDecode (data : ByteArray) : Except String ByteArray := .ok data
 def identityEncode (data : ByteArray) : Except String ByteArray := .ok data
 
-def tokenMetadata (token : String) : Metadata :=
-  Metadata.empty.insert "authorization" token
+def tokenMetadata (token : String) : _root_.Http2.Headers :=
+  _root_.Http2.Headers.empty.insert "authorization" token
 
-def requestMetadata (method : MethodName) (token? : Option String := none) : Metadata :=
-  let metadata := Metadata.empty
+def requestMetadata (method : MethodName) (token? : Option String := none) : _root_.Http2.Headers :=
+  let metadata := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":authority" "127.0.0.1"
@@ -42,51 +42,6 @@ def requestMetadata (method : MethodName) (token? : Option String := none) : Met
   match token? with
   | none => metadata
   | some token => metadata.insert "authorization" token
-
-def headersFrame (state : Http2.Hpack.State) (method : MethodName)
-    (token? : Option String := none) (streamId : Nat := 1) :
-    IO (Http2.Frame × Http2.Hpack.State) := do
-  let encoded ← expectOk (Http2.Hpack.encodeHeaderBlock state (requestMetadata method token?))
-    "encode authenticated request headers"
-  pure ({
-    header := {
-      length := encoded.1.size
-      frameType := .headers
-      flags := Http2.FrameFlag.endHeaders
-      streamId
-    }
-    payload := encoded.1
-  }, encoded.2)
-
-def dataFrame (payload : ByteArray) (streamId : Nat := 1) : Http2.Frame := {
-  header := {
-    length := payload.size
-    frameType := .data
-    flags := Http2.FrameFlag.endStream
-    streamId
-  }
-  payload
-}
-
-def readyState : Http2.Connection.State := {
-  Http2.Connection.initialState with
-  prefaceReceived := true
-  clientSettingsReceived := true
-}
-
-def rejectedStatus (frames : Array Http2.Frame) : IO Status := do
-  let some frame := frames.find? fun frame =>
-      frame.header.frameType == .headers
-        && Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-    | fail "authentication rejection did not emit trailers"
-  let decoded ← expectOk (Http2.Hpack.decodeHeaderBlock {} frame.payload)
-    "decode authentication rejection"
-  expectOk (Headers.statusFromTrailers decoded.headers)
-    "decode authentication rejection status"
-
-def frameData (frames : Array Http2.Frame) : ByteArray :=
-  frames.foldl (init := ByteArray.empty) fun data frame =>
-    if frame.header.frameType == .data then data.append frame.payload else data
 
 def pureAuthenticator : RequestAuthenticator Nat := .pure fun metadata =>
   match metadata.getLast? "authorization" with
@@ -144,7 +99,7 @@ def testMethodEntryConstructionCompatibility : IO Unit := do
   }
   match explicit.requestHeaderHandlerResolver with
   | .pure resolve =>
-      match resolve Metadata.empty with
+      match resolve _root_.Http2.Headers.empty with
       | .ok _ => pure ()
       | .error status => fail s!"explicit method resolver failed: {status.messageD}"
   | _ => fail "explicit MethodEntry resolver initialization changed"
@@ -215,17 +170,17 @@ def testMethodLocalIsolation : IO Unit := do
     "public entry inherited unrelated authentication scheduling"
   let some resolve := registry.pureRequestHeaderAuthorizerFor? publicEntry
     | fail "public entry lost the registered-handler fast path"
-  let handler ← expectUnaryHandler publicEntry (resolve Metadata.empty)
+  let handler ← expectUnaryHandler publicEntry (resolve _root_.Http2.Headers.empty)
     "resolve public entry"
   let response ← expectOk (← handler {
       method := publicMethod
-      metadata := Metadata.empty
+      metadata := _root_.Http2.Headers.empty
       data := ByteArray.mk #[4]
     } |>.run) "run public handler"
   expect (response.data == ByteArray.mk #[4, 99])
     "public handler did not retain effective-handler interception"
 
-def testEffectfulAuthenticationAndDeadline : IO Unit := do
+def testEffectfulAuthentication : IO Unit := do
   let calls ← IO.mkRef 0
   let authenticator : RequestAuthenticator Nat := .effectful fun _ => do
     calls.modify (fun count => count + 1)
@@ -241,26 +196,18 @@ def testEffectfulAuthenticationAndDeadline : IO Unit := do
     "effectful method exposed a pure header resolver"
 
   let decision ← expectOk
-    (← registry.authorizeRequestHeaders entry Metadata.empty |>.run)
+    (← registry.authorizeRequestHeaders entry _root_.Http2.Headers.empty |>.run)
     "run effectful method authentication"
   let handler ← expectUnaryHandler entry decision "resolve effectful authentication"
   let response ← expectOk (← handler {
       method := protectedMethod
-      metadata := Metadata.empty
+      metadata := _root_.Http2.Headers.empty
       data := ByteArray.mk #[5]
     } |>.run) "run effectfully authenticated handler"
   expect (response.data == ByteArray.mk #[5, 31])
     "effectfully authenticated principal was not delivered"
   expect ((← calls.get) == 1)
     "effectful authenticator did not run exactly once"
-
-  let expired ← Http2.Transport.TestSupport.authorizeRegistryEntryUntilWithClock
-    (pure 0) registry entry Metadata.empty (some 0)
-  match expired with
-  | .error status =>
-      expect (status.code == .deadlineExceeded)
-        "expired effectful authentication returned the wrong status"
-  | .ok _ => fail "expired effectful authentication was allowed"
 
 def testCheckedRegistrationRejectsShadowing : IO Unit := do
   let base := Registry.empty.registerUnary protectedMethod fun request =>
@@ -279,7 +226,7 @@ def testCheckedRegistrationRejectsShadowing : IO Unit := do
     | fail "original handler disappeared after duplicate rejection"
   let response ← expectOk (← original {
       method := protectedMethod
-      metadata := Metadata.empty
+      metadata := _root_.Http2.Headers.empty
       data := ByteArray.mk #[1]
     } |>.run) "run original handler after duplicate rejection"
   expect (response.data == ByteArray.mk #[1, 88])
@@ -303,131 +250,6 @@ def testCheckedRegistrationRejectsShadowing : IO Unit := do
   expect (preflighted.entries.isEmpty)
     "successful registration preflight mutated the registry"
 
-def testPureFrameRejectionBeforeData : IO Unit := do
-  let handlerCalls ← IO.mkRef 0
-  let registry := Registry.empty.registerAuthenticatedUnaryCodec protectedMethod pureAuthenticator
-    identityDecode identityEncode (fun _ input => do
-      handlerCalls.modify (fun calls => calls + 1)
-      pure input)
-  let headers ← headersFrame {} protectedMethod none
-  let (state, emitted) ← expectOk
-    (← Http2.Connection.processFrame registry readyState headers.1)
-    "process method-local pure authentication rejection"
-  expect (state.ignoredInboundStreams.contains 1)
-    "method-local pure rejection did not enter drain-only state at END_HEADERS"
-  expect ((← handlerCalls.get) == 0)
-    "method-local pure rejection entered the handler before DATA"
-  let status ← rejectedStatus emitted
-  expect (status.code == .unauthenticated)
-    "method-local pure rejection emitted the wrong status"
-  let malformed := dataFrame (ByteArray.mk #[0xff, 0x00, 0x01])
-  let (_state, bodyFrames) ← expectOk
-    (← Http2.Connection.processFrame registry state malformed)
-    "drain rejected method-local request body"
-  expect ((← handlerCalls.get) == 0)
-    "rejected method-local request DATA reached the handler"
-  expect (bodyFrames.all fun frame => frame.header.frameType == .windowUpdate)
-    "rejected request body emitted a second application response"
-
-def testFramePrincipalExactlyOnceAndPublicIsolation : IO Unit := do
-  let authenticatorCalls ← IO.mkRef 0
-  let protectedHandlerCalls ← IO.mkRef 0
-  let publicHandlerCalls ← IO.mkRef 0
-  let authenticator : RequestAuthenticator Nat := .effectful fun metadata => do
-    authenticatorCalls.modify (fun calls => calls + 1)
-    if metadata.getLast? "authorization" == some "Bearer good" then
-      pure 41
-    else
-      throw (Status.error .unauthenticated "invalid bearer token")
-  let registry := Registry.empty
-    |>.registerAuthenticatedUnaryCodec protectedMethod authenticator
-      identityDecode identityEncode (fun principal input => do
-        protectedHandlerCalls.modify (fun calls => calls + 1)
-        pure (input.push (UInt8.ofNat principal.value)))
-    |>.registerUnary publicMethod (fun request => do
-      publicHandlerCalls.modify (fun calls => calls + 1)
-      pure { data := request.data.push 7, status := Status.ok })
-
-  let protectedHeaders ← headersFrame {} protectedMethod (some "Bearer good") 1
-  let (state, headerFrames) ← expectOk
-    (← Http2.Connection.processFrame registry readyState protectedHeaders.1)
-    "authenticate protected method headers"
-  expect headerFrames.isEmpty "accepted protected headers emitted an early response"
-  expect ((← authenticatorCalls.get) == 1)
-    "method-local authenticator did not run exactly once at END_HEADERS"
-  expect ((← protectedHandlerCalls.get) == 0)
-    "protected handler ran before request DATA"
-  let protectedBody ← expectOk
-    (Message.encode { data := ByteArray.mk #[1] }) "encode protected request"
-  let (state, protectedFrames) ← expectOk
-    (← Http2.Connection.processFrame registry state (dataFrame protectedBody 1))
-    "dispatch protected authenticated request"
-  expect ((← authenticatorCalls.get) == 1)
-    "protected dispatch repeated method-local authentication"
-  expect ((← protectedHandlerCalls.get) == 1)
-    "protected handler did not run exactly once"
-  let protectedMessages ← expectOk (Message.decodeAll (frameData protectedFrames))
-    "decode protected response"
-  expect (protectedMessages.size == 1
-      && protectedMessages[0]!.data == ByteArray.mk #[1, 41])
-    "accepted handler did not receive the authenticated principal"
-
-  let publicHeaders ← headersFrame protectedHeaders.2 publicMethod none 3
-  let (state, publicHeaderFrames) ← expectOk
-    (← Http2.Connection.processFrame registry state publicHeaders.1)
-    "process public method headers beside protected method"
-  expect publicHeaderFrames.isEmpty "public headers emitted an early response"
-  expect ((← authenticatorCalls.get) == 1)
-    "public method invoked an unrelated method-local authenticator"
-  let publicBody ← expectOk
-    (Message.encode { data := ByteArray.mk #[2] }) "encode public request"
-  let (_state, publicFrames) ← expectOk
-    (← Http2.Connection.processFrame registry state (dataFrame publicBody 3))
-    "dispatch public request"
-  expect ((← authenticatorCalls.get) == 1)
-    "public dispatch inherited protected authentication"
-  expect ((← publicHandlerCalls.get) == 1)
-    "public method did not dispatch exactly once"
-  let publicMessages ← expectOk (Message.decodeAll (frameData publicFrames))
-    "decode public response"
-  expect (publicMessages.size == 1
-      && publicMessages[0]!.data == ByteArray.mk #[2, 7])
-    "public method response was changed by protected authentication"
-
-def serverStreamingMethod : MethodName := {
-  service := "test.authenticated.v1.Service"
-  method := "ProtectedStream"
-}
-
-def testAuthenticatedServerStreamingFrames : IO Unit := do
-  let handlerCalls ← IO.mkRef 0
-  let registry := Registry.empty.registerAuthenticatedServerStreamingStreamCodec
-    serverStreamingMethod pureAuthenticator identityDecode identityEncode
-    (fun principal input => do
-      handlerCalls.modify (fun calls => calls + 1)
-      MessageStream.ofArray #[
-        input.push (UInt8.ofNat principal.value),
-        ByteArray.mk #[9]
-      ])
-  let headers ← headersFrame {} serverStreamingMethod (some "Bearer good")
-  let (state, headerFrames) ← expectOk
-    (← Http2.Connection.processFrame registry readyState headers.1)
-    "authenticate server-streaming headers"
-  expect headerFrames.isEmpty "accepted server-streaming headers emitted early output"
-  let body ← expectOk (Message.encode { data := ByteArray.mk #[3] })
-    "encode server-streaming request"
-  let (_state, responseFrames) ← expectOk
-    (← Http2.Connection.processFrame registry state (dataFrame body))
-    "dispatch authenticated server-streaming request"
-  expect ((← handlerCalls.get) == 1)
-    "authenticated server-streaming handler did not run exactly once"
-  let messages ← expectOk (Message.decodeAll (frameData responseFrames))
-    "decode authenticated server-streaming response"
-  expect (messages.size == 2
-      && messages[0]!.data == ByteArray.mk #[3, 23]
-      && messages[1]!.data == ByteArray.mk #[9])
-    "server-streaming handler lost its authenticated principal or stream shape"
-
 def testDirectDispatchAuthenticatedFallbackIsClosed : IO Unit := do
   let registry := Registry.empty.registerAuthenticatedUnaryCodec
     protectedMethod pureAuthenticator identityDecode identityEncode
@@ -448,10 +270,7 @@ def main : IO Unit := do
   Test.AuthenticatedServer.testMethodEntryConstructionCompatibility
   Test.AuthenticatedServer.testPureAuthenticationAndComposition
   Test.AuthenticatedServer.testMethodLocalIsolation
-  Test.AuthenticatedServer.testEffectfulAuthenticationAndDeadline
+  Test.AuthenticatedServer.testEffectfulAuthentication
   Test.AuthenticatedServer.testCheckedRegistrationRejectsShadowing
-  Test.AuthenticatedServer.testPureFrameRejectionBeforeData
-  Test.AuthenticatedServer.testFramePrincipalExactlyOnceAndPublicIsolation
-  Test.AuthenticatedServer.testAuthenticatedServerStreamingFrames
   Test.AuthenticatedServer.testDirectDispatchAuthenticatedFallbackIsClosed
   IO.println "gRPC authenticated server registration tests passed"

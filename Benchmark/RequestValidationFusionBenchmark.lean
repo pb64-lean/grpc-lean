@@ -4,7 +4,7 @@ import Grpc
 # Request validation/classification fusion benchmark
 
 The reference wrapper is the exact retained GL-26 production sequence:
-two-pass `Metadata.validate`, followed by its direct request classifier.  The
+two-pass `Grpc.Metadata.validate`, followed by its direct request classifier.  The
 candidate keeps the unchanged pseudo-header pass and fuses ordinary
 name/value validation with classification in a second direct scan.  An early
 classifier result is retained while later metadata is still validated, so
@@ -35,7 +35,7 @@ namespace Grpc.RequestValidationFusionBenchmarkHarness
 
 private abbrev Result := Headers.RequestHeaderPreflightResult
 private abbrev Outcome := Except Status Result
-private abbrev Classifier := Metadata → Outcome
+private abbrev Classifier := _root_.Http2.Headers → Outcome
 
 private inductive Mode where
   | separate
@@ -43,14 +43,14 @@ private inductive Mode where
 
 /-- Exact separate validation and direct-classification sequence retained from
 GL-26. -/
-@[noinline] private def classifySeparate (metadata : Metadata) : Outcome :=
-  match Metadata.validate metadata with
+@[noinline] private def classifySeparate (metadata : _root_.Http2.Headers) : Outcome :=
+  match Grpc.Metadata.validate metadata with
   | .error status => .ok (.reject status)
   | .ok () =>
       .ok (Headers.TestSupport.requestHeaderPreflightCandidateForBenchmark metadata)
 
 /-- Executable pseudo-pass plus fused validation/classification scan. -/
-@[noinline] private def classifyFused (metadata : Metadata) : Outcome :=
+@[noinline] private def classifyFused (metadata : _root_.Http2.Headers) : Outcome :=
   .ok (Headers.TestSupport.validateRequestHeaderPreflightCandidateForBenchmark
     metadata)
 
@@ -73,15 +73,15 @@ private structure ClassifierBox where
 
 private structure Fixture where
   label : String
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   expected : Result
   expectedHeaders : Nat
 
-private def header (name value : String) : Header :=
-  Header.of name value
+private def header (name value : String) : _root_.Http2.Header :=
+  _root_.Http2.Header.of name value
 
 private def requestPrefix (path : String) (method : String := "POST")
-    (scheme : String := "https") (authority : String := "benchmark.local") : Metadata :=
+    (scheme : String := "https") (authority : String := "benchmark.local") : _root_.Http2.Headers :=
   #[
     header ":method" method,
     header ":scheme" scheme,
@@ -89,7 +89,7 @@ private def requestPrefix (path : String) (method : String := "POST")
     header ":authority" authority
   ]
 
-private def fillerHeaders (count : Nat) : Metadata :=
+private def fillerHeaders (count : Nat) : _root_.Http2.Headers :=
   (Array.range count).map fun index =>
     header s!"x-benchmark-{index}" s!"value-{index}-0123456789abcdef"
 
@@ -181,7 +181,7 @@ private def makeFixtures : Array Fixture :=
       header "content-type" "application/grpc",
       header "te" "trailers"
     ]
-  let forbiddenStatus : Metadata := #[
+  let forbiddenStatus : _root_.Http2.Headers := #[
     header ":method" "POST",
     header ":scheme" "https",
     header ":status" "200",
@@ -241,7 +241,7 @@ private def makeFixtures : Array Fixture :=
     header "x-payload-bin" "AQIDBA",
     header "x-control" "binary"
   ]
-  let latePseudoAfterRegular : Metadata := #[
+  let latePseudoAfterRegular : _root_.Http2.Headers := #[
     header ":method" "POST",
     header ":scheme" "https",
     header ":path" "/benchmark.Service/LatePseudo",
@@ -250,7 +250,7 @@ private def makeFixtures : Array Fixture :=
     header "x-control" "regular",
     header ":authority" "benchmark.local"
   ]
-  let lateDuplicatePseudo : Metadata := #[
+  let lateDuplicatePseudo : _root_.Http2.Headers := #[
     header ":method" "POST",
     header ":scheme" "https",
     header ":path" "/benchmark.Service/DuplicatePseudo",
@@ -548,7 +548,7 @@ private def validateFixtures (fixtures : Array Fixture) : IO Nat := do
 
 /-- One common indirect-call recurrence for both selected implementations. -/
 @[noinline] private def runRepeated (classify : @& Classifier)
-    (metadata : @& Metadata) (iterations : Nat) : UInt64 := Id.run do
+    (metadata : @& _root_.Http2.Headers) (iterations : Nat) : UInt64 := Id.run do
   let mut digest : UInt64 := 0
   for _ in [0:iterations] do
     digest := digest + outcomeDigest (classify metadata)

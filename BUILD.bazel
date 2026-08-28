@@ -108,50 +108,42 @@ lean_test(
 )
 
 lean_library(
-    name = "grpc_cancellation_token",
-    srcs = ["Grpc/CancellationToken.lean"],
-)
-
-lean_library(
     name = "grpc_lean",
     srcs = [
         "Grpc.lean",
-        "Grpc/Bytes.lean",
         "Grpc/CallCredentials.lean",
         "Grpc/Cancellation.lean",
         "Grpc/ChannelInitialization.lean",
         "Grpc/ChannelLease.lean",
         "Grpc/ChannelOwner.lean",
         "Grpc/Client.lean",
-        "Grpc/Dns.lean",
         "Grpc/Endpoint.lean",
         "Grpc/Framing.lean",
         "Grpc/Http2.lean",
         "Grpc/Http2/Connection.lean",
-        "Grpc/Http2/ExtendedConnect.lean",
-        "Grpc/Http2/Frame.lean",
         "Grpc/Http2/Grpc.lean",
-        "Grpc/Http2/Hpack.lean",
         "Grpc/Http2/Server.lean",
         "Grpc/ManagedChannel.lean",
         "Grpc/ManagedChannel/Config.lean",
         "Grpc/Metadata.lean",
         "Grpc/NameResolver.lean",
-        "Grpc/Posix.lean",
         "Grpc/Protocol.lean",
         "Grpc/Server.lean",
         "Grpc/Services/Health.lean",
         "Grpc/Services/Reflection.lean",
         "Grpc/Status.lean",
-        "Grpc/TrustAnchors.lean",
         "Grpc/UnaryCall.lean",
     ],
     deps = [
         "//Zlib:zlib",
-        "//native:posix_ffi",
-        ":grpc_cancellation_token",
         ":grpc_reflection_descriptor",
         ":grpc_tls",
+        "@http2_lean//:cancellation_token",
+        "@http2_lean//:http2_client",
+        "@http2_lean//:http2_core",
+        "@http2_lean//:name_resolver",
+        "@http2_lean//:tls_session",
+        "@http2_lean//:trust_anchors",
         "@grpc_lean_protobuf//:protobuf",
         "@tls13_lean//TLS13:tls13",
     ],
@@ -159,12 +151,9 @@ lean_library(
 
 lean_library(
     name = "grpc_tls",
-    srcs = [
-        "Grpc/Tls/Session.lean",
-        "Grpc/Tls/Rest.lean",
-    ],
+    srcs = ["Grpc/Tls/Rest.lean"],
     deps = [
-        ":grpc_cancellation_token",
+        "@http2_lean//:tls_session",
         "@tls13_lean//Tls:tls",
     ],
 )
@@ -172,11 +161,8 @@ lean_library(
 # Compile-time audit of everything this repository proves and of where its
 # trusted C boundary sits. The principal theorems must exist, be theorems, and
 # close over no axiom beyond the standard three; nothing in `Grpc.*` or `Zlib.*`
-# may reach `sorryAx`; and `@[extern]` may appear only in `Zlib.Gzip` and
-# `Grpc.Posix`, which is the mechanical form of the README's claim that the
-# zlib shim and the POSIX descriptor shim (whose extern ABI is additionally
-# compile-checked by //native:posix_extern_abi_compile) are the only C this
-# repository adds to its trusted computing base.
+# may reach `sorryAx`; and the zlib adapter is the only C boundary implemented
+# by this repository.
 #
 # `allowed_axioms` is deliberately the bare standard three. No proof here uses
 # `bv_decide`, so no generated LRAT-certificate axiom
@@ -202,6 +188,7 @@ lean_assurance_test(
     unaudited_module_prefixes = [
         "Binary",
         "HaclStar",
+        "Http2",
         "Protobuf",
         "TLS13",
         "Tls",
@@ -212,44 +199,11 @@ lean_assurance_test(
         "Grpc.Registry.empty_wellFormed",
         "Grpc.Registry.registerChecked_wellFormed",
         "Grpc.Registry.wellFormed_entry_unique",
-        # Authorization before body: a stream rejected at HEADERS feeds no body
-        # to a handler and dispatches none, over any trace of non-header frames.
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_inert",
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_tables",
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_frameTrace_no_dispatch",
-        "Grpc.Http2.Connection.processDataShared_inert_reset",
-        # Connection.WellFormed: holds initially and is preserved by every pure
-        # frame transition.
-        "Grpc.Http2.Connection.initialState_wellFormed",
-        "Grpc.Http2.Connection.prepareHeadersShared_wellFormed",
-        "Grpc.Http2.Connection.appendContinuationFrame_wellFormed",
-        "Grpc.Http2.Connection.processNonHeaderFrameShared_wellFormed",
-        "Grpc.Http2.Connection.prepareHeadersShared_no_reopen",
-        "Grpc.Http2.Connection.prepareHeadersShared_concurrency",
-        # Flow control: conservation, and the deadlock-freedom argument for
-        # credit-on-consume.
-        "Grpc.Http2.Connection.consumeInboundDataWindow_conserves",
-        "Grpc.Http2.Connection.resetStreamFlowControl_scoped",
-        "Grpc.Http2.Connection.processUnaryRequestData_windows",
-        "Grpc.Http2.Connection.processActiveRequestData_windows",
-        "Grpc.Http2.Connection.decodeActiveRequestData_conserves",
-        "Grpc.Http2.Connection.takeRequestStreamCredit_conserves",
-        "Grpc.Http2.Connection.flushOutbound_conserves",
-        "Grpc.Http2.Connection.queueOutbound_conserves",
-        "Grpc.Http2.Connection.queueOutbound_wellFormed",
+        # The configured stream receive window admits one maximum-size gRPC
+        # message and its wire prefix before application consumption grants
+        # more stream credit.
         "Grpc.Http2.Connection.defaultStreamWindow_admits_max_message",
-        "Grpc.Http2.Connection.inboundWindow_pos_of_incomplete",
-        # Codec laws, every one the README names.
-        "Grpc.Http2.Hpack.decodeHuffman_encodeHuffman",
-        "Grpc.Http2.Hpack.decodeString_encodeString",
-        "Grpc.Http2.Hpack.decodeInteger_encodeInteger",
-        "Grpc.Http2.Hpack.huffmanPrefixFree",
-        "Grpc.Http2.Hpack.dynamicSize_resize_le",
-        "Grpc.Http2.Hpack.dynamicSize_insert_le",
-        "Grpc.Http2.Hpack.dynamicSize_resizeChecked_le",
-        "Grpc.Http2.Hpack.dynamicSize_setMaxAllowedSize_le",
-        "Grpc.Http2.Frame.decodeAll_encode_append",
-        "Grpc.Http2.Frame.decodeHeader_encodeHeader_append",
+        # gRPC codec laws.
         "Grpc.Message.decodeAll_encode_append",
         "Grpc.Message.decodeAllWithLimit_size_le",
         "Grpc.Percent.decode_encode",
@@ -261,9 +215,6 @@ lean_assurance_test(
         # The generated-code gzip accept-encoding parser is extensionally the
         # former split/trim/list parser for every input string.
         "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip",
-        # Successful unary response frame assembly preserves the former
-        # splitter/append encoder for every HPACK state, response, and limit.
-        "Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate_eq_encodeUnaryResponseFrames",
         # Channel-lease kernel: unique bounded leases, draining stops
         # admission, close requires drained, and phase-preservation equations.
         "Grpc.ChannelLease.State.invariant",
@@ -325,37 +276,7 @@ lean_assurance_test(
         "Grpc.Registry.empty_wellFormed": "Grpc.Registry.empty.WellFormed",
         "Grpc.Registry.registerChecked_wellFormed": "∀ {registry registry' : Grpc.Registry} {entry : Grpc.MethodEntry} (hwf : registry.WellFormed) (h : registry.registerChecked entry = Except.ok registry'), registry'.WellFormed",
         "Grpc.Registry.wellFormed_entry_unique": "∀ {registry : Grpc.Registry} {e₁ e₂ : Grpc.MethodEntry} (hwf : registry.WellFormed) (h₁ : e₁ ∈ registry.entries) (h₂ : e₂ ∈ registry.entries) (hname : e₁.name = e₂.name), e₁ = e₂",
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_inert": "∀ (state : Grpc.Http2.Connection.State) (streamId : Nat) (inboundHpack outboundHpack : Grpc.Http2.Hpack.State) (endStream : Bool) (hclaimed : streamId ≤ state.lastClientStreamId) (hactive : ∀ (active : Grpc.Http2.Connection.ActiveRequestStream), active ∈ state.activeRequestStreams → active.streamId ≠ streamId), (Grpc.Http2.Connection.rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream).StreamInert streamId",
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_tables": "∀ (state : Grpc.Http2.Connection.State) (streamId : Nat) (inboundHpack outboundHpack : Grpc.Http2.Hpack.State) (endStream : Bool), let rejected := Grpc.Http2.Connection.rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream; rejected.hpack = inboundHpack ∧ rejected.outboundHpack = outboundHpack",
-        "Grpc.Http2.Connection.rejectStreamAtHeaders_frameTrace_no_dispatch": "∀ {registry : Grpc.Registry} {state final : Grpc.Http2.Connection.State} {steps : List (Grpc.Http2.Frame × Grpc.Http2.Connection.SharedFrameResult)} (streamId : Nat) (inboundHpack outboundHpack : Grpc.Http2.Hpack.State) (endStream : Bool) (hclaimed : streamId ≤ state.lastClientStreamId) (hactive : ∀ (active : Grpc.Http2.Connection.ActiveRequestStream), active ∈ state.activeRequestStreams → active.streamId ≠ streamId) (trace : Grpc.Http2.Connection.FrameTrace registry (Grpc.Http2.Connection.rejectStreamAtHeaders state streamId inboundHpack outboundHpack endStream) steps final) (hdata : ∀ (step : Grpc.Http2.Frame × Grpc.Http2.Connection.SharedFrameResult), step ∈ steps → step.fst.header.frameType = Grpc.Http2.FrameType.data → step.fst.header.streamId = streamId), final.StreamInert streamId ∧ (∀ (step : Grpc.Http2.Frame × Grpc.Http2.Connection.SharedFrameResult), step ∈ steps → step.snd.requestFeeds = #[] ∧ step.snd.detached = none ∧ step.snd.requestStreaming = none)",
-        "Grpc.Http2.Connection.processDataShared_inert_reset": "∀ {registry : Grpc.Registry} {state state' : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {result : Grpc.Http2.Connection.SharedFrameResult} (hinert : state.StreamInert frame.header.streamId) (hnotrej : state.rejectedAtHeaders frame.header.streamId = false) (h : Grpc.Http2.Connection.processDataShared registry state frame = Except.ok (state', result)), result.requestFeeds = #[] ∧ result.detached = none ∧ result.requestStreaming = none ∧ (∀ (dispatch : Grpc.Http2.Connection.ActiveDispatch), dispatch ∈ result.cancelDispatches → dispatch.streamId = frame.header.streamId) ∧ state'.streams = Grpc.Http2.Connection.removeStream state.streams frame.header.streamId ∧ state'.lastClientStreamId = state.lastClientStreamId ∧ (∀ (active : Grpc.Http2.Connection.ActiveRequestStream), active ∈ state'.activeRequestStreams → active ∈ state.activeRequestStreams) ∧ (∃ rst, rst ∈ result.emitted ∧ rst.header.frameType = Grpc.Http2.FrameType.rstStream ∧ rst.header.streamId = frame.header.streamId)",
-        "Grpc.Http2.Connection.initialState_wellFormed": "∀ (maxConcurrentStreams maxHeaderListSize : Option Nat) (initialWindowSize : Nat), Grpc.Http2.Connection.WellFormed (Grpc.Http2.Connection.initialState maxConcurrentStreams maxHeaderListSize initialWindowSize)",
-        "Grpc.Http2.Connection.prepareHeadersShared_wellFormed": "∀ {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {res : Grpc.Http2.Connection.State × Option Grpc.Http2.Frame} (h : Grpc.Http2.Connection.WellFormed state) (hpending : Grpc.Http2.Connection.pendingHeaderStream? state.streams = none) (heq : Grpc.Http2.Connection.prepareHeadersShared state frame = Except.ok res), Grpc.Http2.Connection.WellFormed res.fst",
-        "Grpc.Http2.Connection.appendContinuationFrame_wellFormed": "∀ {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {streams' : Array Grpc.Http2.Connection.StreamState} (h : Grpc.Http2.Connection.WellFormed state) (heq : Grpc.Http2.Connection.appendContinuationFrame state.streams frame = Except.ok streams'), Grpc.Http2.Connection.WellFormed { closing := state.closing, prefaceReceived := state.prefaceReceived, clientSettingsReceived := state.clientSettingsReceived, extendedConnectEnabled := state.extendedConnectEnabled, peerExtendedConnectEnabled := state.peerExtendedConnectEnabled, prefaceBuffer := state.prefaceBuffer, decoder := state.decoder, hpack := state.hpack, outboundHpack := state.outboundHpack, lastClientStreamId := state.lastClientStreamId, outboundGoAwayLastStreamId := state.outboundGoAwayLastStreamId, outboundConnectionWindow := state.outboundConnectionWindow, outboundInitialStreamWindow := state.outboundInitialStreamWindow, outboundMaxFramePayloadLength := state.outboundMaxFramePayloadLength, inboundMaxFramePayloadLength := state.inboundMaxFramePayloadLength, inboundConnectionWindow := state.inboundConnectionWindow, inboundInitialStreamWindow := state.inboundInitialStreamWindow, inboundMaxConcurrentStreams := state.inboundMaxConcurrentStreams, inboundMaxHeaderListSize := state.inboundMaxHeaderListSize, inboundStreamWindows := state.inboundStreamWindows, outboundStreamWindows := state.outboundStreamWindows, pendingOutbound := state.pendingOutbound, streams := streams', ignoredInboundStreams := state.ignoredInboundStreams, resetInboundStreams := state.resetInboundStreams, resetHeaderBlock := state.resetHeaderBlock, refusedInboundStreams := state.refusedInboundStreams, activeRequestStreams := state.activeRequestStreams, activeDispatches := state.activeDispatches, activeAuthorizations := state.activeAuthorizations, activeExtendedConnectDecisions := state.activeExtendedConnectDecisions, activeTunnels := state.activeTunnels, pendingDispatchPublications := state.pendingDispatchPublications, pendingKeepalivePing := state.pendingKeepalivePing, deadlineScheduler := state.deadlineScheduler }",
-        "Grpc.Http2.Connection.processNonHeaderFrameShared_wellFormed": "∀ {registry : Grpc.Registry} {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {res : Grpc.Http2.Connection.State × Grpc.Http2.Connection.SharedFrameResult} (h : Grpc.Http2.Connection.WellFormed state) (heq : Grpc.Http2.Connection.processNonHeaderFrameShared registry state frame = Except.ok res), Grpc.Http2.Connection.WellFormed res.fst",
-        "Grpc.Http2.Connection.prepareHeadersShared_no_reopen": "∀ {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {res : Grpc.Http2.Connection.State × Option Grpc.Http2.Frame} (heq : Grpc.Http2.Connection.prepareHeadersShared state frame = Except.ok res) {claimed : Nat} (hclaimed : claimed ≤ state.lastClientStreamId), frame.header.streamId ≠ claimed",
-        "Grpc.Http2.Connection.prepareHeadersShared_concurrency": "∀ {state state' : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {limit : Nat} (hlimit : state.inboundMaxConcurrentStreams = some limit) (heq : Grpc.Http2.Connection.prepareHeadersShared state frame = Except.ok (state', none)), Grpc.Http2.Connection.activeInboundStreamCount state < limit ∨ Grpc.Http2.Connection.containsStreamId state'.refusedInboundStreams frame.header.streamId = true",
-        "Grpc.Http2.Connection.consumeInboundDataWindow_conserves": "∀ {state state' : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} (h : Grpc.Http2.Connection.consumeInboundDataWindow state frame = Except.ok state'), state'.inboundConnectionWindow + frame.payload.size = state.inboundConnectionWindow ∧ Grpc.Http2.Connection.inboundStreamWindow state' frame.header.streamId + frame.payload.size = Grpc.Http2.Connection.inboundStreamWindow state frame.header.streamId",
-        "Grpc.Http2.Connection.resetStreamFlowControl_scoped": "∀ {state state' : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {result : Grpc.Http2.Connection.SharedFrameResult} (h : Grpc.Http2.Connection.resetStreamFlowControl state frame = Except.ok (state', result)), result.requestFeeds = #[] ∧ result.detached = none ∧ result.requestStreaming = none ∧ state'.inboundConnectionWindow = state.inboundConnectionWindow ∧ state'.lastClientStreamId = state.lastClientStreamId ∧ state'.hpack = state.hpack ∧ state'.outboundHpack = state.outboundHpack ∧ (∀ (dispatch : Grpc.Http2.Connection.ActiveDispatch), dispatch ∈ result.cancelDispatches → dispatch.streamId = frame.header.streamId) ∧ (∃ connectionUpdate rst, Grpc.Http2.WindowUpdate.frame 0 frame.payload.size = Except.ok connectionUpdate ∧ Grpc.Http2.RstStream.frame frame.header.streamId Grpc.Http2.ErrorCode.flowControlError = Except.ok rst ∧ result.emitted = #[connectionUpdate, rst])",
-        "Grpc.Http2.Connection.processUnaryRequestData_windows": "∀ {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {res : Grpc.Http2.Connection.State × Grpc.Http2.Connection.SharedFrameResult} (heq : Grpc.Http2.Connection.processUnaryRequestData state frame = Except.ok res), res.fst.inboundConnectionWindow = state.inboundConnectionWindow ∧ (res.snd.detached = none → Grpc.Http2.Connection.inboundStreamWindow res.fst frame.header.streamId = Grpc.Http2.Connection.inboundStreamWindow state frame.header.streamId)",
-        "Grpc.Http2.Connection.processActiveRequestData_windows": "∀ {registry : Grpc.Registry} {state : Grpc.Http2.Connection.State} {frame : Grpc.Http2.Frame} {active : Grpc.Http2.Connection.ActiveRequestStream} {res : Grpc.Http2.Connection.State × Grpc.Http2.Connection.SharedFrameResult} (heq : Grpc.Http2.Connection.processActiveRequestData registry state frame active = Except.ok res), res.fst.inboundConnectionWindow = state.inboundConnectionWindow",
-        "Grpc.Http2.Connection.decodeActiveRequestData_conserves": "∀ {registry : Grpc.Registry} {active active' : Grpc.Http2.Connection.ActiveRequestStream} {frame : Grpc.Http2.Frame} {messages : Array ByteArray} {close : Bool} (h : Grpc.Http2.Connection.decodeActiveRequestData registry active frame = Except.ok (active', messages, close)), Grpc.Http2.Connection.creditSum active'.pendingRequestCredits + active'.decodeState.buffered.size = Grpc.Http2.Connection.creditSum active.pendingRequestCredits + active.decodeState.buffered.size + frame.payload.size",
-        "Grpc.Http2.Connection.takeRequestStreamCredit_conserves": "∀ (state : Grpc.Http2.Connection.State) (streamId : Nat), Grpc.Http2.Connection.inboundStreamWindow (Grpc.Http2.Connection.takeRequestStreamCredit state streamId).fst streamId = Grpc.Http2.Connection.inboundStreamWindow state streamId + (Grpc.Http2.Connection.takeRequestStreamCredit state streamId).snd",
-        "Grpc.Http2.Connection.flushOutbound_conserves": "∀ (state : Grpc.Http2.Connection.State) (emitted : Array Grpc.Http2.Frame), (Grpc.Http2.Connection.flushOutbound state emitted).fst.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes (Grpc.Http2.Connection.flushOutbound state emitted).snd = state.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes emitted",
-        "Grpc.Http2.Connection.queueOutbound_conserves": "∀ (state : Grpc.Http2.Connection.State) (frames : Array Grpc.Http2.Frame), (Grpc.Http2.Connection.queueOutbound state frames).fst.outboundConnectionWindow + Grpc.Http2.Connection.dataPayloadBytes (Grpc.Http2.Connection.queueOutbound state frames).snd = state.outboundConnectionWindow",
-        "Grpc.Http2.Connection.queueOutbound_wellFormed": "∀ (state : Grpc.Http2.Connection.State) (frames : Array Grpc.Http2.Frame), Grpc.Http2.Connection.WellFormed state → Grpc.Http2.Connection.WellFormed (Grpc.Http2.Connection.queueOutbound state frames).fst",
         "Grpc.Http2.Connection.defaultStreamWindow_admits_max_message": "Grpc.Message.prefixLength + Grpc.Message.defaultMaxDecompressedSize ≤ Grpc.Http2.Connection.defaultStreamWindow",
-        "Grpc.Http2.Connection.inboundWindow_pos_of_incomplete": "∀ {state : Grpc.Http2.Connection.State} {streamId buffered messageWireSize : Nat} (hbalance : Grpc.Http2.Connection.inboundStreamWindow state streamId + buffered = state.inboundInitialStreamWindow) (hfits : messageWireSize ≤ state.inboundInitialStreamWindow) (hincomplete : buffered < messageWireSize), 0 < Grpc.Http2.Connection.inboundStreamWindow state streamId",
-        "Grpc.Http2.Hpack.decodeHuffman_encodeHuffman": "∀ (bytes : ByteArray), Grpc.Http2.Hpack.decodeHuffman (Grpc.Http2.Hpack.encodeHuffman bytes) = Except.ok bytes",
-        "Grpc.Http2.Hpack.decodeString_encodeString": "∀ {value : String} {encoded : ByteArray} (henc : Grpc.Http2.Hpack.encodeString value = Except.ok encoded) (rest : ByteArray), Grpc.Http2.Hpack.decodeString (encoded ++ rest) 0 = Except.ok { value := value, next := encoded.size }",
-        "Grpc.Http2.Hpack.decodeInteger_encodeInteger": "∀ {prefixBits prefixMask value : Nat} {encoded : ByteArray} (hmask : prefixMask % 2 ^ prefixBits = 0) (hfits : prefixMask + 2 ^ prefixBits ≤ 256) (henc : Grpc.Http2.Hpack.encodeInteger prefixBits prefixMask value = Except.ok encoded) (rest : ByteArray), Grpc.Http2.Hpack.decodeInteger prefixBits (encoded ++ rest) 0 = Except.ok { value := value, next := encoded.size }",
-        "Grpc.Http2.Hpack.huffmanPrefixFree": "Grpc.Http2.Hpack.pairwiseNoBitPrefix Grpc.Http2.Hpack.huffmanCodeTable = true",
-        "Grpc.Http2.Hpack.dynamicSize_resize_le": "∀ (state : Grpc.Http2.Hpack.State) (maxSize : Nat), Grpc.Http2.Hpack.dynamicSize (Grpc.Http2.Hpack.resize state maxSize).dynamic ≤ maxSize",
-        "Grpc.Http2.Hpack.dynamicSize_insert_le": "∀ (state : Grpc.Http2.Hpack.State) (header : Grpc.Header), Grpc.Http2.Hpack.dynamicSize (Grpc.Http2.Hpack.insert state header).dynamic ≤ state.maxSize",
-        "Grpc.Http2.Hpack.dynamicSize_resizeChecked_le": "∀ {state state' : Grpc.Http2.Hpack.State} {maxSize : Nat} (h : Grpc.Http2.Hpack.resizeChecked state maxSize = Except.ok state'), Grpc.Http2.Hpack.dynamicSize state'.dynamic ≤ maxSize",
-        "Grpc.Http2.Hpack.dynamicSize_setMaxAllowedSize_le": "∀ (state : Grpc.Http2.Hpack.State) (maxSize : Nat), Grpc.Http2.Hpack.dynamicSize (Grpc.Http2.Hpack.setMaxAllowedSize state maxSize).dynamic ≤ maxSize",
-        "Grpc.Http2.Frame.decodeAll_encode_append": "∀ {frame : Grpc.Http2.Frame} {bs : ByteArray} (henc : frame.encode = Except.ok bs) (hft : Grpc.Http2.FrameType.ofUInt8 frame.header.frameType.toUInt8 = frame.header.frameType) (rest : ByteArray), Grpc.Http2.Frame.decodeAll (bs ++ rest) = Except.map (fun frames => #[frame] ++ frames) (Grpc.Http2.Frame.decodeAll rest)",
-        "Grpc.Http2.Frame.decodeHeader_encodeHeader_append": "∀ {header : Grpc.Http2.FrameHeader} {bs : ByteArray} (henc : Grpc.Http2.Frame.encodeHeader header = Except.ok bs) (hft : Grpc.Http2.FrameType.ofUInt8 header.frameType.toUInt8 = header.frameType) (rest : ByteArray), Grpc.Http2.Frame.decodeHeader (bs ++ rest) = Except.ok header",
         "Grpc.Message.decodeAll_encode_append": "∀ {x : Grpc.Message} {bs : ByteArray} (henc : x.encode = Except.ok bs) (rest : ByteArray), Grpc.Message.decodeAll (bs ++ rest) = Except.map (fun messages => #[x] ++ messages) (Grpc.Message.decodeAll rest)",
         "Grpc.Message.decodeAllWithLimit_size_le": "∀ {maxDataSize : Nat} {bytes : ByteArray} {messages : Array Grpc.Message} (h : Grpc.Message.decodeAllWithLimit (some maxDataSize) bytes = Except.ok messages) (message : Grpc.Message), message ∈ messages → message.data.size ≤ maxDataSize",
         "Grpc.Percent.decode_encode": "∀ (message : String), Grpc.Percent.decode (Grpc.Percent.encode message) = Except.ok message",
@@ -365,7 +286,6 @@ lean_assurance_test(
         "Grpc.Base64.decodeBytes_encodeBytes": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytes bytes) = Except.ok bytes",
         "Grpc.Base64.decodeBytes_encodeBytesUnpadded": "∀ (bytes : ByteArray), Grpc.Base64.decodeBytes (Grpc.Base64.encodeBytesUnpadded bytes) = Except.ok bytes",
         "Grpc.Headers.valueAcceptsGzipCandidate_eq_valueAcceptsGzip": "∀ (value : String), Grpc.Headers.TestSupport.valueAcceptsGzipCandidateForBenchmark value = Grpc.Headers.valueAcceptsGzip value",
-        "Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate_eq_encodeUnaryResponseFrames": "∀ (state : Grpc.Http2.Hpack.State) (streamId : Nat) (response : Grpc.UnaryResponse) (maxDataFrameSize : Nat) (gzip : Bool), Grpc.Http2.Transport.TestSupport.encodeUnaryResponseFramesCandidateForBenchmark state streamId response maxDataFrameSize gzip = Grpc.Http2.Transport.encodeUnaryResponseFrames state streamId response maxDataFrameSize gzip",
         "Grpc.ChannelLease.State.invariant": "∀ (state : Grpc.ChannelLease.State), state.Invariant",
         "Grpc.ChannelLease.State.closed_has_no_leases": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeLeases = []",
         "Grpc.ChannelLease.State.closed_active_count_zero": "∀ (state : Grpc.ChannelLease.State) (closed : state.phase = Grpc.ChannelLease.Phase.closed), state.activeCount = 0",
@@ -417,34 +337,21 @@ lean_assurance_test(
     },
     expected_unsafe_constants = [],
     expected_partial_definitions = [
-        "Grpc.Http2.Hpack.decodeLoop",
         "Grpc.Http2.Connection.DeadlineScheduler.loop",
+        "Grpc.Http2.Connection.emitStreamingMessagesShared",
+        "Grpc.Http2.Connection.flushResponses",
         "Grpc.MessageStream.collect",
-        "Grpc.Http2.Grpc.Grpc.Http2.Transport.emitMessageStreamDataFramesAsync",
-        "Grpc.Tls.Session.Grpc.Tls.serverHandshakeLoop",
-        "Grpc.Tls.Session.Grpc.Tls.writerLoop",
-        "Grpc.Tls.Session.Grpc.Tls.clientHandshakeLoop",
-        "Grpc.Tls.ServerSession.recvApp",
         "Grpc.Client.collectResponses",
         "Grpc.Client.readerLoop",
         "Grpc.Client.Call.recvLoop",
         "Grpc.Client.writerLoop",
         "Grpc.Client.Call.finish",
         "Grpc.Client.Call.sendChunks",
-        "Grpc.Http2.Connection.sendActiveTunnelChunks",
-        "Grpc.Http2.Connection.waitActiveTunnel",
-        "Grpc.Client.beginExtendedConnect",
-        "Grpc.Client.sendTunnelChunks",
         "Grpc.Client.startLoop",
-        "Grpc.Client.recvTunnelLoop",
-        "Grpc.Client.waitTunnel",
         "Grpc.Client.failQueuedOutboundWrites",
-        "Grpc.Client.awaitExtendedConnectCapability",
-        "Grpc.Client.awaitExtendedConnectResponse",
         "Grpc.Http2.Server.keepaliveLoop",
         "Grpc.Http2.Server.waitActiveConnectionsDrained",
-        "Grpc.Http2.Server.failQueuedSocketWrites",
-        "Grpc.Http2.Server.serveForeverApplications",
+        "Grpc.Http2.Server.serveForever",
         "Grpc.Http2.Server.acceptTlsLoop",
         "Grpc.Http2.Server.serveClientLoop",
         "Grpc.Http2.Server.socketWriterLoop",
@@ -455,31 +362,13 @@ lean_assurance_test(
         "Grpc.ManagedChannel.Grpc.tryAddresses",
         "Grpc.ManagedChannel.ensureClaimedCloseOwner",
         "Grpc.ManagedChannel.awaitClaimedCloseUntil",
-        "Grpc.TrustAnchors.readHandleBounded",
-        "Grpc.TrustAnchors.readDescriptorBounded",
     ],
     expected_opaque_constants = [
         "Zlib.Gzip.compress",
         "Zlib.Gzip.decompress",
-        "Grpc.Posix.Native.strerrorRaw",
-        "Grpc.Posix.Native.openRaw",
-        "Grpc.Posix.Native.readRaw",
-        "Grpc.Posix.Native.closeRaw",
-        "Grpc.Posix.Native.fstatRaw",
     ],
     expected_implemented_by = {
-        "Grpc.Http2.Hpack.decodeHuffman": "Grpc.Http2.Hpack.decodeHuffmanLookup",
-        "Grpc.Http2.Hpack.decodeString": "Grpc.Http2.Hpack.decodeStringLookup",
-        "Grpc.Http2.Hpack.entrySize": "Grpc.Http2.Hpack.entrySizeCandidate",
-        "Grpc.Http2.Frame.decodeChunk": "Grpc.Http2.Frame.decodeChunkCandidate",
-        "Grpc.Http2.Transport.encodeUnaryResponseFrames": "Grpc.Http2.Grpc.Grpc.Http2.Transport.encodeUnaryResponseFramesCandidate",
-        "Grpc.Http2.Connection.appendStreamFrame": "Grpc.Http2.Connection.appendStreamFrameCandidate",
-        "Grpc.Http2.Connection.flushOutbound": "Grpc.Http2.Connection.flushOutboundCandidate",
-        "Grpc.Http2.Connection.processUnaryRequestData": "Grpc.Http2.Connection.processUnaryRequestDataCandidate",
         "Grpc.Http2.Connection.removeStream": "Grpc.Http2.Connection.removeStreamErasing",
-        "Grpc.Header.normalizeName": "Grpc.Header.normalizeNameByteIndexed",
-        "Grpc.Metadata.getLast?": "Grpc.Metadata.getLastUSize",
-        "Grpc.Metadata.headerListEntrySize": "Grpc.Metadata.headerListEntrySizeCandidate",
         "Grpc.Ascii.validHeaderName": "Grpc.Ascii.validHeaderNameByteIndexed",
         "Grpc.Ascii.isVisibleString": "Grpc.Ascii.isVisibleStringByteIndexed",
         "Grpc.Message.encode": "Grpc.Framing.Grpc.Message.encodeCandidate",
@@ -491,17 +380,12 @@ lean_assurance_test(
     expected_extern_declarations = {
         "Zlib.Gzip.compress": "all:standard:grpc_zlib_gzip_compress",
         "Zlib.Gzip.decompress": "all:standard:grpc_zlib_gzip_decompress",
-        "Grpc.Posix.Native.strerrorRaw": "all:standard:lean_grpc_posix_strerror_raw",
-        "Grpc.Posix.Native.openRaw": "all:standard:lean_grpc_posix_open_raw",
-        "Grpc.Posix.Native.readRaw": "all:standard:lean_grpc_posix_read_raw",
-        "Grpc.Posix.Native.closeRaw": "all:standard:lean_grpc_posix_close_raw",
-        "Grpc.Posix.Native.fstatRaw": "all:standard:lean_grpc_posix_fstat_raw",
     },
     expected_native_targets = [
         "//Zlib:lean_runtime_headers",
         "//Zlib:zlib_shim",
-        "//native:lean_runtime_headers",
-        "//native:posix_ffi",
+        "@http2-lean+//native:lean_runtime_headers",
+        "@http2-lean+//native:posix_ffi",
         "@tls13-lean++_repo_rules+hacl//:hacl",
         "@tls13-lean+//HaclStar:hacl_shim",
         "@tls13-lean+//HaclStar:lean_runtime_headers",
@@ -517,10 +401,9 @@ lean_assurance_test(
 # it reaches comes from tls13-lean's own audited HaclStar boundary, so no
 # `@[extern]` may appear under `Grpc.Tls`.
 #
-# The audited environment is partitioned: `Grpc.Tls` is audited here;
-# `Grpc.CancellationToken` is audited by `//:grpc_assurance` (under its `Grpc`
-# prefix); the `Tls`/`TLS13`/`HaclStar` roots are tls13-lean modules audited by
-# that repository's own assurance targets.
+# The audited environment is partitioned: the gRPC REST adapter is audited
+# here, while its HTTP/2 TLS session and cryptographic dependencies are outside
+# this target's module prefix.
 lean_assurance_test(
     name = "grpc_tls_assurance",
     policy_mode = "exact",
@@ -533,8 +416,8 @@ lean_assurance_test(
     ],
     module_prefixes = ["Grpc.Tls"],
     unaudited_module_prefixes = [
-        "Grpc.CancellationToken",
         "HaclStar",
+        "Http2",
         "TLS13",
         "Tls",
     ],
@@ -543,10 +426,6 @@ lean_assurance_test(
         "Grpc.Tls.Rest.acceptLoop",
         "Grpc.Tls.Rest.serveOneRequest",
         "Grpc.Tls.Rest.waitOwnedTasks",
-        "Grpc.Tls.ServerSession.recvApp",
-        "Grpc.Tls.Session.Grpc.Tls.clientHandshakeLoop",
-        "Grpc.Tls.Session.Grpc.Tls.serverHandshakeLoop",
-        "Grpc.Tls.Session.Grpc.Tls.writerLoop",
     ],
     expected_opaque_constants = [],
     expected_implemented_by = {},
@@ -593,7 +472,10 @@ lean_test(
     # In-process client+server; run exclusively so concurrent socket tests do not
     # starve each other's worker pool (see the same-process handshake note).
     tags = ["no-sandbox", "exclusive"],
-    deps = [":grpc_tls"],
+    deps = [
+        ":grpc_tls",
+        "@http2_lean//:tls_session",
+    ],
 )
 
 lean_test(
@@ -609,28 +491,9 @@ lean_test(
 )
 
 lean_test(
-    name = "extended_connect_test",
-    srcs = ["Test/ExtendedConnectTest.lean"],
-    # In-process socket test; keep it isolated from other worker-pool users.
+    name = "http2_error_code_test",
+    srcs = ["Test/Http2ErrorCodeTest.lean"],
     tags = ["no-sandbox", "exclusive"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "outbound_queue_test",
-    srcs = ["Test/OutboundQueueTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "inbound_window_fusion_test",
-    srcs = ["Test/InboundWindowFusionTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "data_frames_test",
-    srcs = ["Test/DataFramesTest.lean"],
     deps = [":grpc_lean"],
 )
 
@@ -720,18 +583,6 @@ lean_test(
 )
 
 lean_test(
-    name = "hpack_test",
-    srcs = ["Test/HpackTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "hpack_name_lookup_test",
-    srcs = ["Test/HpackNameLookupTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
     name = "timeout_test",
     srcs = ["Test/TimeoutTest.lean"],
     deps = [":grpc_lean"],
@@ -744,65 +595,14 @@ lean_test(
 )
 
 lean_test(
-    name = "header_normalize_name_test",
-    srcs = ["Test/HeaderNormalizeNameTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "metadata_get_last_test",
-    srcs = ["Test/MetadataGetLastTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "header_size_accounting_test",
-    srcs = ["Test/HeaderSizeAccountingTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "frame_header_decode_test",
-    srcs = ["Test/FrameHeaderDecodeTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "frame_parser_cursor_test",
-    srcs = ["Test/FrameParserCursorTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
     name = "request_preflight_summary_test",
     srcs = ["Test/RequestPreflightSummaryTest.lean"],
     deps = [":grpc_lean"],
 )
 
 lean_binary(
-    name = "hpack_benchmark",
-    srcs = ["Benchmark/HpackBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "authorization_benchmark",
-    srcs = ["Benchmark/AuthorizationBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
     name = "timeout_benchmark",
     srcs = ["Benchmark/TimeoutBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "deadline_phase_benchmark",
-    srcs = ["Benchmark/DeadlinePhaseBenchmark.lean"],
     tags = ["manual"],
     deps = [":grpc_lean"],
 )
@@ -836,69 +636,6 @@ lean_binary(
 )
 
 lean_binary(
-    name = "unary_body_benchmark",
-    srcs = ["Benchmark/UnaryBodyBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "response_hpack_benchmark",
-    srcs = ["Benchmark/ResponseHpackBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "unary_response_frame_assembly_benchmark",
-    srcs = ["Benchmark/UnaryResponseFrameAssemblyBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "unary_response_frame_assembly_benchmark_test",
-    srcs = ["Benchmark/UnaryResponseFrameAssemblyBenchmark.lean"],
-    args = ["candidate", "exact_128", "100", "10"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "frame_batch_benchmark",
-    srcs = ["Benchmark/FrameBatchBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "outbound_flush_benchmark",
-    srcs = ["Benchmark/OutboundFlushBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "outbound_flush_test",
-    srcs = ["Benchmark/OutboundFlushBenchmark.lean"],
-    args = ["candidate", "unary_128", "1000", "10"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "inbound_window_round_trip_benchmark",
-    srcs = ["Benchmark/InboundWindowRoundTripBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "inbound_window_round_trip_benchmark_test",
-    srcs = ["Benchmark/InboundWindowRoundTripBenchmark.lean"],
-    args = ["candidate", "present_first_1_exact", "1000", "10"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
     name = "stream_removal_benchmark",
     srcs = ["Benchmark/StreamRemovalBenchmark.lean"],
     tags = ["manual"],
@@ -906,72 +643,9 @@ lean_binary(
 )
 
 lean_binary(
-    name = "stream_frame_append_benchmark",
-    srcs = ["Benchmark/StreamFrameAppendBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "stream_frame_append_test",
-    srcs = ["Benchmark/StreamFrameAppendBenchmark.lean"],
-    args = ["candidate", "present_first", "4", "1000", "0"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
     name = "metadata_ascii_benchmark",
     srcs = ["Benchmark/MetadataAsciiBenchmark.lean"],
     tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "header_normalize_name_benchmark",
-    srcs = ["Benchmark/HeaderNormalizeNameBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "hpack_name_lookup_benchmark",
-    srcs = ["Benchmark/HpackNameLookupBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "metadata_get_last_benchmark",
-    srcs = ["Benchmark/MetadataGetLastBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "header_size_accounting_benchmark",
-    srcs = ["Benchmark/HeaderSizeAccountingBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "frame_header_decode_benchmark",
-    srcs = ["Benchmark/FrameHeaderDecodeBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_binary(
-    name = "frame_parser_cursor_benchmark",
-    srcs = ["Benchmark/FrameParserCursorBenchmark.lean"],
-    tags = ["manual"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "frame_parser_cursor_benchmark_test",
-    srcs = ["Benchmark/FrameParserCursorBenchmark.lean"],
-    args = ["candidate", "unary_three", "100", "10"],
     deps = [":grpc_lean"],
 )
 
@@ -1000,12 +674,6 @@ lean_test(
     name = "request_validation_fusion_benchmark_test",
     srcs = ["Benchmark/RequestValidationFusionBenchmark.lean"],
     args = ["fused", "client_default_7", "100", "10"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "response_header_cache_test",
-    srcs = ["Test/ResponseHeaderCacheTest.lean"],
     deps = [":grpc_lean"],
 )
 
@@ -1065,20 +733,16 @@ lean_test(
     deps = [
         ":grpc_lean",
         ":test_certificate_fixtures",
+        "@http2_lean//:name_resolver",
+        "@http2_lean//:trust_anchors",
     ],
 )
 
 lean_test(
     name = "name_resolver_test",
     srcs = ["Test/NameResolverTest.lean"],
-    deps = [":grpc_lean"],
-)
-
-lean_test(
-    name = "trust_anchors_test",
-    srcs = ["Test/TrustAnchorsTest.lean"],
     deps = [
         ":grpc_lean",
-        ":test_certificate_fixtures",
+        "@http2_lean//:name_resolver",
     ],
 )

@@ -46,7 +46,7 @@ absolute instant the server enforces, so `context.remainingDeadline` is exactly
 the time a downstream call may still take. -/
 structure RequestContext where
   method : MethodName
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   timeout : Option Timeout := none
   /-- Absolute deadline on `IO.monoNanosNow`'s clock, or `none` when the
   request carried no `grpc-timeout`. -/
@@ -114,8 +114,8 @@ structure Authenticated (α : Type) where
 Pure authenticators run inline; effectful authenticators participate in the
 call's cancellation and deadline lifecycle. -/
 inductive RequestAuthenticator (α : Type) where
-  | pure (authenticate : Metadata -> Except Status α)
-  | effectful (authenticate : Metadata -> GrpcM α)
+  | pure (authenticate : _root_.Http2.Headers -> Except Status α)
+  | effectful (authenticate : _root_.Http2.Headers -> GrpcM α)
 
 /--
 The seven RPC shapes a registered method handler may have.  The `*Stream`
@@ -152,8 +152,8 @@ authenticated registration uses this resolver to capture its authenticated
 principal in the exact handler that later receives request DATA. -/
 inductive RequestHeaderHandlerResolver (shape : RpcShape) where
   | registered
-  | pure (resolve : Metadata -> Except Status (Handler shape))
-  | effectful (resolve : Metadata -> GrpcM (Handler shape))
+  | pure (resolve : _root_.Http2.Headers -> Except Status (Handler shape))
+  | effectful (resolve : _root_.Http2.Headers -> GrpcM (Handler shape))
 
 namespace RequestHeaderHandlerResolver
 
@@ -203,7 +203,7 @@ def AuthorizationResult.acceptRegistered (entry : MethodEntry) :
 remains indexed by the looked-up entry's exact RPC shape, just like the
 effectful authorizer below. -/
 abbrev PureRequestHeaderAuthorizer :=
-  (entry : MethodEntry) -> Metadata -> AuthorizationResult entry
+  (entry : MethodEntry) -> _root_.Http2.Headers -> AuthorizationResult entry
 
 /--
 Request-header authorization runs after gRPC method/header validation and
@@ -213,7 +213,7 @@ should keep it bounded because the connection preserves request ordering
 while it runs.  Throwing a `Status` is equivalent to returning `.reject`.
 -/
 abbrev RequestHeaderAuthorizer :=
-  (entry : MethodEntry) -> Metadata -> GrpcM (AuthorizationResult entry)
+  (entry : MethodEntry) -> _root_.Http2.Headers -> GrpcM (AuthorizationResult entry)
 
 /-- A shape-preserving interceptor applied to the effective handler after
 method-local resolution and registry-global request authorization. -/
@@ -226,8 +226,8 @@ structure DuplicateMethod where
   deriving Repr, DecidableEq
 
 structure Registry where
-  maxReceiveMessageSize : Option Nat := none
-  maxSendMessageSize : Option Nat := none
+  maxReceiveMessageSize : Option Nat := some Message.defaultMaxDecompressedSize
+  maxSendMessageSize : Option Nat := some Message.defaultMaxDecompressedSize
   /-- Whether responses may use gzip when the peer advertises it. Request
   decompression remains available independently. -/
   enableResponseCompression : Bool := true
@@ -310,7 +310,7 @@ private def interceptHandler (registry : Registry) (entry : MethodEntry)
     interceptor entry handler) handler
 
 private def authorizePureResolvedHandler (registry : Registry) (entry : MethodEntry)
-    (metadata : Metadata) (handler : Handler entry.shape) : AuthorizationResult entry :=
+    (metadata : _root_.Http2.Headers) (handler : Handler entry.shape) : AuthorizationResult entry :=
   let resolvedEntry := {
     entry with
     handler := handler
@@ -326,7 +326,7 @@ private def authorizePureResolvedHandler (registry : Registry) (entry : MethodEn
 /-- The complete bounded-pure resolver for one entry, when both its local
 resolver and the registry-global authorizer are pure. -/
 def pureRequestHeaderAuthorizerFor? (registry : Registry) (entry : MethodEntry) :
-    Option (Metadata -> AuthorizationResult entry) :=
+    Option (_root_.Http2.Headers -> AuthorizationResult entry) :=
   if registry.customRequestHeaderAuthorizer then
     none
   else
@@ -345,7 +345,7 @@ def pureRequestHeaderAuthorizerFor? (registry : Registry) (entry : MethodEntry) 
 /-- Run method-local handler resolution, the installed registry-global
 authorizer, and effective-handler interceptors, in that order. -/
 def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)
-    (metadata : Metadata) : GrpcM (AuthorizationResult entry) := do
+    (metadata : _root_.Http2.Headers) : GrpcM (AuthorizationResult entry) := do
   let handler ← match entry.requestHeaderHandlerResolver with
     | .registered => pure entry.handler
     | .pure resolve => GrpcM.ofExcept (resolve metadata)
@@ -504,7 +504,7 @@ def registerAuthenticatedUnaryCodecWithContext [ToString ε]
       match encode output with
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, data := data, status := Status.ok }
 
 def registerAuthenticatedUnaryCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -530,7 +530,7 @@ def registerAuthenticatedServerStreamingCodecWithContext [ToString ε]
         match encode output with
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, messages := messages, status := Status.ok }
 
 def registerAuthenticatedServerStreamingCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -557,7 +557,7 @@ def registerAuthenticatedServerStreamingStreamCodecWithContext [ToString ε]
         match encode output with
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, messages := messages, status := Status.ok }
 
 def registerAuthenticatedServerStreamingStreamCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -583,7 +583,7 @@ def registerAuthenticatedClientStreamingCodecWithContext [ToString ε]
       match encode output with
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, data := data, status := Status.ok }
 
 def registerAuthenticatedClientStreamingCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -611,7 +611,7 @@ def registerAuthenticatedClientStreamingStreamCodecWithContext [ToString ε]
       match encode output with
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, data := data, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, data := data, status := Status.ok }
 
 def registerAuthenticatedClientStreamingStreamCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -639,7 +639,7 @@ def registerAuthenticatedBidirectionalStreamingCodecWithContext [ToString ε]
         match encode output with
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, messages := messages, status := Status.ok }
 
 def registerAuthenticatedBidirectionalStreamingCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -669,7 +669,7 @@ def registerAuthenticatedBidirectionalStreamingStreamCodecWithContext [ToString 
         match encode output with
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
-    pure { metadata := Metadata.empty, messages := messages, status := Status.ok }
+    pure { metadata := _root_.Http2.Headers.empty, messages := messages, status := Status.ok }
 
 def registerAuthenticatedBidirectionalStreamingStreamCodec [ToString ε]
     (registry : Registry) (name : MethodName)
@@ -831,7 +831,7 @@ def registerUnaryCodecWithContext [ToString ε] (registry : Registry) (name : Me
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       data := data,
       status := Status.ok
     }
@@ -856,7 +856,7 @@ def registerServerStreamingCodecWithContext [ToString ε] (registry : Registry) 
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       messages := messages,
       status := Status.ok
     }
@@ -881,7 +881,7 @@ def registerServerStreamingStreamCodecWithContext [ToString ε] (registry : Regi
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       messages := messages,
       status := Status.ok
     }
@@ -906,7 +906,7 @@ def registerClientStreamingCodecWithContext [ToString ε] (registry : Registry) 
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       data := data,
       status := Status.ok
     }
@@ -931,7 +931,7 @@ def registerClientStreamingStreamCodecWithContext [ToString ε] (registry : Regi
       | .ok value => .ok value
       | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       data := data,
       status := Status.ok
     }
@@ -957,7 +957,7 @@ def registerBidirectionalStreamingCodecWithContext [ToString ε] (registry : Reg
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       messages := messages,
       status := Status.ok
     }
@@ -983,7 +983,7 @@ def registerBidirectionalStreamingStreamCodecWithContext [ToString ε] (registry
         | .ok value => .ok value
         | .error err => .error (Status.internal s!"failed to encode response: {err}")
     pure {
-      metadata := Metadata.empty,
+      metadata := _root_.Http2.Headers.empty,
       messages := messages,
       status := Status.ok
     }
@@ -1205,7 +1205,7 @@ private def checkSendDataSize (registry : Registry) (data : ByteArray) : GrpcM U
       else
         pure ()
 
-private def validateStatusDetailsTrailer (status : Status) (trailers : Metadata) : GrpcM Unit := do
+private def validateStatusDetailsTrailer (status : Status) (trailers : _root_.Http2.Headers) : GrpcM Unit := do
   if status.isOk && (trailers.get? "grpc-status-details-bin").isSome then
     throw (Status.internal "grpc-status-details-bin is only valid for non-OK statuses")
   else
@@ -1278,7 +1278,7 @@ private def withDeadlineUntil (deadline? : Option Nat) (stream : MessageStream �
     cancel := stream.cancel
   }
 
-private def decodeUnaryRequestHeaders (metadata : Metadata) (bodySize : Nat)
+private def decodeUnaryRequestHeaders (metadata : _root_.Http2.Headers) (bodySize : Nat)
     (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight) :
     GrpcM (MethodName × Option Timeout × Option Nat) := do
@@ -1292,7 +1292,7 @@ private def decodeUnaryRequestHeaders (metadata : Metadata) (bodySize : Nat)
         GrpcM.ofExcept (Headers.validateContentLengthValue preflight.contentLength bodySize)
         pure (preflight.method, preflight.timeout, headerDeadline)
 
-private def unaryRequestFromIdentityMessages (metadata : Metadata)
+private def unaryRequestFromIdentityMessages (metadata : _root_.Http2.Headers)
     (method : MethodName) (timeout : Option Timeout) (deadline? : Option Nat)
     (messages : Array Message) : GrpcM UnaryRequest := do
   if messages.size != 1 then
@@ -1308,7 +1308,7 @@ private def unaryRequestFromIdentityMessages (metadata : Metadata)
     data := message.data
   }
 
-private def decodeUnaryRequestFromIdentityMessages (metadata : Metadata)
+private def decodeUnaryRequestFromIdentityMessages (metadata : _root_.Http2.Headers)
     (bodySize : Nat) (messages : Array Message)
     (headerDeadline : Option Nat := none)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
@@ -1317,7 +1317,7 @@ private def decodeUnaryRequestFromIdentityMessages (metadata : Metadata)
     decodeUnaryRequestHeaders metadata bodySize headerDeadline trustedPreflight?
   unaryRequestFromIdentityMessages metadata method timeout deadline? messages
 
-private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body : ByteArray)
+private def decodeUnaryRequest (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (headerDeadline : Option Nat := none)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM UnaryRequest := do
@@ -1330,7 +1330,7 @@ private def decodeUnaryRequest (registry : Registry) (metadata : Metadata) (body
 /-- Validate/decompress one transport aggregate and consume its first framing
 pass directly when it is already entirely identity-framed. Compressed bodies
 retain the established normalize/re-encode/body-decode path. -/
-private def decodeUnaryTransportBody (registry : Registry) (metadata : Metadata)
+private def decodeUnaryTransportBody (registry : Registry) (metadata : _root_.Http2.Headers)
     (usesGzip : Bool) (body : ByteArray)
     (headerDeadline : Option Nat := none)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
@@ -1344,7 +1344,7 @@ private def decodeUnaryTransportBody (registry : Registry) (metadata : Metadata)
   | .rewritten normalized =>
       decodeUnaryRequest registry metadata normalized headerDeadline trustedPreflight?
 
-private def decodeClientStreamingRequest (registry : Registry) (metadata : Metadata)
+private def decodeClientStreamingRequest (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (headerDeadline : Option Nat := none)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM ClientStreamingRequest := do
@@ -1369,7 +1369,7 @@ private def decodeClientStreamingRequest (registry : Registry) (metadata : Metad
     messages := messages.map (fun message => message.data)
   }
 
-private def decodeClientStreamingStreamRequest (metadata : Metadata)
+private def decodeClientStreamingStreamRequest (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray) (headerDeadline : Option Nat := none)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (ClientStreamingStreamRequest × Option Nat) := do
@@ -1457,7 +1457,7 @@ private def prepareUnaryRequestDispatch (registry : Registry) (request : UnaryRe
       validateUnaryResponse registry response
   }
 
-private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (body : ByteArray)
+private def prepareUnaryDispatch (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (PreparedDispatch UnaryResponse) := do
@@ -1465,7 +1465,7 @@ private def prepareUnaryDispatch (registry : Registry) (metadata : Metadata) (bo
   prepareUnaryRequestDispatch registry request handler?
 
 private def prepareUnaryTransportBodyDispatch (registry : Registry)
-    (metadata : Metadata) (usesGzip : Bool) (body : ByteArray)
+    (metadata : _root_.Http2.Headers) (usesGzip : Bool) (body : ByteArray)
     (handler? : Option UnaryHandler) (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
     GrpcM (PreparedDispatch UnaryResponse) := do
@@ -1473,7 +1473,7 @@ private def prepareUnaryTransportBodyDispatch (registry : Registry)
     headerDeadline trustedPreflight?
   prepareUnaryRequestDispatch registry request handler?
 
-private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata : Metadata)
+private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (handler? : Option ServerStreamingStreamHandler)
     (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
@@ -1495,7 +1495,7 @@ private def prepareServerStreamingStreamDispatch (registry : Registry) (metadata
       validateServerStreamingStreamResponse registry response
   }
 
-private def prepareClientStreamingDispatch (registry : Registry) (metadata : Metadata)
+private def prepareClientStreamingDispatch (registry : Registry) (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray) (handler? : Option ClientStreamingStreamHandler)
     (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
@@ -1518,7 +1518,7 @@ private def prepareClientStreamingDispatch (registry : Registry) (metadata : Met
       validateUnaryResponse registry response
   }
 
-private def prepareBidirectionalStreamingDispatch (registry : Registry) (metadata : Metadata)
+private def prepareBidirectionalStreamingDispatch (registry : Registry) (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray) (handler? : Option BidirectionalStreamingStreamHandler)
     (headerDeadline : Option Nat)
     (trustedPreflight? : Option Headers.RequestPreflight := none) :
@@ -1541,7 +1541,7 @@ private def prepareBidirectionalStreamingDispatch (registry : Registry) (metadat
       validateServerStreamingStreamResponse registry response
   }
 
-def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchUnary (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none) :
     GrpcM UnaryResponse := do
   let prepared ← prepareUnaryDispatch registry metadata body handler? headerDeadline
@@ -1550,7 +1550,7 @@ def dispatchUnary (registry : Registry) (metadata : Metadata) (body : ByteArray)
 /-- Async-native managed-server dispatch.  The no-deadline branch executes
 inline; a timed call owns one cancellable handler task while a managed
 transport supplies its shared deadline scheduler. -/
-def dispatchUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchUnaryAsync (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none)
     (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1562,7 +1562,7 @@ def dispatchUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteA
 is derived from the request metadata, and the raw aggregate is validated
 against this registry's receive limit. Successful all-identity requests
 transfer the first decoded message array into unary preparation. -/
-def dispatchUnaryTransportBodyAsync (registry : Registry) (metadata : Metadata)
+def dispatchUnaryTransportBodyAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray)
     (handler? : Option UnaryHandler := none) (headerDeadline : Option Nat := none)
     (runtime? : Option DeadlineRuntime := none) :
@@ -1578,7 +1578,7 @@ def dispatchUnaryTransportBodyAsync (registry : Registry) (metadata : Metadata)
 
 /-- Managed-transport dispatch for a request whose original metadata has
 already produced the supplied preflight and authorized handler capability. -/
-def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchManagedUnaryAsync (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
     (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1590,7 +1590,7 @@ def dispatchManagedUnaryAsync (registry : Registry) (metadata : Metadata) (body 
 /-- Managed-transport counterpart of `dispatchUnaryTransportBodyAsync` using
 the retained preflight and authorized handler capability. -/
 def dispatchManagedUnaryTransportBodyAsync (registry : Registry)
-    (metadata : Metadata) (body : ByteArray)
+    (metadata : _root_.Http2.Headers) (body : ByteArray)
     (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
     (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1625,7 +1625,7 @@ deliberately creates no task, Promise, timer, or scheduler registration.  The
 caller must retain and cancel the exact task executing this action, keep the
 absolute deadline armed independently, and arbitrate terminal response
 publication against expiry, reset, and shutdown. -/
-def dispatchManagedUnaryInlineUntilAsync (registry : Registry) (metadata : Metadata)
+def dispatchManagedUnaryInlineUntilAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
     (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1647,7 +1647,7 @@ Framing, decompression, cached-header, cardinality, and handler errors preserve
 the exact deadline precedence and clock brackets of the former two-stage path,
 while an identity body is parsed only once. -/
 def dispatchManagedUnaryTransportBodyInlineUntilAsync (registry : Registry)
-    (metadata : Metadata) (body : ByteArray)
+    (metadata : _root_.Http2.Headers) (body : ByteArray)
     (preflight : Headers.RequestPreflight) (handler : UnaryHandler)
     (deadline : Nat) (now : BaseIO Nat := IO.monoNanosNow) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1662,7 +1662,7 @@ def dispatchManagedUnaryTransportBodyInlineUntilAsync (registry : Registry)
   | .ok request =>
       dispatchManagedUnaryRequestInlineUntilAsync registry request handler deadline now
 
-def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchServerStreamingStream (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingStreamResponse := do
@@ -1673,7 +1673,7 @@ def dispatchServerStreamingStream (registry : Registry) (metadata : Metadata) (b
 
 /-- Returns the unwrapped stream together with the one absolute deadline.  The
 Async HTTP/2 encoder races each receive against that same instant. -/
-def dispatchServerStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+def dispatchServerStreamingStreamAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (handler? : Option ServerStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
@@ -1685,7 +1685,7 @@ def dispatchServerStreamingStreamAsync (registry : Registry) (metadata : Metadat
       | .error status => pure (.error status)
       | .ok response => pure (.ok (response, prepared.deadline))
 
-def dispatchManagedServerStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+def dispatchManagedServerStreamingStreamAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (preflight : Headers.RequestPreflight)
     (handler : ServerStreamingStreamHandler) (deadline : Option Nat)
     (runtime? : Option DeadlineRuntime := none) :
@@ -1699,14 +1699,14 @@ def dispatchManagedServerStreamingStreamAsync (registry : Registry) (metadata : 
       | .error status => pure (.error status)
       | .ok response => pure (.ok (response, prepared.deadline))
 
-def dispatchServerStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchServerStreaming (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option ServerStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingResponse := do
   let response ← registry.dispatchServerStreamingStream metadata body handler? headerDeadline
   collectServerStreamingStreamResponse response
 
-def dispatchClientStreamingMessageStream (registry : Registry) (metadata : Metadata)
+def dispatchClientStreamingMessageStream (registry : Registry) (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray)
     (handler? : Option ClientStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
@@ -1715,7 +1715,7 @@ def dispatchClientStreamingMessageStream (registry : Registry) (metadata : Metad
     prepareClientStreamingDispatch registry metadata messages handler? headerDeadline
   runPreparedDispatch prepared (cancelAfterDeadline messages)
 
-def dispatchClientStreamingMessageStreamAsync (registry : Registry) (metadata : Metadata)
+def dispatchClientStreamingMessageStreamAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray)
     (handler? : Option ClientStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
@@ -1727,7 +1727,7 @@ def dispatchClientStreamingMessageStreamAsync (registry : Registry) (metadata : 
       runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime?
 
 def dispatchManagedClientStreamingMessageStreamAsync (registry : Registry)
-    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (metadata : _root_.Http2.Headers) (messages : MessageStream ByteArray)
     (preflight : Headers.RequestPreflight) (handler : ClientStreamingStreamHandler)
     (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1738,7 +1738,7 @@ def dispatchManagedClientStreamingMessageStreamAsync (registry : Registry)
   | .ok prepared =>
       runPreparedDispatchAsync prepared (cancelAfterDeadline messages) runtime?
 
-def dispatchClientStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchClientStreaming (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option ClientStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
     GrpcM UnaryResponse := do
@@ -1746,7 +1746,7 @@ def dispatchClientStreaming (registry : Registry) (metadata : Metadata) (body : 
   let messages ← MessageStream.ofArray request.messages
   registry.dispatchClientStreamingMessageStream metadata messages handler? request.deadline
 
-def dispatchClientStreamingAsync (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchClientStreamingAsync (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option ClientStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status UnaryResponse) := do
@@ -1759,7 +1759,7 @@ def dispatchClientStreamingAsync (registry : Registry) (metadata : Metadata) (bo
           registry.dispatchClientStreamingMessageStreamAsync
             metadata messages handler? request.deadline runtime?
 
-def dispatchManagedClientStreamingAsync (registry : Registry) (metadata : Metadata)
+def dispatchManagedClientStreamingAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (preflight : Headers.RequestPreflight)
     (handler : ClientStreamingStreamHandler) (deadline : Option Nat)
     (runtime? : Option DeadlineRuntime := none) :
@@ -1774,7 +1774,7 @@ def dispatchManagedClientStreamingAsync (registry : Registry) (metadata : Metada
           registry.dispatchManagedClientStreamingMessageStreamAsync
             metadata messages preflight handler deadline runtime?
 
-def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata : Metadata)
+def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata : _root_.Http2.Headers)
     (messages : MessageStream ByteArray)
     (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
@@ -1795,7 +1795,7 @@ def dispatchBidirectionalStreamingMessageStream (registry : Registry) (metadata 
   }
 
 def dispatchBidirectionalStreamingMessageStreamAsync (registry : Registry)
-    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (metadata : _root_.Http2.Headers) (messages : MessageStream ByteArray)
     (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
@@ -1818,7 +1818,7 @@ def dispatchBidirectionalStreamingMessageStreamAsync (registry : Registry)
           pure (.ok (response, prepared.deadline))
 
 def dispatchManagedBidirectionalStreamingMessageStreamAsync (registry : Registry)
-    (metadata : Metadata) (messages : MessageStream ByteArray)
+    (metadata : _root_.Http2.Headers) (messages : MessageStream ByteArray)
     (preflight : Headers.RequestPreflight) (handler : BidirectionalStreamingStreamHandler)
     (deadline : Option Nat) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
@@ -1841,7 +1841,7 @@ def dispatchManagedBidirectionalStreamingMessageStreamAsync (registry : Registry
           }
           pure (.ok (response, prepared.deadline))
 
-def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : Metadata)
+def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingStreamResponse := do
@@ -1850,7 +1850,7 @@ def dispatchBidirectionalStreamingStream (registry : Registry) (metadata : Metad
   registry.dispatchBidirectionalStreamingMessageStream
     metadata messages handler? request.deadline
 
-def dispatchBidirectionalStreamingStreamAsync (registry : Registry) (metadata : Metadata)
+def dispatchBidirectionalStreamingStreamAsync (registry : Registry) (metadata : _root_.Http2.Headers)
     (body : ByteArray) (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
@@ -1864,7 +1864,7 @@ def dispatchBidirectionalStreamingStreamAsync (registry : Registry) (metadata : 
             metadata messages handler? request.deadline runtime?
 
 def dispatchManagedBidirectionalStreamingStreamAsync (registry : Registry)
-    (metadata : Metadata) (body : ByteArray) (preflight : Headers.RequestPreflight)
+    (metadata : _root_.Http2.Headers) (body : ByteArray) (preflight : Headers.RequestPreflight)
     (handler : BidirectionalStreamingStreamHandler) (deadline : Option Nat)
     (runtime? : Option DeadlineRuntime := none) :
     Std.Async.Async (Except Status (ServerStreamingStreamResponse × Option Nat)) := do
@@ -1878,7 +1878,7 @@ def dispatchManagedBidirectionalStreamingStreamAsync (registry : Registry)
           registry.dispatchManagedBidirectionalStreamingMessageStreamAsync
             metadata messages preflight handler deadline runtime?
 
-def dispatchBidirectionalStreaming (registry : Registry) (metadata : Metadata) (body : ByteArray)
+def dispatchBidirectionalStreaming (registry : Registry) (metadata : _root_.Http2.Headers) (body : ByteArray)
     (handler? : Option BidirectionalStreamingStreamHandler := none)
     (headerDeadline : Option Nat := none) :
     GrpcM ServerStreamingResponse := do

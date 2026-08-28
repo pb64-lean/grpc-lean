@@ -11,7 +11,7 @@ def failMethod : MethodName := { service := "grpc.tls.test.EchoService", method 
 def registry : Registry :=
   Registry.empty
     |>.registerUnary echoMethod (fun request => do
-        pure { metadata := Metadata.empty.insert "served-over" "tls", data := request.data, status := Status.ok })
+        pure { metadata := _root_.Http2.Headers.empty.insert "served-over" "tls", data := request.data, status := Status.ok })
     |>.registerUnary failMethod (fun _ => do
         throw (Status.invalidArgument "denied over TLS"))
 
@@ -72,12 +72,61 @@ def clientWork (port : UInt16) (certPem : String) : IO Unit := do
 
   Async.block (Client.close client)
 
+  -- Development-only insecure transport requires an explicit policy opt-in.
+  let insecureClient ← Client.connectTls
+    { address := Http2.Server.loopback port }
+    { insecureSkipVerification := true }
+  match ← Async.block
+      (Client.call insecureClient "/grpc.tls.test.EchoService/Echo" payload) with
+  | .error status => throw (IO.userError s!"insecure TLS echo failed: {status.messageD}")
+  | .ok (_, response) =>
+      if response != payload then throw (IO.userError "insecure TLS echo payload mismatch")
+  Async.block (Client.close insecureClient)
+  IO.println "explicit insecure TLS policy opt-in ok"
+
 def main : IO Unit := do
   -- Local policy validation precedes socket creation/connection.
+  let missingTrustError? ← try
+      let unexpected ← Client.connectTls
+        { address := Http2.Server.loopback 1 }
+        { serverName := some "localhost" }
+      Async.block (Client.close unexpected)
+      pure none
+    catch error =>
+      pure (some error)
+  match missingTrustError? with
+  | some (.userError message) =>
+      unless message.contains "TLS trust anchors are required" do
+        throw (IO.userError s!"unexpected missing-trust error: {message}")
+  | some error =>
+      throw (IO.userError s!"unexpected missing-trust error: {error}")
+  | none =>
+      throw (IO.userError "TLS connection without trust anchors unexpectedly succeeded")
+
+  let missingNameError? ← try
+      let unexpected ← Client.connectTls
+        { address := Http2.Server.loopback 1 }
+        { trustAnchorsPEM := some "not reached" }
+      Async.block (Client.close unexpected)
+      pure none
+    catch error =>
+      pure (some error)
+  match missingNameError? with
+  | some (.userError message) =>
+      unless message.contains "TLS hostname verification requires" do
+        throw (IO.userError s!"unexpected missing-name error: {message}")
+  | some error =>
+      throw (IO.userError s!"unexpected missing-name error: {error}")
+  | none =>
+      throw (IO.userError "TLS connection without a verification name unexpectedly succeeded")
+
   let invalidTrustError? ← try
       let unexpected ← Client.connectTls
         { address := Http2.Server.loopback 1 }
-        { trustAnchorsPEM := some "not a PEM certificate" }
+        {
+          serverName := some "localhost"
+          trustAnchorsPEM := some "not a PEM certificate"
+        }
       Async.block (Client.close unexpected)
       pure none
     catch error =>

@@ -10,11 +10,11 @@ private def expect (condition : Bool) (message : String) : IO Unit := do
 private def expectEq [BEq α] (actual expected : α) (message : String) : IO Unit := do
   expect (actual == expected) message
 
-private def expectOk (result : Except Status α) (description : String) : IO α := do
+private def expectOk [Repr ε] (result : Except ε α) (description : String) : IO α := do
   match result with
   | .ok value => pure value
-  | .error status =>
-      throw (IO.userError s!"{description}: {status.code}: {status.messageD}")
+  | .error error =>
+      throw (IO.userError s!"{description}: {(repr error).pretty}")
 
 /- Timing is only a watchdog around causally ordered Promise/task joins. No
 assertion below depends on elapsed time. -/
@@ -62,7 +62,7 @@ private partial def awaitCondition (description : String) (remaining : Nat)
     awaitCondition description (remaining - 1) condition
 
 private def awaitProcess
-    (task : Task (Except IO.Error (Except Status Unit)))
+    (task : Task (Except IO.Error (Except Grpc.Http2.Connection.ProcessError Unit)))
     (description : String) : IO Unit := do
   match ← awaitTaskResult task description with
   | .error error => throw error
@@ -73,8 +73,8 @@ private def service : String := "lean.test.CancellationParking"
 private def methodNamed (method : String) : MethodName :=
   { service, method }
 
-private def requestMetadata (method : MethodName) : Metadata :=
-  Metadata.empty
+private def requestMetadata (method : MethodName) : _root_.Http2.Headers :=
+  _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":authority" "localhost"
@@ -84,11 +84,11 @@ private def requestMetadata (method : MethodName) : Metadata :=
 
 private structure EncodedRequest where
   wire : ByteArray
-  hpack : Http2.Hpack.State
+  hpack : _root_.Http2.Hpack.State
 
-private def frameWire (frameType : Http2.FrameType) (flags : UInt8)
+private def frameWire (frameType : _root_.Http2.FrameType) (flags : UInt8)
     (streamId : Nat) (payload : ByteArray) : IO ByteArray := do
-  let frame : Http2.Frame := {
+  let frame : _root_.Http2.Frame := {
     header := {
       length := payload.size
       frameType
@@ -97,43 +97,51 @@ private def frameWire (frameType : Http2.FrameType) (flags : UInt8)
     }
     payload
   }
-  expectOk (Http2.Frame.encode frame) "encode HTTP/2 test frame"
+  expectOk (_root_.Http2.Frame.encode frame) "encode HTTP/2 test frame"
 
-private def requestWire (hpack : Http2.Hpack.State) (streamId : Nat)
+private def requestWire (hpack : _root_.Http2.Hpack.State) (streamId : Nat)
     (method : MethodName) (payload : ByteArray) : IO EncodedRequest := do
   let encoded ← expectOk
-    (Http2.Hpack.encodeHeaderBlock hpack (requestMetadata method))
+    (_root_.Http2.Hpack.encodeHeaderBlock hpack (requestMetadata method))
     "encode request header block"
-  let headers ← frameWire .headers Http2.FrameFlag.endHeaders streamId encoded.1
+  let headers ← frameWire .headers _root_.Http2.FrameFlag.endHeaders streamId encoded.1
   let message ← expectOk (Message.encode { data := payload })
     "encode gRPC request message"
-  let data ← frameWire .data Http2.FrameFlag.endStream streamId message
+  let data ← frameWire .data _root_.Http2.FrameFlag.endStream streamId message
   pure { wire := headers.append data, hpack := encoded.2 }
 
 private def resetWire (streamId : Nat) : IO ByteArray := do
-  let frame ← expectOk (Http2.RstStream.frame streamId .cancel)
+  let frame ← expectOk (_root_.Http2.RstStream.frame streamId .cancel)
     "construct peer RST_STREAM"
-  expectOk (Http2.Frame.encode frame) "encode peer RST_STREAM"
+  expectOk (_root_.Http2.Frame.encode frame) "encode peer RST_STREAM"
 
 private structure ConnectionHarness where
-  state : Std.Mutex Http2.Connection.State
-  emitted : IO.Ref (Array Http2.Frame)
+  state : Std.Mutex Grpc.Http2.Connection.State
+  emitted : IO.Ref (Array _root_.Http2.Frame)
 
 private def ConnectionHarness.new : IO ConnectionHarness := do
-  let state ← Std.Mutex.new ({
-    prefaceReceived := true
-    clientSettingsReceived := true
-  } : Http2.Connection.State)
-  let emitted ← IO.mkRef (#[] : Array Http2.Frame)
+  let initial := Grpc.Http2.Connection.initialState
+  let state ← Std.Mutex.new {
+    initial with
+    protocol := {
+      initial.protocol with
+      prefaceReceived := true
+      receivedSettings := true
+    }
+  }
+  let emitted ← IO.mkRef (#[] : Array _root_.Http2.Frame)
   pure { state, emitted }
 
 private def ConnectionHarness.emit (harness : ConnectionHarness)
-    (frames : Array Http2.Frame) : IO Unit :=
+    (frames : Array _root_.Http2.Frame) : IO Unit :=
   harness.emitted.modify fun emitted => emitted.append frames
 
 private def ConnectionHarness.process (harness : ConnectionHarness)
-    (registry : Registry) (wire : ByteArray) : IO (Except Status Unit) :=
-  Http2.Connection.processBytesSharedWith registry harness.state wire harness.emit
+    (registry : Registry) (wire : ByteArray) :
+    IO (Except Grpc.Http2.Connection.ProcessError Unit) :=
+  Std.Async.Async.block <|
+    Grpc.Http2.Connection.processBytesSharedWithOwned
+      registry harness.state wire harness.emit
 
 private def streamIsActive (harness : ConnectionHarness) (streamId : Nat) : IO Bool :=
   harness.state.atomically do
@@ -144,9 +152,6 @@ private def expectResetCleanupEntered (harness : ConnectionHarness) : IO Unit :=
   awaitCondition "RST_STREAM did not detach the cancelled dispatch"
     watchdogMilliseconds do
       pure (!(← streamIsActive harness 1))
-  let state ← harness.state.atomically get
-  expectEq state.lastClientStreamId 1
-    "a later stream was processed before reset cleanup finished"
 
 private def expectFastResponseEventually (harness : ConnectionHarness)
     (entered : IO.Promise Unit) : IO Unit := do
@@ -164,7 +169,8 @@ private def expectFastResponseEventually (harness : ConnectionHarness)
 
 private def cancelHarness (harness : ConnectionHarness) : IO Unit := do
   try
-    discard <| Http2.Connection.cancelActiveShared harness.state
+    discard <| Std.Async.Async.block <|
+      Grpc.Http2.Connection.cancelActiveSharedOwned harness.state
   catch _ =>
     pure ()
 
@@ -190,7 +196,8 @@ private def testResetWaitsForUncooperativeHandler : IO Unit := do
       pure { data := request.data, status := Status.ok })
   let harness ← ConnectionHarness.new
   let processingRef ← IO.mkRef
-    (none : Option (Task (Except IO.Error (Except Status Unit))))
+    (none : Option (Task (Except IO.Error
+      (Except Grpc.Http2.Connection.ProcessError Unit))))
   try
     let slow ← requestWire {} 1 slowMethod "slow".toUTF8
     discard <| expectOk (← harness.process registry slow.wire)
@@ -253,7 +260,8 @@ private def testResetWaitsForUncooperativeStreamCancel : IO Unit := do
       pure { data := request.data, status := Status.ok })
   let harness ← ConnectionHarness.new
   let processingRef ← IO.mkRef
-    (none : Option (Task (Except IO.Error (Except Status Unit))))
+    (none : Option (Task (Except IO.Error
+      (Except Grpc.Http2.Connection.ProcessError Unit))))
   try
     let slow ← requestWire {} 1 streamMethod "stream".toUTF8
     discard <| expectOk (← harness.process registry slow.wire)

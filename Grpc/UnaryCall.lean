@@ -37,7 +37,7 @@ private def optionsFor
     (timeout : String) :
     Grpc.Client.CallOptions := {
   metadata := entries.map fun entry =>
-    Grpc.Header.of entry.name entry.exposeValue
+    _root_.Http2.Header.of entry.name entry.exposeValue
   timeout := some timeout
 }
 
@@ -51,7 +51,7 @@ private theorem optionsFor_metadata
     (entries : Array CredentialEntry) (timeout : String) :
     (optionsFor entries timeout).metadata =
       entries.map (fun entry =>
-        Grpc.Header.of entry.name entry.exposeValue) := by
+        _root_.Http2.Header.of entry.name entry.exposeValue) := by
   rfl
 
 /--
@@ -63,7 +63,8 @@ private theorem optionsFor_singleton_get?
     (entry : CredentialEntry) (timeout : String) :
     ((optionsFor #[entry] timeout).metadata.get? entry.name) =
       some entry.exposeValue := by
-  simp [optionsFor, Grpc.Metadata.get?, Grpc.Metadata.getAll, Grpc.Header.of]
+  simp [optionsFor, _root_.Http2.Headers.get?, _root_.Http2.Headers.getAll,
+    _root_.Http2.Header.of]
 
 /-- Obtain fresh per-call credential entries and build the call options. -/
 private def callOptions
@@ -122,7 +123,8 @@ structure Primitives (Handle : Type) where
   recv? : Handle → Async (Except Grpc.Status (Option ByteArray))
   finish :
     Handle →
-      Async (Except Grpc.Status (Grpc.Status × Grpc.Metadata × Grpc.Metadata))
+      Async (Except Grpc.Status
+        (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers))
   cancel : Handle → Async Unit
 
 /--
@@ -198,15 +200,15 @@ therefore fail closed instead of making retry policy depend on header order.
 Malformed binary metadata is likewise not exposed as typed status evidence.
 -/
 private def statusDetailsFromTrailers
-    (trailers : Grpc.Metadata) : Option ByteArray :=
-  match trailers.getBinaryAll "grpc-status-details-bin" with
+    (trailers : _root_.Http2.Headers) : Option ByteArray :=
+  match Grpc.Metadata.getBinaryAll trailers "grpc-status-details-bin" with
   | .ok values =>
       if values.size == 1 then values[0]? else none
   | .error _ => none
 
 private def rpcErrorFromTerminal
     (status : Grpc.Status)
-    (trailers : Grpc.Metadata) : Error :=
+    (trailers : _root_.Http2.Headers) : Error :=
   .rpc status (statusDetailsFromTrailers trailers)
 
 /--
@@ -217,7 +219,8 @@ details that may describe a different failure.
 private def rpcErrorAfterFinish
     (status : Grpc.Status)
     (finishResult :
-      Except Grpc.Status (Grpc.Status × Grpc.Metadata × Grpc.Metadata)) :
+      Except Grpc.Status
+        (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers)) :
     Error :=
   match finishResult with
   | .ok (terminalStatus, _, trailers) =>

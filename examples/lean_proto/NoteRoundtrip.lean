@@ -107,7 +107,7 @@ def testGeneratedService : IO Unit := do
   let requestBody ← match (Grpc.Message.encode { data := requestData }) with
     | .ok body => pure body
     | .error status => throw (IO.userError status.messageD)
-  let headers := Grpc.Metadata.empty
+  let headers := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Echo"
@@ -123,7 +123,7 @@ def testGeneratedService : IO Unit := do
     "generated service should preserve Lean keyword-like proto fields"
   assertEq response.status.code Grpc.Code.ok "generated service response should be OK"
 
-  let slowHeaders := Grpc.Metadata.empty
+  let slowHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Slow"
@@ -136,7 +136,7 @@ def testGeneratedService : IO Unit := do
   assertEq slowStatus.code Grpc.Code.deadlineExceeded
     "generated slow service should map grpc-timeout to DEADLINE_EXCEEDED"
 
-  let failHeaders := Grpc.Metadata.empty
+  let failHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Fail"
@@ -150,7 +150,7 @@ def testGeneratedService : IO Unit := do
   assertEq failStatus.message (some "invalid note from generated service")
     "generated failing service should preserve explicit handler status message"
 
-  let metaHeaders := Grpc.Metadata.empty
+  let metaHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Meta"
@@ -173,7 +173,7 @@ def testGeneratedService : IO Unit := do
   assertEq metaResponse.status.code Grpc.Code.ok
     "generated imported-type unary response should be OK"
 
-  let streamHeaders := Grpc.Metadata.empty
+  let streamHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/List"
@@ -187,7 +187,7 @@ def testGeneratedService : IO Unit := do
   assertEq second.title "lean proto two" "second generated server-streaming response did not decode"
   assertEq streamResponse.status.code Grpc.Code.ok "generated server-streaming response should be OK"
 
-  let collectHeaders := Grpc.Metadata.empty
+  let collectHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Collect"
@@ -204,7 +204,7 @@ def testGeneratedService : IO Unit := do
   assertEq collected.priority (24 : Int32) "generated client-streaming response should aggregate priority"
   assertEq collectResponse.status.code Grpc.Code.ok "generated client-streaming response should be OK"
 
-  let chatHeaders := Grpc.Metadata.empty
+  let chatHeaders := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" "/lean.example.proto.NoteService/Chat"

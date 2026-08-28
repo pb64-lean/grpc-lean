@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # gRPC-over-TLS interoperability gate: drives the Lean `serveTls` server with
 # grpcurl (grpc-go) and openssl s_client. Everything below the TCP socket --
-# TLS 1.3, ALPN "h2", HTTP/2 and gRPC -- is Lean code from this repo and
-# ../tls13-lean; the client is an independent implementation.
+# TLS 1.3, ALPN "h2", HTTP/2, and gRPC -- is provided by the Lean server under
+# test; the client is an independent implementation.
 #
 # Tagged manual/local: it binds a loopback port and shells out to host tools,
 # so `bazel test //...` skips it. Run it with grpcurl and openssl on PATH:

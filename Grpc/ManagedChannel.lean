@@ -5,7 +5,7 @@ public import Grpc.Cancellation
 public import Grpc.ChannelOwner
 public import Grpc.ManagedChannel.Config
 public import Grpc.NameResolver
-public import Grpc.TrustAnchors
+public import Http2.TrustAnchors
 public import Grpc.UnaryCall
 public import Std.Async.Timer
 public import Std.Sync.CancellationToken
@@ -74,7 +74,7 @@ inductive ChannelCredentials where
   | tls (policy : TlsPolicy)
 
 structure ConnectAttempt where
-  address : NameResolver.Address
+  address : _root_.Http2.NameResolver.Address
   authority : String
   scheme : String
   credentials : ChannelCredentials
@@ -122,11 +122,11 @@ structure Connector (Resource : Type) where
 structure ManagedChannel.Dependencies (Resource : Type) where
   resolve :
     Endpoint →
-      IO (Except NameResolver.Error
-        (Array NameResolver.Address))
+      IO (Except _root_.Http2.NameResolver.Error
+        (Array _root_.Http2.NameResolver.Address))
   loadTrust :
-    IO (Except TrustAnchors.Error
-      TrustAnchors.Bundle)
+    IO (Except _root_.Http2.TrustAnchors.Error
+      _root_.Http2.TrustAnchors.Bundle)
   connector : Connector Resource
   /--
   Deterministic pre-acquisition failure seam. Production leaves this empty;
@@ -899,7 +899,7 @@ private partial def tryAddresses
     (configuration : ManagedChannel.Config)
     (connector : Connector Resource)
     (credentials : ChannelCredentials)
-    (addresses : List NameResolver.Address)
+    (addresses : List _root_.Http2.NameResolver.Address)
     (sawAlpnFailure : Bool := false) :
     IO (Except (OwnedOpenFailure Resource) (Subchannel Resource)) := do
   match addresses with
@@ -1007,7 +1007,7 @@ private partial def tryAddresses
 private def resolved
     (dependencies : ManagedChannel.Dependencies Resource) (endpoint : Endpoint) :
     IO (Except (OwnedOpenFailure Resource)
-      (Array NameResolver.Address)) := do
+      (Array _root_.Http2.NameResolver.Address)) := do
   try
     match ← dependencies.resolve endpoint with
     | .ok addresses => pure (.ok addresses)
@@ -1021,7 +1021,7 @@ private def resolved
 private def trustBundle
     (dependencies : ManagedChannel.Dependencies Resource) :
     IO (Except (OwnedOpenFailure Resource)
-      TrustAnchors.Bundle) := do
+      _root_.Http2.TrustAnchors.Bundle) := do
   try
     match ← dependencies.loadTrust with
     | .ok bundle => pure (.ok bundle)
@@ -1110,14 +1110,14 @@ def Connector.production : Connector Grpc.Client.Connection := {
       pure .failed
   selectedAlpn := fun connection =>
     match connection.tls with
-    | some session => Grpc.Tls.ClientSession.alpnSelected session
+    | some session => _root_.Http2.Tls.ClientSession.alpnSelected session
     | none => pure none
   close := closeGrpcConnection
 }
 
 def ManagedChannel.Dependencies.production : ManagedChannel.Dependencies Grpc.Client.Connection := {
   resolve := NameResolver.resolve
-  loadTrust := TrustAnchors.load
+  loadTrust := _root_.Http2.TrustAnchors.load
   connector := Connector.production
 }
 
@@ -2693,8 +2693,8 @@ private def SharedState.quarantineInitializationUncertainty
   })
 
 private abbrev TrustPreparationResult :=
-  Except TrustAnchors.Error
-    TrustAnchors.Bundle
+  Except _root_.Http2.TrustAnchors.Error
+    _root_.Http2.TrustAnchors.Bundle
 
 /-!
 Trust preparation is process-local policy, not part of a connection

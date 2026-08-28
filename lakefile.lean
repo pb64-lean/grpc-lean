@@ -17,10 +17,15 @@ Use Bazel for validation:
 package «rules-lean-grpc» where
   leanOptions := #[⟨`experimental.module, true⟩]
 
-require «tls13-lean» from "../tls13-lean"
+require «tls13-lean» from git
+  "https://github.com/pb64-lean/tls13-lean.git" @
+  "4fa14fe068d9ea17c85294a6a27c224b2de5cddb"
+require «http2-lean» from git
+  "https://github.com/pb64-lean/http2-lean.git" @
+  "82fc066025f3e5fdec54c836f4e9659c2f8176ab"
 
-/- Keep the editor's Lake module graph aligned with the local repositories in
-   MODULE.bazel.  These are source roots only; Bazel remains the build system. -/
+/- Keep the editor's Lake module graph aligned with MODULE.bazel. Bazel remains
+   the authoritative build system. -/
 lean_lib «Binary» where
   srcDir := "third_party/Lean-zh/binary"
 

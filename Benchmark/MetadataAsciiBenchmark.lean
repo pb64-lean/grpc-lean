@@ -3,9 +3,9 @@ import Grpc
 open Grpc
 
 /-!
-# Metadata ASCII-validation benchmark
+# _root_.Http2.Headers ASCII-validation benchmark
 
-Measures the production `Metadata.validateHeader` path for ordinary non-binary
+Measures the production `Grpc.Metadata.validateHeader` path for ordinary non-binary
 metadata.  The benchmark-local reference retains the pre-change `String.all`
 predicates; fixture construction, exact result comparison, warmup, and final
 validation stay outside the reported samples.  A constant-size result digest
@@ -19,7 +19,7 @@ common-path performance claim.
 
 private structure Fixture where
   label : String
-  headers : Array Header
+  headers : Array _root_.Http2.Header
   expectedDigestPerSweep : Nat
 
 private def referenceHeaderName (name : String) : Bool :=
@@ -31,7 +31,7 @@ private def referenceVisibleValue (value : String) : Bool :=
   value.all fun character =>
     0x20 <= character.toNat && character.toNat <= 0x7e
 
-private def referenceValidateHeader (header : Header) : Except Status Unit := do
+private def referenceValidateHeader (header : _root_.Http2.Header) : Except Status Unit := do
   if !referenceHeaderName header.name then
     throw (Status.invalidArgument s!"invalid gRPC metadata name {header.name}")
   if referenceVisibleValue header.value then
@@ -49,7 +49,7 @@ private def sameResult (left right : Except Status Unit) : Bool :=
   | .ok () => 1
   | .error status => 17 + status.messageD.utf8ByteSize
 
-private def header (name value : String) : Header := { name, value }
+private def header (name value : String) : _root_.Http2.Header := { name, value }
 
 private def visibleValue (size seed : Nat) : String := Id.run do
   let mut value := ""
@@ -61,7 +61,7 @@ private def withCharacter (before : String) (character : Char)
     (after : String := "") : String :=
   (before.push character).append after
 
-private def makeFixture (label : String) (headers : Array Header) : IO Fixture := do
+private def makeFixture (label : String) (headers : Array _root_.Http2.Header) : IO Fixture := do
   unless !headers.isEmpty do
     throw (IO.userError s!"{label}: fixture is empty")
   let mut expectedDigestPerSweep := 0
@@ -71,7 +71,7 @@ private def makeFixture (label : String) (headers : Array Header) : IO Fixture :
           |>.contains current.name) then
       throw (IO.userError s!"{label}: fixture escaped the ordinary metadata path")
     let expected := referenceValidateHeader current
-    let actual := Metadata.validateHeader current
+    let actual := Grpc.Metadata.validateHeader current
     unless sameResult actual expected do
       throw (IO.userError <|
         s!"{label}: production/reference disagreement for " ++
@@ -84,7 +84,7 @@ private def makeFixture (label : String) (headers : Array Header) : IO Fixture :
   let mut checksum := 0
   for _ in [0:iterations] do
     for current in fixture.headers do
-      checksum := checksum + resultDigest (Metadata.validateHeader current)
+      checksum := checksum + resultDigest (Grpc.Metadata.validateHeader current)
   pure checksum
 
 private def expectedChecksum (fixture : @& Fixture) (iterations : Nat) : Nat :=
@@ -198,7 +198,7 @@ def main (args : List String) : IO Unit := do
   let fixtures := #[typical, names, values8, values32, values128, invalidControls]
 
   IO.println <| "benchmark=metadata_ascii_validation_v1 " ++
-    s!"path=Metadata.validateHeader selection={selection} validation=pass"
+    s!"path=Grpc.Metadata.validateHeader selection={selection} validation=pass"
   for fixture in fixtures do
     if selection == "all" || selection == fixture.label then
       let mut samples := #[]

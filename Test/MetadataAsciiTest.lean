@@ -100,7 +100,7 @@ private def sameValidation (left right : Except Status Unit) : Bool :=
   | .error left, .error right => left.code == right.code && left.message == right.message
   | _, _ => false
 
-private def referenceValidateOrdinary (header : Header) : Except Status Unit := do
+private def referenceValidateOrdinary (header : _root_.Http2.Header) : Except Status Unit := do
   if !referenceHeaderName header.name then
     throw (Status.invalidArgument s!"invalid gRPC metadata name {header.name}")
   if referenceVisibleString header.value then
@@ -109,7 +109,7 @@ private def referenceValidateOrdinary (header : Header) : Except Status Unit := 
     throw (Status.invalidArgument s!"invalid ASCII gRPC metadata value for {header.name}")
 
 private def testValidationRouting : IO Unit := do
-  let cases : Array Header := #[
+  let cases : Array _root_.Http2.Header := #[
     { name := "x-meta", value := "" },
     { name := "x-meta", value := " " },
     { name := "x-meta", value := "~" },
@@ -120,7 +120,7 @@ private def testValidationRouting : IO Unit := do
   ]
   for current in cases do
     let expected := referenceValidateOrdinary current
-    let actual := Metadata.validateHeader current
+    let actual := Grpc.Metadata.validateHeader current
     expect (sameValidation actual expected)
       s!"validateHeader changed result or rejection precedence for {repr current}"
 

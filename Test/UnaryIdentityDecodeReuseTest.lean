@@ -20,7 +20,7 @@ private def method : MethodName := {
   method := "Unary"
 }
 
-private def metadata : Metadata := Metadata.empty
+private def metadata : _root_.Http2.Headers := _root_.Http2.Headers.empty
 
 private def preflight (usesGzip : Bool) (contentLength : Option Nat := none) :
     Headers.RequestPreflight := {

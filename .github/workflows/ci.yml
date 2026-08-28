@@ -20,8 +20,6 @@ concurrency:
 jobs:
   test:
     uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
-    with:
-      siblings: rules_lean tls13-lean
 
   interop:
     # Explicit target name runs it despite its `manual` tag. The client
@@ -30,7 +28,6 @@ jobs:
     needs: test
     uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
     with:
-      siblings: rules_lean tls13-lean
       targets: "//examples/lean_proto:note_grpcurl_interop_test //examples/lean_proto:note_grpcurl_tls_interop_test"
       extra_args: "--test_env=TEST_GRPC_PORT=50153 --test_env=TEST_GRPC_TLS_PORT=50154 --flaky_test_attempts=3"
       timeout_minutes: 30

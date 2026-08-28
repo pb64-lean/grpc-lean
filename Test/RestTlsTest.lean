@@ -1,10 +1,11 @@
 import Std.Async.TCP
 
 import Grpc.Tls.Rest
-import Grpc.Tls.Session
+import Http2.Tls.Session
 import Tls.Client
 
 open Grpc.Tls
+open _root_.Http2.Tls
 open Tls
 open Std.Async
 open Std.Net

@@ -41,7 +41,7 @@ def testRegistry : Registry :=
         let count := (request.data[0]?.getD 0).toNat
         let items := Array.ofFn (n := count) fun i => s!"item-{i.val}".toUTF8
         pure {
-          metadata := Metadata.empty.insert "served-by" "range",
+          metadata := _root_.Http2.Headers.empty.insert "served-by" "range",
           messages := ← MessageStream.ofArray items,
           status := Status.ok
         })
@@ -72,7 +72,7 @@ def testServerStreamingBasic (client : Client.Connection) : Async Unit := do
   expectEq result.messages.size 5 "Range should stream five messages"
   for i in [0:5] do
     expectEq result.messages[i]! s!"item-{i}".toUTF8 s!"Range message {i} should match"
-  expectEq (Metadata.get? result.headers "served-by") (some "range")
+  expectEq (_root_.Http2.Headers.get? result.headers "served-by") (some "range")
     "initial response metadata should arrive"
   IO.println "server-streaming basic ok"
 
@@ -252,7 +252,7 @@ def describeCause : Http2.Server.CloseCause → String
   | .peerClosed => "peerClosed"
   | .serverShutdown => "serverShutdown"
   | .keepaliveTimeout => "keepaliveTimeout"
-  | .protocolError status => s!"protocolError({status.messageD})"
+  | .protocolError error => s!"protocolError({error.message})"
   | .transportError message => s!"transportError({message})"
 
 /-- What the server itself says about the connections it closed and about the health

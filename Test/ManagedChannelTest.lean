@@ -1,4 +1,6 @@
 import Grpc
+import Http2.NameResolver
+import Http2.TrustAnchors
 import Test.CertificateFixtures
 
 namespace ManagedChannelTest
@@ -39,7 +41,7 @@ private def apiConfiguration (endpointText : String) :
 private def addresses
     (configuration : Grpc.ManagedChannel.Config)
     (raw : Array String) :
-    IO (Array NameResolver.Address) := do
+    IO (Array _root_.Http2.NameResolver.Address) := do
   match ← NameResolver.resolveWith (fun _ _ => pure (.ok raw))
       configuration.endpoint with
   | .ok addresses => pure addresses
@@ -48,11 +50,11 @@ private def addresses
 private def validPem : String :=
   CertificateFixtures.validCertificatePem
 
-private def trustBundle : IO TrustAnchors.Bundle := do
-  let backend : TrustAnchors.Backend := {
+private def trustBundle : IO _root_.Http2.TrustAnchors.Bundle := do
+  let backend : _root_.Http2.TrustAnchors.Backend := {
     platform := .linux
     getEnvironment := fun name =>
-      if name == TrustAnchors.sslCertFileVariable then
+      if name == _root_.Http2.TrustAnchors.sslCertFileVariable then
         pure (some "/test/anchors.pem")
       else
         pure none
@@ -60,7 +62,7 @@ private def trustBundle : IO TrustAnchors.Bundle := do
       pure (.error (IO.userError "unexpected trust path probe"))
     read := fun _ => pure (.ok validPem.toUTF8)
   }
-  match ← TrustAnchors.loadWith backend with
+  match ← _root_.Http2.TrustAnchors.loadWith backend with
   | .ok bundle => pure bundle
   | .error error => fail s!"test trust bundle failed: {error}"
 
@@ -2156,7 +2158,7 @@ private def testMismatchedCleanupFailureIsQuarantined : IO Unit := do
 
 private def makeCleanupFailure
     (configuration : Grpc.ManagedChannel.Config)
-    (destinations : Array Grpc.NameResolver.Address)
+    (destinations : Array _root_.Http2.NameResolver.Address)
     (resource : Nat)
     (closeCount : IO.Ref Nat)
     (detail : String) : IO (OwnedOpenFailure Nat) := do
@@ -3289,7 +3291,7 @@ private def testTrustPreparationIsTerminalAndPinned : IO Unit := do
       pure (.ok destinations)
     loadTrust := do
       failedLoads.modify (· + 1)
-      pure (.error (.emptyExplicitPath TrustAnchors.sslCertFileVariable))
+      pure (.error (.emptyExplicitPath _root_.Http2.TrustAnchors.sslCertFileVariable))
     connector := {
       connect := fun _ _ => do
         failedConnects.modify (· + 1)
@@ -3463,7 +3465,7 @@ private def testConnectorInvariantPoisonsSharedClose : IO Unit := do
     "repeated invariant close retried an effect"
 
 private def invariantCleanupDependencies
-    (destinations : Array Grpc.NameResolver.Address)
+    (destinations : Array _root_.Http2.NameResolver.Address)
     (firstResource : Nat)
     (connectCount : IO.Ref Nat)
     (oldReceipt : IO.Ref (Option (RegistrationReceipt Nat)))

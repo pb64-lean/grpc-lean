@@ -1,7 +1,7 @@
 module
 
 public import Grpc.Status
-import Grpc.Bytes
+import Http2.Bytes
 import Zlib.Gzip
 
 public section
@@ -89,7 +89,8 @@ private def encodeCandidate (message : Message) : Except Status ByteArray :=
 private theorem appendUInt32BE_append_left (pre out : ByteArray) (n : Nat) :
     appendUInt32BE (pre ++ out) n = pre ++ appendUInt32BE out n := by
   simp only [appendUInt32BE]
-  rw [Bytes.append_push, Bytes.append_push, Bytes.append_push, Bytes.append_push]
+  rw [_root_.Http2.Bytes.append_push, _root_.Http2.Bytes.append_push,
+    _root_.Http2.Bytes.append_push, _root_.Http2.Bytes.append_push]
 
 private theorem appendUInt32BE_eq_append (out : ByteArray) (n : Nat) :
     appendUInt32BE out n = out ++ uint32BE n := by
@@ -628,10 +629,16 @@ def decompress (usesGzip : Bool) (maxSize : Nat) (message : Message) :
         | none => throw (Status.internal "failed to decompress gzip gRPC message")
 
 /-- Build a message for `data`, gzip-compressing it when it meets the size
-threshold; smaller payloads keep the identity flag (allowed per-message). -/
+threshold and compression is beneficial. Smaller or incompressible payloads
+keep the identity flag, so negotiated compression never expands the retained
+or transmitted message. -/
 def gzipped (data : ByteArray) : Message :=
   if data.size >= gzipCompressThreshold then
-    { compressed := .compressed, data := Zlib.Gzip.compress data }
+    let compressed := Zlib.Gzip.compress data
+    if compressed.size < data.size then
+      { compressed := .compressed, data := compressed }
+    else
+      { data := data }
   else
     { data := data }
 
@@ -651,12 +658,25 @@ def BodyPreparation.body : BodyPreparation → ByteArray → ByteArray
   | .identity _, original => original
   | .rewritten body, _ => body
 
+private def ensureRetainedIdentityBodySize (maxDataSize? : Option Nat)
+    (body : ByteArray) : Except Status Unit :=
+  let retainedLimit := prefixLength + maxDataSize?.getD defaultMaxDecompressedSize
+  if body.size > retainedLimit then
+    .error (Status.resourceExhausted
+      s!"gRPC aggregate request exceeds retained decoded-byte limit {retainedLimit}")
+  else
+    .ok ()
+
 private def rewriteCompressedBody (usesGzip : Bool) (maxDataSize? : Option Nat)
     (messages : Array Message) : Except Status ByteArray := do
   let maxSize := maxDataSize?.getD defaultMaxDecompressedSize
+  let retainedLimit := prefixLength + maxSize
   messages.foldlM (init := ByteArray.empty) fun out message => do
     let message ← decompress usesGzip maxSize message
     let encoded ← encode message
+    if out.size + encoded.size > retainedLimit then
+      throw (Status.resourceExhausted
+        s!"gRPC aggregate request exceeds retained decoded-byte limit {retainedLimit}")
     pure (out.append encoded)
 
 /-- Validate and normalize a complete aggregate body while retaining the
@@ -669,6 +689,7 @@ def prepareBody (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArray)
     Except Status BodyPreparation := do
   let messages ← decodeAllWithLimit maxDataSize? body
   if messages.all (fun message => message.compressed == .identity) then
+    let _ ← ensureRetainedIdentityBodySize maxDataSize? body
     pure (.identity messages)
   else
     pure (.rewritten (← rewriteCompressedBody usesGzip maxDataSize? messages))
@@ -680,6 +701,7 @@ def decompressBody (usesGzip : Bool) (maxDataSize? : Option Nat) (body : ByteArr
     Except Status ByteArray := do
   let messages ← decodeAllWithLimit maxDataSize? body
   if messages.all (fun message => message.compressed == .identity) then
+    let _ ← ensureRetainedIdentityBodySize maxDataSize? body
     pure body
   else
     rewriteCompressedBody usesGzip maxDataSize? messages
@@ -697,7 +719,8 @@ theorem prepareBody_body (usesGzip : Bool) (maxDataSize? : Option Nat)
   | ok messages =>
       simp only [bind, Except.bind]
       split
-      next => rfl
+      next =>
+        cases hretained : ensureRetainedIdentityBodySize maxDataSize? body <;> rfl
       next =>
         cases hrewrite : rewriteCompressedBody usesGzip maxDataSize? messages <;> rfl
 

@@ -83,14 +83,14 @@ def main : IO Unit := do
   expect ((Message.gzipped payload).compressed == .compressed)
     "large messages should be gzip-compressed"
 
-  -- Header helpers.
+  -- _root_.Http2.Header helpers.
   expect (Headers.acceptedEncodings == "identity,gzip")
     "server should advertise identity,gzip"
   expect (Headers.clientAcceptsGzip
-      (Metadata.empty.insert "grpc-accept-encoding" "identity, gzip"))
+      (_root_.Http2.Headers.empty.insert "grpc-accept-encoding" "identity, gzip"))
     "client accept-encoding list containing gzip should be detected"
   expect (!Headers.clientAcceptsGzip
-      (Metadata.empty.insert "grpc-accept-encoding" "identity"))
+      (_root_.Http2.Headers.empty.insert "grpc-accept-encoding" "identity"))
     "identity-only accept-encoding should not enable gzip"
 
   -- The executable fast path and fused fallback must return exactly the same

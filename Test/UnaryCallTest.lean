@@ -72,7 +72,8 @@ private structure ScriptedCall where
   sent : IO.Ref (Option ByteArray)
   responses : IO.Ref (List ByteArray)
   finishResult :
-    Except Grpc.Status (Grpc.Status × Grpc.Metadata × Grpc.Metadata)
+    Except Grpc.Status
+      (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers)
 
 private def scriptedPrimitives : Primitives ScriptedCall where
   send := fun call message => do
@@ -99,10 +100,10 @@ private def scriptedCall
     (events : IO.Ref (Array String))
     (responses : List ByteArray)
     (finishResult : Except Grpc.Status Grpc.Status := .ok Grpc.Status.ok)
-    (trailers : Grpc.Metadata := Grpc.Metadata.empty) :
+    (trailers : _root_.Http2.Headers := _root_.Http2.Headers.empty) :
     IO ScriptedCall := do
   let finishResult := match finishResult with
-    | .ok status => .ok (status, Grpc.Metadata.empty, trailers)
+    | .ok status => .ok (status, _root_.Http2.Headers.empty, trailers)
     | .error status => .error status
   pure {
     events
@@ -205,7 +206,7 @@ private def testStatusDetailsTrailers : IO Unit := do
 
   -- `insertBinary` exercises the metadata layer's normal unpadded `-bin` encoding.
   let unpaddedDetails := "unpadded-rich-status".toUTF8
-  let unpaddedTrailers := Grpc.Metadata.empty.insertBinary
+  let unpaddedTrailers := Grpc.Metadata.insertBinary _root_.Http2.Headers.empty
     "grpc-status-details-bin" unpaddedDetails
   let unpaddedEvents ← IO.mkRef #[]
   let unpaddedCall ← scriptedCall unpaddedEvents ["ignored".toUTF8]
@@ -246,7 +247,7 @@ private def testStatusDetailsTrailers : IO Unit := do
 
   -- Peers may send the standard padded base64 spelling as well.
   let paddedDetails := ByteArray.empty.push 1 |>.push 2
-  let paddedTrailers := Grpc.Metadata.empty.insert
+  let paddedTrailers := _root_.Http2.Headers.empty.insert
     "grpc-status-details-bin" "AQI="
   let paddedEvents ← IO.mkRef #[]
   let paddedCall ← scriptedCall paddedEvents ["ignored".toUTF8]
@@ -257,9 +258,11 @@ private def testStatusDetailsTrailers : IO Unit := do
         "padded grpc-status-details-bin was not decoded exactly"
   | result => fail s!"padded status details returned {repr result}"
 
-  let duplicateTrailers := Grpc.Metadata.empty
-    |>.insertBinary "grpc-status-details-bin" "first-details".toUTF8
-    |>.insertBinary "grpc-status-details-bin" "second-details".toUTF8
+  let duplicateTrailers :=
+    Grpc.Metadata.insertBinary
+      (Grpc.Metadata.insertBinary _root_.Http2.Headers.empty
+        "grpc-status-details-bin" "first-details".toUTF8)
+      "grpc-status-details-bin" "second-details".toUTF8
   let duplicateEvents ← IO.mkRef #[]
   let duplicateCall ← scriptedCall duplicateEvents ["ignored".toUTF8]
     (.ok denied) duplicateTrailers
@@ -270,7 +273,7 @@ private def testStatusDetailsTrailers : IO Unit := do
   | result =>
       fail s!"duplicate grpc-status-details-bin did not fail closed: {repr result}"
 
-  let malformedTrailers := Grpc.Metadata.empty.insert
+  let malformedTrailers := _root_.Http2.Headers.empty.insert
     "grpc-status-details-bin" "not%%%base64"
   let malformedEvents ← IO.mkRef #[]
   let malformedCall ← scriptedCall malformedEvents ["ignored".toUTF8]
@@ -285,7 +288,7 @@ private def testStatusDetailsTrailers : IO Unit := do
 private def testFastActionErrorsRecoverStatusDetails : IO Unit := do
   let actionStatus := Grpc.Status.error .failedPrecondition "rejected early"
   let details := "fast-action-status-details".toUTF8
-  let trailers := Grpc.Metadata.empty.insertBinary
+  let trailers := Grpc.Metadata.insertBinary _root_.Http2.Headers.empty
     "grpc-status-details-bin" details
 
   let sendEvents ← IO.mkRef #[]
@@ -463,7 +466,7 @@ private def completionRacePrimitives : Primitives CompletionRaceCall where
     match call.terminalStatus with
     | some status => pure (.error status)
     | none => pure (.ok
-        (Grpc.Status.ok, Grpc.Metadata.empty, Grpc.Metadata.empty))
+        (Grpc.Status.ok, _root_.Http2.Headers.empty, _root_.Http2.Headers.empty))
   cancel := fun call =>
     record call.events "cancel"
 
@@ -550,7 +553,8 @@ private structure PostCancelCall where
   cancels : IO.Ref Nat
   outcome : PostCancelOutcome
   finishResult :
-    Except Grpc.Status (Grpc.Status × Grpc.Metadata × Grpc.Metadata)
+    Except Grpc.Status
+      (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers)
 
 private def postCancelPrimitives : Primitives PostCancelCall where
   send := fun call _ => do
@@ -600,7 +604,7 @@ private def runPostCancel
     cancels := ← IO.mkRef 0
     outcome
     finishResult := .ok
-      (Grpc.Status.ok, Grpc.Metadata.empty, Grpc.Metadata.empty)
+      (Grpc.Status.ok, _root_.Http2.Headers.empty, _root_.Http2.Headers.empty)
   }
   let deadlineDriver : DeadlineDriver := {
     arm := fun _ => pure {
@@ -674,7 +678,7 @@ private def testPostCancelPreservesPeerStatusDetails : IO Unit := do
   let events ← IO.mkRef #[]
   let recvEntered ← IO.Promise.new
   let details := "peer-cancel-status-details".toUTF8
-  let trailers := Grpc.Metadata.empty.insertBinary
+  let trailers := Grpc.Metadata.insertBinary _root_.Http2.Headers.empty
     "grpc-status-details-bin" details
   -- Deliberately use `Grpc.Client`'s byte-equal local-cancel sentinel.  The rich
   -- trailer is terminal peer evidence and must prevent local reclassification.
@@ -686,7 +690,7 @@ private def testPostCancelPreservesPeerStatusDetails : IO Unit := do
     cancels := ← IO.mkRef 0
     outcome := .status locallyCancelledStatus
     finishResult := .ok
-      (locallyCancelledStatus, Grpc.Metadata.empty, trailers)
+      (locallyCancelledStatus, _root_.Http2.Headers.empty, trailers)
   }
   let deadlineDriver : DeadlineDriver := {
     arm := fun _ => pure {
@@ -1014,14 +1018,14 @@ private def testTokenCancelCommitsOnceAndWakesSelectors : IO Unit := do
       Selectable.case token.selector fun _ => pure (),
       Selectable.case bystander.selector fun _ => pure ()
     ]).block
-  expect (← Grpc.CancellationToken.cancel token)
+  expect (← _root_.Http2.CancellationToken.cancel token)
     "first callback-safe cancellation did not perform the transition"
   match ← IO.wait race with
   | .ok () => pure ()
   | .error error => fail s!"callback-safe cancellation race failed: {error}"
   expect (← token.isCancelled)
     "callback-safe cancellation did not publish the sticky transition"
-  expect (!(← Grpc.CancellationToken.cancel token))
+  expect (!(← _root_.Http2.CancellationToken.cancel token))
     "repeated callback-safe cancellation claimed the one transition again"
 
 def run : IO Unit := do

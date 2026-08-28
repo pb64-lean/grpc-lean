@@ -16,11 +16,11 @@ private def framePayload : ByteArray :=
 
 private def frameWire : IO ByteArray := do
   let payload := framePayload
-  match Http2.Frame.encode {
+  match _root_.Http2.Frame.encode {
       header := {
         length := payload.size
         frameType := .data
-        flags := Http2.FrameFlag.endStream
+        flags := _root_.Http2.FrameFlag.endStream
         streamId := 1
       }
       payload := payload
@@ -33,9 +33,9 @@ private def messageWire : IO ByteArray := do
   | .ok wire => pure wire
   | .error status => throw (IO.userError status.messageD)
 
-private def decodeFrameChunk (state : Http2.Frame.DecodeState) (chunk : ByteArray) :
-    IO Http2.Frame.DecodeState := do
-  match Http2.Frame.decodeChunk state chunk with
+private def decodeFrameChunk (state : _root_.Http2.Frame.DecodeState) (chunk : ByteArray) :
+    IO _root_.Http2.Frame.DecodeState := do
+  match _root_.Http2.Frame.decodeChunk state chunk with
   | .ok decoded => pure decoded
   | .error status => throw (IO.userError status.messageD)
 
@@ -46,7 +46,7 @@ private def decodeMessageChunk (state : Message.DecodeState) (chunk : ByteArray)
   | .error status => throw (IO.userError status.messageD)
 
 private def validateFrameSplits (wire : ByteArray) : IO Unit := do
-  let expected ← match Http2.Frame.decodeAll wire with
+  let expected ← match _root_.Http2.Frame.decodeAll wire with
     | .ok frames => pure frames
     | .error status => throw (IO.userError status.messageD)
   for split in [0:wire.size + 1] do

@@ -6,7 +6,6 @@ public import Grpc.ChannelInitialization
 public import Grpc.ChannelLease
 public import Grpc.ChannelOwner
 public import Grpc.Client
-public import Grpc.Dns
 public import Grpc.Endpoint
 public import Grpc.Framing
 public import Grpc.Http2
@@ -14,13 +13,11 @@ public import Grpc.ManagedChannel
 public import Grpc.ManagedChannel.Config
 public import Grpc.Metadata
 public import Grpc.NameResolver
-public import Grpc.Posix
 public import Grpc.Protocol
 public import Grpc.Server
 public import Grpc.Services.Health
 public import Grpc.Services.Reflection
 public import Grpc.Status
-public import Grpc.TrustAnchors
 public import Grpc.UnaryCall
 
 public section
@@ -42,11 +39,6 @@ def anyIPv4 (port : UInt16) : Std.Net.SocketAddress :=
 
 def bind (config : Config := {}) : IO Instance :=
   Http2.Server.bind config
-
-def serveClientWithState (registry : Registry) (config : Config)
-    (client : Std.Async.TCP.Socket.Client) (state : Http2.Connection.State := {}) :
-    Std.Async.Async Http2.Connection.State :=
-  Http2.Server.serveClientWithState registry config client state
 
 def serveClient (registry : Registry) (config : Config)
     (client : Std.Async.TCP.Socket.Client) : Std.Async.Async Unit :=

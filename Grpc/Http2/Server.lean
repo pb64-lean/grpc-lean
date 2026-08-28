@@ -5,15 +5,20 @@ public import Std.Async.Timer
 public import Std.Sync.CancellationToken
 public import Std.Sync.Channel
 
-public import Grpc.CancellationToken
+public import Http2.CancellationToken
 public import Grpc.Http2.Connection
-public import Grpc.Tls.Session
+public import Http2.Tls.Session
 
 public section
 
 namespace Grpc
 namespace Http2
 namespace Server
+
+private def ofHttp2 {α} (result : Except _root_.Http2.Error α) : Except Status α :=
+  match result with
+  | .ok value => .ok value
+  | .error error => .error (Status.ofHttp2Error error)
 
 open Std
 open Std.Net
@@ -27,19 +32,16 @@ structure Config where
   backlog : UInt32 := 1024
   readSize : UInt64 := 16384
   noDelay : Bool := true
-  maxConcurrentStreams : Option Nat := none
+  /-- Finite default keeps per-stream request bounds compositional at the
+  connection level. Set explicitly to `none` only for a trusted deployment
+  that supplies an independent admission bound. -/
+  maxConcurrentStreams : Option Nat := some 100
   maxHeaderListSize : Option Nat := none
   /-- Milliseconds between server-initiated keepalive PINGs; `none` disables keepalive. -/
   keepaliveIntervalMs : Option Nat := none
   /-- Milliseconds to wait for a keepalive PING ack before closing the connection. -/
   keepaliveTimeoutMs : Nat := 20000
   deriving Inhabited
-
-/-- The independent application protocols served on one HTTP/2 connection.
-Extended CONNECT is advertised only when a handler is present. -/
-structure Applications where
-  grpc : Registry := Registry.empty
-  extendedConnect : Option ExtendedConnect.Handler := none
 
 /-- Why a managed connection is being torn down.  Every teardown path records one,
 so a connection that dies is attributable both to the peer (through the GOAWAY the
@@ -52,7 +54,7 @@ inductive CloseCause where
   /-- The peer never acknowledged a keepalive PING within the timeout. -/
   | keepaliveTimeout
   /-- The connection hit an HTTP/2 or gRPC connection error. -/
-  | protocolError (status : Status)
+  | protocolError (error : Connection.ProcessError)
   /-- The connection task itself failed (socket write, preface encoding, ...). -/
   | transportError (message : String)
   deriving Inhabited, Repr
@@ -69,19 +71,19 @@ def notifiesPeer : CloseCause → Bool
 violation by either endpoint — RFC 9113 §6.8 has no code for "peer stopped
 answering", and NO_ERROR plus debug data says "going away, here is why" without
 libelling the peer's framing. -/
-def errorCode : CloseCause → ErrorCode
-  | .peerClosed => ErrorCode.noError
-  | .serverShutdown => ErrorCode.noError
-  | .keepaliveTimeout => ErrorCode.noError
-  | .protocolError _ => ErrorCode.internalError
-  | .transportError _ => ErrorCode.internalError
+def errorCode : CloseCause → _root_.Http2.ErrorCode
+  | .peerClosed => _root_.Http2.ErrorCode.noError
+  | .serverShutdown => _root_.Http2.ErrorCode.noError
+  | .keepaliveTimeout => _root_.Http2.ErrorCode.noError
+  | .protocolError error => error.errorCode
+  | .transportError _ => _root_.Http2.ErrorCode.internalError
 
 /-- Human-readable cause, carried as GOAWAY debug data and kept in `closedConnections`. -/
 def describe : CloseCause → String
   | .peerClosed => "peer closed the connection"
   | .serverShutdown => "server shutdown"
   | .keepaliveTimeout => "keepalive ping timeout"
-  | .protocolError status => status.messageD
+  | .protocolError error => error.message
   | .transportError message => "connection task failed: " ++ message
 
 end CloseCause
@@ -93,20 +95,13 @@ structure ClosedConnection where
   cause : CloseCause
   deriving Inhabited, Repr
 
-/-- One item in the plaintext connection writer FIFO. Tunnel DATA attaches a
-completion promise; ordinary HTTP/2 output remains fire-and-forget. -/
-structure SocketWrite where
-  bytes : ByteArray
-  private completion : Option (IO.Promise (Except IO.Error Unit)) := none
-
 /-- One FIFO owner of a plaintext connection's write side.  Producers only
 enqueue bytes; the `Async` task is the sole socket writer and therefore preserves
 HTTP/2 frame order without ever parking an RPC or connection worker on TCP
 backpressure. -/
 structure SocketWriter where
-  outbound : Std.CloseableChannel SocketWrite
+  outbound : Std.CloseableChannel ByteArray
   task : AsyncTask Unit
-  private failure : IO.Ref (Option IO.Error)
 
 structure ActiveConnection where
   id : Nat
@@ -122,7 +117,7 @@ structure ActiveConnection where
   socket would put plaintext on an encrypted stream.  Stays `none` for h2c and for
   a TLS connection that died before it had a session — in both cases there is
   nothing to seal and nothing the peer could read. -/
-  tlsSession : IO.Ref (Option Grpc.Tls.ServerSession)
+  tlsSession : IO.Ref (Option _root_.Http2.Tls.ServerSession)
 
 /-- Exact owner of one accepted connection computation.  Retaining the outer
 `Async.toIO` handle gives shutdown a joinable ownership boundary for every
@@ -152,7 +147,34 @@ def loopback (port : UInt16) : SocketAddress :=
 def anyIPv4 (port : UInt16) : SocketAddress :=
   ipv4Address 0 0 0 0 port
 
+private def validateConfig (config : Config) : IO Unit := do
+  if config.readSize == 0 then
+    throw (IO.userError "gRPC HTTP/2 readSize must be positive")
+  let maximumSettingValue : Nat := 4294967295
+  if config.maxConcurrentStreams.any (· > maximumSettingValue) then
+    throw (IO.userError "gRPC HTTP/2 maxConcurrentStreams exceeds the SETTINGS wire range")
+  if config.maxHeaderListSize.any (· > maximumSettingValue) then
+    throw (IO.userError "gRPC HTTP/2 maxHeaderListSize exceeds the SETTINGS wire range")
+  if config.keepaliveIntervalMs == some 0 then
+    throw (IO.userError "gRPC HTTP/2 keepaliveIntervalMs must be positive")
+  if config.keepaliveTimeoutMs == 0 then
+    throw (IO.userError "gRPC HTTP/2 keepaliveTimeoutMs must be positive")
+
+private def configuredReceiveLimit (registry : Registry) : Nat :=
+  registry.maxReceiveMessageSize.getD Message.defaultMaxDecompressedSize
+
+private def configuredSendLimit (registry : Registry) : Nat :=
+  registry.maxSendMessageSize.getD Message.defaultMaxDecompressedSize
+
+private def validateRegistryLimits (registry : Registry) : IO Unit := do
+  if Message.prefixLength + configuredReceiveLimit registry >
+      _root_.Http2.Connection.maximumWindowSize then
+    throw (IO.userError "gRPC receive message limit exceeds the HTTP/2 stream-window range")
+  if configuredSendLimit registry > Message.maxWireLength then
+    throw (IO.userError "gRPC send message limit exceeds the 32-bit wire-length range")
+
 def bind (config : Config := {}) : IO Server := do
+  validateConfig config
   let socket ← TCP.Socket.Server.mk
   socket.bind config.address
   socket.listen config.backlog
@@ -161,22 +183,25 @@ def bind (config : Config := {}) : IO Server := do
   let localAddress ← socket.getSockName
   pure { socket := socket, localAddress := localAddress, config := config }
 
-def statusDebugData (status : Status) : ByteArray :=
-  status.messageD.toUTF8
+def processErrorDebugData (error : Connection.ProcessError) : ByteArray :=
+  error.message.toUTF8
 
-def errorGoAwayFrame (state : Connection.State) (status : Status) : Except Status Frame :=
-  GoAway.frame state.lastClientStreamId ErrorCode.internalError (statusDebugData status)
+def errorGoAwayFrame (state : Connection.State) (error : Connection.ProcessError) :
+    Except Status _root_.Http2.Frame :=
+  ofHttp2 <| _root_.Http2.GoAway.frame state.protocol.lastPeerStreamId
+    error.errorCode (processErrorDebugData error)
 
-def errorGoAwayBytes (state : Connection.State) (status : Status) : Except Status ByteArray := do
-  let frame ← errorGoAwayFrame state status
-  Frame.encode frame
+def errorGoAwayBytes (state : Connection.State) (error : Connection.ProcessError) :
+    Except Status ByteArray := do
+  let frame ← errorGoAwayFrame state error
+  ofHttp2 <| _root_.Http2.Frame.encode frame
 
-def gracefulGoAwayFrame (state : Connection.State) : Except Status Frame :=
-  GoAway.frame state.lastClientStreamId ErrorCode.noError
+def gracefulGoAwayFrame (state : Connection.State) : Except Status _root_.Http2.Frame :=
+  ofHttp2 <| _root_.Http2.GoAway.frame state.protocol.lastPeerStreamId _root_.Http2.ErrorCode.noError
 
 def gracefulGoAwayBytes (state : Connection.State) : Except Status ByteArray := do
   let frame ← gracefulGoAwayFrame state
-  Frame.encode frame
+  ofHttp2 <| _root_.Http2.Frame.encode frame
 
 private def ofStatusExcept (result : Except Status α) : IO α :=
   match result with
@@ -213,66 +238,32 @@ private def closeConnectionSocket (client : TCP.Socket.Client) : Std.Async.Async
   catch _ =>
     pure ()
 
-private partial def failQueuedSocketWrites (outbound : Std.CloseableChannel SocketWrite)
-    (error : IO.Error) : Std.Async.Async Unit := do
-  match ← await (← outbound.recv) with
-  | none => pure ()
-  | some request =>
-      if let some completion := request.completion then completion.resolve (.error error)
-      failQueuedSocketWrites outbound error
-
 private partial def socketWriterLoop (client : TCP.Socket.Client)
-    (outbound : Std.CloseableChannel SocketWrite) (failure : IO.Ref (Option IO.Error))
-    (onError : IO.Error → IO Unit) :
+    (outbound : Std.CloseableChannel ByteArray) (onError : IO.Error → IO Unit) :
     Std.Async.Async Unit := do
   match ← await (← outbound.recv) with
   | none => pure ()
-  | some request =>
+  | some bytes =>
       try
-        client.send request.bytes
-        if let some completion := request.completion then completion.resolve (.ok ())
-        socketWriterLoop client outbound failure onError
+        client.send bytes
+        socketWriterLoop client outbound onError
       catch err =>
-        failure.set (some err)
-        if let some completion := request.completion then completion.resolve (.error err)
         -- Reject future enqueues and wake the connection owner.  The writer owns
         -- the socket send side, so no other task can make forward progress after
         -- this failure.
         discard <| outbound.close.toBaseIO
-        failQueuedSocketWrites outbound err
         onError err
 
 private def startSocketWriter (client : TCP.Socket.Client)
     (onError : IO.Error → IO Unit := fun _ => pure ()) : IO SocketWriter := do
   let outbound ← Std.CloseableChannel.new
-  let failure ← IO.mkRef (none : Option IO.Error)
-  let task ← Std.Async.Async.toIO (socketWriterLoop client outbound failure onError)
-  pure { outbound := outbound, task := task, failure := failure }
+  let task ← Std.Async.Async.toIO (socketWriterLoop client outbound onError)
+  pure { outbound := outbound, task := task }
 
 /-- Non-blocking producer side of a plaintext connection writer. -/
 private def sendBytes (writer : SocketWriter) (bytes : ByteArray) : IO Unit := do
   unless bytes.isEmpty do
-    discard <| writer.outbound.send { bytes := bytes }
-
-/-- Enqueue one byte batch and wait for its exact socket write. -/
-private def sendBytesAcknowledged (writer : SocketWriter) (bytes : ByteArray) :
-    Std.Async.Async (Except Status Unit) := do
-  if bytes.isEmpty then return .ok ()
-  let completion : IO.Promise (Except IO.Error Unit) ← IO.Promise.new
-  let admitted ← (Std.CloseableChannel.Sync.send writer.outbound {
-    bytes := bytes,
-    completion := some completion
-  }).toBaseIO
-  match admitted with
-  | .error _ =>
-      let error := (← writer.failure.get).getD (IO.userError "socket writer is closed")
-      pure (.error (Status.ofIOError error))
-  | .ok () =>
-      match ← Std.Async.Async.ofTask completion.result? with
-      | some (.ok ()) => pure (.ok ())
-      | some (.error error) => pure (.error (Status.ofIOError error))
-      | none => pure (.error (Status.error .unavailable
-          "socket writer dropped a send acknowledgement"))
+    discard <| writer.outbound.send bytes
 
 private def drainSocketWriter (writer : SocketWriter) : Std.Async.Async Unit := do
   discard <| writer.outbound.close.toBaseIO
@@ -293,7 +284,7 @@ private def drainSocketWriter (writer : SocketWriter) : Std.Async.Async Unit := 
 /-- Put teardown bytes on a connection's wire: through the plaintext FIFO writer
 for h2c, sealed through the record writer for TLS. -/
 private def sendConnectionBytes (plainWriter? : Option SocketWriter)
-    (tls? : Option Grpc.Tls.ServerSession) (bytes : ByteArray) : IO Unit :=
+    (tls? : Option _root_.Http2.Tls.ServerSession) (bytes : ByteArray) : IO Unit :=
   match tls? with
   | none =>
       match plainWriter? with
@@ -305,7 +296,7 @@ private def sendConnectionBytes (plainWriter? : Option SocketWriter)
 writer is cooperatively drained first; a short bound cancels a writer stalled on
 a non-reading peer before the bounded write-side shutdown. -/
 private def retireConnection (plainWriter? : Option SocketWriter)
-    (tls? : Option Grpc.Tls.ServerSession)
+    (tls? : Option _root_.Http2.Tls.ServerSession)
     (client : TCP.Socket.Client) : Std.Async.Async Unit := do
   match plainWriter?, tls? with
   | some writer, _ => drainSocketWriter writer
@@ -316,9 +307,9 @@ private def retireConnection (plainWriter? : Option SocketWriter)
   closeConnectionSocket client
 
 private def sendGoAway (writer : SocketWriter) (state : Connection.State)
-    (status : Status) : IO Unit := do
-  if state.prefaceReceived then
-    match errorGoAwayBytes state status with
+    (error : Connection.ProcessError) : IO Unit := do
+  if state.protocol.prefaceReceived then
+    match errorGoAwayBytes state error with
     | .ok bytes =>
         try
           sendBytes writer bytes
@@ -329,55 +320,75 @@ private def sendGoAway (writer : SocketWriter) (state : Connection.State)
 private def getConnectionState (stateMutex : Std.Mutex Connection.State) : IO Connection.State :=
   stateMutex.atomically get
 
+private def initialConnectionWireBytes (stateMutex : Std.Mutex Connection.State) : IO ByteArray := do
+  let state ← getConnectionState stateMutex
+  ofStatusExcept (ofHttp2 (_root_.Http2.Connection.initialWireBytes state.protocol))
+
 private def markGracefulShutdownState (stateMutex : Std.Mutex Connection.State) :
-    IO Connection.State :=
+    IO (Connection.State × Option _root_.Http2.Frame) :=
   stateMutex.atomically do
     let state ← get
-    let state := {
-      state with outboundGoAwayLastStreamId := some state.lastClientStreamId
-    }
-    set state
-    pure state
+    if state.protocol.localGoAwayLastStream?.isSome then
+      pure (state, none)
+    else
+      match _root_.Http2.Connection.beginGoAway state.protocol with
+      | .error _ => pure (state, none)
+      | .ok (protocol, frame) =>
+          let state := { state with protocol := protocol }
+          set state
+          pure (state, some frame)
 
 private def sendGracefulGoAway (connection : ActiveConnection) : IO Unit := do
-  let state ← markGracefulShutdownState connection.stateMutex
-  if state.prefaceReceived then
-    match gracefulGoAwayBytes state with
-    | .ok bytes =>
-        try
-          sendConnectionBytes connection.plainWriter (← connection.tlsSession.get) bytes
-        catch _ =>
-          pure ()
-    | .error _ => pure ()
+  let (state, frame?) ← markGracefulShutdownState connection.stateMutex
+  if state.protocol.prefaceReceived then
+    match frame? with
+    | none => pure ()
+    | some frame =>
+      match _root_.Http2.Frame.encode frame with
+      | .ok bytes =>
+          try
+            sendConnectionBytes connection.plainWriter (← connection.tlsSession.get) bytes
+          catch _ =>
+            pure ()
+      | .error _ => pure ()
 
 /-- Tell the peer why this connection is ending, exactly once.  Claiming
-`outboundGoAwayLastStreamId` under the state mutex makes this idempotent and makes it
+the protocol GOAWAY state under the state mutex makes this idempotent and makes it
 defer to a GOAWAY that some other path (graceful drain) already sent. -/
 private def sendCauseGoAway (plainWriter? : Option SocketWriter)
-    (tls? : Option Grpc.Tls.ServerSession)
+    (tls? : Option _root_.Http2.Tls.ServerSession)
     (stateMutex : Std.Mutex Connection.State) (cause : CloseCause) : IO Unit := do
   if !cause.notifiesPeer then
     return ()
   let claimed ← stateMutex.atomically do
     let state ← get
-    if state.prefaceReceived && state.outboundGoAwayLastStreamId.isNone then
-      set { state with outboundGoAwayLastStreamId := some state.lastClientStreamId }
-      pure (some state.lastClientStreamId)
+    let fatal := cause.errorCode != _root_.Http2.ErrorCode.noError
+    let eligible :=
+      if fatal then !state.terminalGoAwaySent
+      else state.protocol.localGoAwayLastStream?.isNone
+    if state.protocol.prefaceReceived && eligible then
+      match _root_.Http2.Connection.beginGoAway state.protocol cause.errorCode
+          cause.describe.toUTF8 with
+      | .error _ => pure none
+      | .ok (protocol, frame) =>
+          set {
+            state with
+            protocol := protocol
+            terminalGoAwaySent := state.terminalGoAwaySent || fatal
+          }
+          pure (some frame)
     else
       pure none
   match claimed with
   | none => pure ()
-  | some lastStreamId =>
-      match GoAway.frame lastStreamId cause.errorCode cause.describe.toUTF8 with
+  | some frame =>
+      match _root_.Http2.Frame.encode frame with
       | .error _ => pure ()
-      | .ok frame =>
-          match Frame.encode frame with
-          | .error _ => pure ()
-          | .ok bytes =>
-              try
-                sendConnectionBytes plainWriter? tls? bytes
-              catch _ =>
-                pure ()
+      | .ok bytes =>
+          try
+            sendConnectionBytes plainWriter? tls? bytes
+          catch _ =>
+            pure ()
 
 /-- Record the first cause reported for a connection; later reports lose. -/
 private def reportCloseCause (closeCause : IO.Ref (Option CloseCause)) (cause : CloseCause) :
@@ -410,17 +421,23 @@ def closedConnectionRecords (server : Server) : IO (Array ClosedConnection) := d
   | none => pure #[]
   | some closedMutex => closedMutex.atomically get
 
-private def initialConnectionState (config : Config) (state : Connection.State) :
+private def initialConnectionState (registry : Registry) (config : Config)
+    (state : Connection.State) :
     Connection.State :=
+  let receiveWindow := Nat.min _root_.Http2.Connection.maximumWindowSize
+    (Message.prefixLength + configuredReceiveLimit registry + 65536)
+  let protocol := (Connection.initialState config.maxConcurrentStreams
+    config.maxHeaderListSize receiveWindow).protocol
   {
     state with
-    inboundMaxConcurrentStreams := config.maxConcurrentStreams,
-    inboundMaxHeaderListSize := config.maxHeaderListSize
+    protocol := protocol,
+    maxPendingResponseBytes := Message.prefixLength + configuredSendLimit registry
   }
 
-private def newConnectionStateMutex (config : Config) (state : Connection.State) :
+private def newConnectionStateMutex (registry : Registry) (config : Config)
+    (state : Connection.State) :
     IO (Std.Mutex Connection.State) :=
-  Std.Mutex.new (initialConnectionState config state)
+  Std.Mutex.new (initialConnectionState registry config state)
 
 private def installDeadlineScheduler (stateMutex : Std.Mutex Connection.State) : IO Unit := do
   let installed ← stateMutex.atomically do
@@ -443,7 +460,7 @@ private def registerActiveConnection (server : Server) (id : Nat)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (closeCause : IO.Ref (Option CloseCause))
     (plainWriter : Option SocketWriter)
-    (tlsSession : IO.Ref (Option Grpc.Tls.ServerSession)) :
+    (tlsSession : IO.Ref (Option _root_.Http2.Tls.ServerSession)) :
     IO (Option ActiveConnection) := do
   match server.activeConnections with
   | none => pure none
@@ -550,14 +567,14 @@ private def signalActiveConnectionsShutdown (server : Server) : IO Unit := do
       -- One broken writer must not prevent shutdown from reaching the rest.
       reportCloseCause connection.closeCause (CloseCause.transportError (toString err))
       Connection.signalCancelActiveShared connection.stateMutex
-      discard <| Grpc.CancellationToken.cancel connection.stopToken
+      discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
         (reason := Std.CancellationReason.shutdown)
 
 private def stopDrainedConnection (connection : ActiveConnection) : IO Bool := do
   let state ← getConnectionState connection.stateMutex
   if Connection.isDrainedAfterOutboundGoAway state then
     reportCloseCause connection.closeCause CloseCause.serverShutdown
-    discard <| Grpc.CancellationToken.cancel connection.stopToken
+    discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
       (reason := Std.CancellationReason.shutdown)
     pure true
   else
@@ -598,7 +615,7 @@ private def nextConnectionEvent (config : Config) (client : TCP.Socket.Client)
         Std.Async.Selectable.one <| events.push <|
           Std.Async.Selectable.case timer fun _ => pure ConnectionEvent.deadline
 
-private partial def serveClientLoop (applications : Applications) (config : Config)
+private partial def serveClientLoop (registry : Registry) (config : Config)
     (client : TCP.Socket.Client) (writer : SocketWriter)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken) :
     Std.Async.Async Connection.State := do
@@ -608,70 +625,39 @@ private partial def serveClientLoop (applications : Applications) (config : Conf
   | .received none => Connection.cancelActiveSharedOwned stateMutex
   | .deadline =>
       match ← Connection.expirePendingDeadlinesEncodedSharedWith stateMutex (sendBytes writer) with
-      | .ok () => serveClientLoop applications config client writer stateMutex stopToken
+      | .ok () => serveClientLoop registry config client writer stateMutex stopToken
       | .error status =>
           let state ← getConnectionState stateMutex
-          sendGoAway writer state status
+          sendGoAway writer state (.application status)
           Connection.cancelActiveSharedOwned stateMutex
   | .received (some chunk) =>
       if chunk.isEmpty then
-        serveClientLoop applications config client writer stateMutex stopToken
+        serveClientLoop registry config client writer stateMutex stopToken
       else
         match (← Connection.processBytesEncodedSharedWithOwned
-            applications.grpc stateMutex chunk (sendBytes writer)
-              applications.extendedConnect (some (sendBytesAcknowledged writer))) with
+            registry stateMutex chunk (sendBytes writer)) with
         | .ok () =>
-            serveClientLoop applications config client writer stateMutex stopToken
+            serveClientLoop registry config client writer stateMutex stopToken
         | .error status =>
             let state ← getConnectionState stateMutex
             sendGoAway writer state status
             Connection.cancelActiveSharedOwned stateMutex
 
-private def serveClientWithStateMutex (applications : Applications) (config : Config)
-    (client : TCP.Socket.Client) (stateMutex : Std.Mutex Connection.State) :
-    Std.Async.Async Connection.State := do
-  let writerFailure ← IO.mkRef (none : Option IO.Error)
-  let stopToken ← Std.CancellationToken.new
-  let writer ← startSocketWriter client fun err => do
-    writerFailure.set (some err)
-    Connection.signalCancelActiveShared stateMutex
-    discard <| Grpc.CancellationToken.cancel stopToken
-      (reason := Std.CancellationReason.shutdown)
-  try
-    installDeadlineScheduler stateMutex
-    if config.noDelay then
-      client.noDelay
-    let serverPreface ← ofStatusExcept
-      (Connection.serverPrefaceBytes config.maxConcurrentStreams config.maxHeaderListSize
-        (enableExtendedConnect := applications.extendedConnect.isSome))
-    sendBytes writer serverPreface
-    let state ← serveClientLoop applications config client writer stateMutex stopToken
-    drainSocketWriter writer
-    match ← writerFailure.get with
-    | none => pure state
-    | some err => throw err
-  catch err =>
-    -- Setup can fail before the read loop reaches its normal owned-cancel
-    -- path; retire the independently spawned deadline scheduler here too.
-    discard <| Connection.cancelActiveSharedOwned stateMutex
-    drainSocketWriter writer
-    throw err
-
 private def keepalivePingPayload : ByteArray :=
   ByteArray.mk #[0x67, 0x72, 0x70, 0x63, 0x6c, 0x65, 0x61, 0x6e]
 
-private def sendKeepalivePing (writer : SocketWriter)
+private def sendKeepalivePing (send : ByteArray -> IO Unit)
     (stateMutex : Std.Mutex Connection.State) : IO Bool := do
   stateMutex.atomically do
     modify fun state => { state with pendingKeepalivePing := some keepalivePingPayload }
-  match Ping.frame keepalivePingPayload with
+  match _root_.Http2.Ping.frame keepalivePingPayload with
   | .error _ => pure false
   | .ok ping =>
-      match Frame.encode ping with
+      match _root_.Http2.Frame.encode ping with
       | .error _ => pure false
       | .ok bytes =>
           try
-            sendBytes writer bytes
+            send bytes
             pure true
           catch _ =>
             pure false
@@ -695,14 +681,14 @@ private def keepaliveWait (stopToken : Std.CancellationToken) (ms : Nat) :
 /-- Periodically PING the peer; if an ack does not arrive within the timeout, cancel all
 active work and stop the connection. Detects peers that vanished behind NAT/LB idle
 timeouts (and clients that never complete the handshake). -/
-private partial def keepaliveLoop (writer : SocketWriter)
+private partial def keepaliveLoop (send : ByteArray -> IO Unit)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (closeCause : IO.Ref (Option CloseCause)) (intervalMs timeoutMs : Nat) :
     Std.Async.Async Unit := do
   match ← keepaliveWait stopToken intervalMs with
   | .stop => pure ()
   | .tick =>
-    if !(← sendKeepalivePing writer stateMutex) then
+    if !(← sendKeepalivePing send stateMutex) then
       pure ()
     else
       match ← keepaliveWait stopToken timeoutMs with
@@ -718,14 +704,14 @@ private partial def keepaliveLoop (writer : SocketWriter)
                 -- must find the cause already there to put it in its GOAWAY.
                 reportCloseCause closeCause CloseCause.keepaliveTimeout
                 Connection.signalCancelActiveShared stateMutex
-                discard <| Grpc.CancellationToken.cancel stopToken
+                discard <| _root_.Http2.CancellationToken.cancel stopToken
                   (reason := Std.CancellationReason.shutdown)
               else
-                keepaliveLoop writer stateMutex stopToken closeCause intervalMs timeoutMs
+                keepaliveLoop send stateMutex stopToken closeCause intervalMs timeoutMs
           | none =>
-              keepaliveLoop writer stateMutex stopToken closeCause intervalMs timeoutMs
+              keepaliveLoop send stateMutex stopToken closeCause intervalMs timeoutMs
 
-private def spawnKeepalive (config : Config) (writer : SocketWriter)
+private def spawnKeepalive (config : Config) (send : ByteArray -> IO Unit)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (closeCause : IO.Ref (Option CloseCause)) :
     IO (Option (Task (Except IO.Error Unit))) := do
@@ -733,15 +719,57 @@ private def spawnKeepalive (config : Config) (writer : SocketWriter)
   | none => pure none
   | some intervalMs =>
       let task ← Std.Async.Async.toIO
-        (keepaliveLoop writer stateMutex stopToken closeCause intervalMs
+        (keepaliveLoop send stateMutex stopToken closeCause intervalMs
           config.keepaliveTimeoutMs)
       pure (some task)
 
+private def serveClientWithStateMutex (registry : Registry) (config : Config)
+    (client : TCP.Socket.Client) (stateMutex : Std.Mutex Connection.State) :
+    Std.Async.Async Connection.State := do
+  let writerFailure ← IO.mkRef (none : Option IO.Error)
+  let stopToken ← Std.CancellationToken.new
+  let closeCause ← IO.mkRef (none : Option CloseCause)
+  let mut keepaliveTask? : Option (Task (Except IO.Error Unit)) := none
+  let writer ← startSocketWriter client fun err => do
+    writerFailure.set (some err)
+    Connection.signalCancelActiveShared stateMutex
+    discard <| _root_.Http2.CancellationToken.cancel stopToken
+      (reason := Std.CancellationReason.shutdown)
+  try
+    installDeadlineScheduler stateMutex
+    if config.noDelay then
+      client.noDelay
+    let serverPreface ← initialConnectionWireBytes stateMutex
+    sendBytes writer serverPreface
+    keepaliveTask? ← spawnKeepalive config (sendBytes writer)
+      stateMutex stopToken closeCause
+    let state ← serveClientLoop registry config client writer stateMutex stopToken
+    discard <| _root_.Http2.CancellationToken.cancel stopToken
+      (reason := Std.CancellationReason.shutdown)
+    if let some task := keepaliveTask? then
+      try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+    if let some cause ← closeCause.get then
+      sendCauseGoAway (some writer) none stateMutex cause
+    drainSocketWriter writer
+    match ← writerFailure.get with
+    | none => pure state
+    | some err => throw err
+  catch err =>
+    discard <| _root_.Http2.CancellationToken.cancel stopToken
+      (reason := Std.CancellationReason.shutdown)
+    if let some task := keepaliveTask? then
+      try Std.Async.Async.ofAsyncTask task catch _ => pure ()
+    -- Setup can fail before the read loop reaches its normal owned-cancel
+    -- path; retire the independently spawned deadline scheduler here too.
+    discard <| Connection.cancelActiveSharedOwned stateMutex
+    drainSocketWriter writer
+    throw err
+
 /-- Per-connection event loop. Runs in `Async`: while idle (waiting for bytes or the
 stop token) the loop suspends cooperatively instead of parking a worker thread, so
-idle connections cost no threads. Frame processing only enqueues outbound bytes;
+idle connections cost no threads. _root_.Http2.Frame processing only enqueues outbound bytes;
 the connection's sole `Async` writer owns all potentially backpressured sends. -/
-private partial def serveManagedClientLoop (applications : Applications) (config : Config)
+private partial def serveManagedClientLoop (registry : Registry) (config : Config)
     (client : TCP.Socket.Client) (writer : SocketWriter)
     (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
@@ -759,9 +787,9 @@ private partial def serveManagedClientLoop (applications : Applications) (config
       match ← Connection.expirePendingDeadlinesEncodedSharedWith
           stateMutex (sendBytes writer) with
       | .ok () =>
-          serveManagedClientLoop applications config client writer stateMutex stopToken closeCause
+          serveManagedClientLoop registry config client writer stateMutex stopToken closeCause
       | .error status =>
-          reportCloseCause closeCause (CloseCause.protocolError status)
+          reportCloseCause closeCause (CloseCause.protocolError (.application status))
           Connection.cancelActiveSharedOwned stateMutex
   | ConnectionEvent.received (some chunk) =>
       if chunk.isEmpty then
@@ -769,55 +797,38 @@ private partial def serveManagedClientLoop (applications : Applications) (config
           reportCloseCause closeCause CloseCause.peerClosed
           getConnectionState stateMutex
         else
-          serveManagedClientLoop applications config client writer stateMutex stopToken closeCause
+          serveManagedClientLoop registry config client writer stateMutex stopToken closeCause
       else
         match (← Connection.processBytesEncodedSharedWithOwned
-            applications.grpc stateMutex chunk (sendBytes writer)
-              applications.extendedConnect (some (sendBytesAcknowledged writer))) with
+            registry stateMutex chunk (sendBytes writer)) with
         | .ok () =>
             if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
               reportCloseCause closeCause CloseCause.peerClosed
               getConnectionState stateMutex
             else
-              serveManagedClientLoop applications config client writer stateMutex stopToken closeCause
+              serveManagedClientLoop registry config client writer stateMutex stopToken closeCause
         | .error status =>
             -- The GOAWAY naming this status, and the socket close behind it, are
             -- emitted once by `finishManagedClient` for every teardown path.
             reportCloseCause closeCause (CloseCause.protocolError status)
             Connection.cancelActiveSharedOwned stateMutex
 
-def serveApplicationsClientWithState (applications : Applications) (config : Config)
-    (client : TCP.Socket.Client)
-    (state : Connection.State :=
-      Connection.initialState config.maxConcurrentStreams config.maxHeaderListSize
-        (enableExtendedConnect := applications.extendedConnect.isSome)) :
-    Std.Async.Async Connection.State := do
-  let stateMutex ← newConnectionStateMutex config state
-  serveClientWithStateMutex applications config client stateMutex
-
-def serveClientWithState (registry : Registry) (config : Config)
-    (client : TCP.Socket.Client)
-    (state : Connection.State :=
-      Connection.initialState config.maxConcurrentStreams config.maxHeaderListSize) :
-    Std.Async.Async Connection.State :=
-  serveApplicationsClientWithState { grpc := registry } config client state
-
-def serveApplicationsClient (applications : Applications) (config : Config)
-    (client : TCP.Socket.Client) : Std.Async.Async Unit := do
-  discard <| serveApplicationsClientWithState applications config client
-  closeConnectionSocket client
+private def serveFreshClient (registry : Registry) (config : Config)
+    (client : TCP.Socket.Client) : Std.Async.Async Connection.State := do
+  validateConfig config
+  validateRegistryLimits registry
+  let stateMutex ← newConnectionStateMutex registry config
+    (Connection.initialState config.maxConcurrentStreams config.maxHeaderListSize)
+  serveClientWithStateMutex registry config client stateMutex
 
 def serveClient (registry : Registry) (config : Config) (client : TCP.Socket.Client) :
-    Std.Async.Async Unit :=
-  serveApplicationsClient { grpc := registry } config client
-
-def acceptOneApplications (server : Server) (applications : Applications) :
     Std.Async.Async Unit := do
-  let client ← server.socket.accept
-  serveApplicationsClient applications server.config client
+  discard <| serveFreshClient registry config client
+  closeConnectionSocket client
 
 def acceptOne (server : Server) (registry : Registry) : Std.Async.Async Unit := do
-  acceptOneApplications server { grpc := registry }
+  let client ← server.socket.accept
+  serveClient registry server.config client
 
 private def waitUntilConnectionTaskRetained (retained : IO.Promise Unit) :
     Std.Async.Async Unit := do
@@ -833,7 +844,7 @@ private def finishManagedClient (server : Server) (id : Nat) (client : TCP.Socke
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
     (keepaliveTask? : Option (Task (Except IO.Error Unit))) : Std.Async.Async Unit := do
-  discard <| Grpc.CancellationToken.cancel stopToken
+  discard <| _root_.Http2.CancellationToken.cancel stopToken
     (reason := Std.CancellationReason.shutdown)
   match keepaliveTask? with
   | none => pure ()
@@ -855,7 +866,7 @@ private def finishManagedClient (server : Server) (id : Nat) (client : TCP.Socke
   -- waiting for our FIN. Retire the local write side for every cause.
   closeConnectionSocket client
 
-private def serveManagedClient (server : Server) (applications : Applications) (id : Nat)
+private def serveManagedClient (server : Server) (registry : Registry) (id : Nat)
     (client : TCP.Socket.Client) (writer : SocketWriter)
     (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (connection? : Option ActiveConnection)
@@ -869,14 +880,11 @@ private def serveManagedClient (server : Server) (applications : Applications) (
       installDeadlineScheduler stateMutex
       if server.config.noDelay then
         client.noDelay
-      let serverPreface ← ofStatusExcept
-        (Connection.serverPrefaceBytes server.config.maxConcurrentStreams
-          server.config.maxHeaderListSize
-          (enableExtendedConnect := applications.extendedConnect.isSome))
+      let serverPreface ← initialConnectionWireBytes stateMutex
       sendBytes writer serverPreface
-      keepaliveTask? ← spawnKeepalive server.config writer stateMutex stopToken closeCause
-      discard <| serveManagedClientLoop applications server.config client writer stateMutex
-        stopToken closeCause
+      keepaliveTask? ← spawnKeepalive server.config (sendBytes writer)
+        stateMutex stopToken closeCause
+      discard <| serveManagedClientLoop registry server.config client writer stateMutex stopToken closeCause
       pure none
     catch err =>
       -- Do not let the connection die anonymously: the failure becomes the
@@ -889,26 +897,25 @@ private def serveManagedClient (server : Server) (applications : Applications) (
   | none => pure ()
   | some err => throw err
 
-private def spawnManagedClient (server : Server) (applications : Applications)
+private def spawnManagedClient (server : Server) (registry : Registry)
     (client : TCP.Socket.Client) (shutdownToken : Std.CancellationToken) : IO Unit := do
   let id ← nextActiveConnectionId server
-  let stateMutex ← newConnectionStateMutex server.config
-    (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize
-      (enableExtendedConnect := applications.extendedConnect.isSome))
+  let stateMutex ← newConnectionStateMutex registry server.config
+    (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize)
   let stopToken ← Std.CancellationToken.new
   let closeCause ← IO.mkRef (none : Option CloseCause)
-  let tlsSession ← IO.mkRef (none : Option Grpc.Tls.ServerSession)
+  let tlsSession ← IO.mkRef (none : Option _root_.Http2.Tls.ServerSession)
   let writer ← startSocketWriter client fun err => do
     reportCloseCause closeCause (CloseCause.transportError (toString err))
     Connection.signalCancelActiveShared stateMutex
-    discard <| Grpc.CancellationToken.cancel stopToken
+    discard <| _root_.Http2.CancellationToken.cancel stopToken
       (reason := Std.CancellationReason.shutdown)
   let connection? ← registerActiveConnection server id client stateMutex stopToken closeCause
     (some writer) tlsSession
   let retained ← IO.Promise.new
   let task ← try
       Std.Async.Async.toIO <|
-        serveManagedClient server applications id client writer stateMutex stopToken connection?
+        serveManagedClient server registry id client writer stateMutex stopToken connection?
           closeCause retained
     catch err =>
       -- No owner was created, so this is the only synchronous cleanup case.
@@ -916,7 +923,7 @@ private def spawnManagedClient (server : Server) (applications : Applications)
       let cause := CloseCause.transportError (toString err)
       reportCloseCause closeCause cause
       recordClosedConnection server id cause
-      discard <| Grpc.CancellationToken.cancel stopToken
+      discard <| _root_.Http2.CancellationToken.cancel stopToken
         (reason := Std.CancellationReason.shutdown)
       unregisterActiveConnection server connection?
       Std.Async.Async.block (retireConnection (some writer) none client)
@@ -932,7 +939,7 @@ private def spawnManagedClient (server : Server) (applications : Applications)
     | some connection =>
         try sendGracefulGoAway connection catch err => do
           reportCloseCause closeCause (CloseCause.transportError (toString err))
-          discard <| Grpc.CancellationToken.cancel stopToken
+          discard <| _root_.Http2.CancellationToken.cancel stopToken
             (reason := Std.CancellationReason.shutdown)
   pruneFinishedConnectionTasks server
 
@@ -949,27 +956,22 @@ private def nextAcceptLoopEvent (server : Server) (token : Std.CancellationToken
       pure AcceptLoopEvent.shutdown
   ]
 
-partial def serveForeverApplications (server : Server) (applications : Applications) :
-    Std.Async.Async Unit := do
+partial def serveForever (server : Server) (registry : Registry) : Std.Async.Async Unit := do
   let client ← server.socket.accept
-  discard <| Std.Async.Async.toIO
-    (serveApplicationsClient applications server.config client)
-  serveForeverApplications server applications
-
-partial def serveForever (server : Server) (registry : Registry) : Std.Async.Async Unit :=
-  serveForeverApplications server { grpc := registry }
+  discard <| Std.Async.Async.toIO (serveClient registry server.config client)
+  serveForever server registry
 
 /-- Accept loop as a suspending `Async` computation: between connections it holds no
 worker thread, and each accepted connection is spawned as its own `Async` task. -/
-private partial def acceptLoop (server : Server) (applications : Applications)
+private partial def acceptLoop (server : Server) (registry : Registry)
     (token : Std.CancellationToken) : Std.Async.Async Unit := do
   match ← nextAcceptLoopEvent server token with
   | AcceptLoopEvent.shutdown => pure ()
   | AcceptLoopEvent.accepted client =>
-      spawnManagedClient server applications client token
-      acceptLoop server applications token
+      spawnManagedClient server registry client token
+      acceptLoop server registry token
 
-partial def serveApplicationsUntilShutdown (server : Server) (applications : Applications)
+partial def serveUntilShutdown (server : Server) (registry : Registry)
     (token : Std.CancellationToken) : Std.Async.Async Unit := do
   let activeConnections ← Std.Mutex.new #[]
   let connectionTasks ← Std.Mutex.new #[]
@@ -983,19 +985,16 @@ partial def serveApplicationsUntilShutdown (server : Server) (applications : App
     nextConnectionId := some nextConnectionId,
     closedConnections := some closedConnections
   }
-  acceptLoop server applications token
+  acceptLoop server registry token
   signalActiveConnectionsShutdown server
   let connections ← activeConnectionSnapshot server
   for connection in connections do
-    discard <| Grpc.CancellationToken.cancel connection.stopToken
+    discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
       (reason := Std.CancellationReason.shutdown)
   waitConnectionTasks server
 
-partial def serveUntilShutdown (server : Server) (registry : Registry)
-    (token : Std.CancellationToken) : Std.Async.Async Unit :=
-  serveApplicationsUntilShutdown server { grpc := registry } token
-
-def serveApplications (applications : Applications) (config : Config := {}) : IO Server := do
+def serve (registry : Registry) (config : Config := {}) : IO Server := do
+  validateRegistryLimits registry
   let server ← bind config
   let token ← Std.CancellationToken.new
   let activeConnections ← Std.Mutex.new #[]
@@ -1010,11 +1009,8 @@ def serveApplications (applications : Applications) (config : Config := {}) : IO
     nextConnectionId := some nextConnectionId,
     closedConnections := some closedConnections
   }
-  let task ← Std.Async.Async.toIO (acceptLoop server applications token)
+  let task ← Std.Async.Async.toIO (acceptLoop server registry token)
   pure { server with acceptTask := some task }
-
-def serve (registry : Registry) (config : Config := {}) : IO Server :=
-  serveApplications { grpc := registry } config
 
 /-! ## TLS
 
@@ -1043,16 +1039,8 @@ private def freshTlsServerConfig (tlsConfig : TlsConfig) : IO Tls.Server.Config 
     alpnProtocols := tlsConfig.alpnProtocols
   }
 
-private def tlsServerSend (session : Grpc.Tls.ServerSession) (bytes : ByteArray) : IO Unit :=
+private def tlsServerSend (session : _root_.Http2.Tls.ServerSession) (bytes : ByteArray) : IO Unit :=
   session.send bytes
-
-private def tlsServerSendAcknowledged (session : Grpc.Tls.ServerSession)
-    (bytes : ByteArray) : Std.Async.Async (Except Status Unit) := do
-  try
-    session.sendAcknowledged bytes
-    pure (.ok ())
-  catch error =>
-    pure (.error (Status.ofIOError error))
 
 private inductive TlsConnectionEvent where
   | received (chunk? : Option ByteArray)
@@ -1060,7 +1048,7 @@ private inductive TlsConnectionEvent where
   | writerFailed
   | deadline
 
-private def nextTlsConnectionEvent (config : Config) (session : Grpc.Tls.ServerSession)
+private def nextTlsConnectionEvent (config : Config) (session : _root_.Http2.Tls.ServerSession)
     (stopToken : Std.CancellationToken) (deadline? : Option Nat := none) :
     Std.Async.Async TlsConnectionEvent := do
   let events := #[
@@ -1088,7 +1076,7 @@ authorization intentionally runs outside the connection-state mutex but the
 read owner still awaits its exact child; this watcher ensures a failed record
 writer can cancel that child immediately rather than waiting for authorization
 IO to return. -/
-private def watchTlsWriterFailure (session : Grpc.Tls.ServerSession)
+private def watchTlsWriterFailure (session : _root_.Http2.Tls.ServerSession)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (closeCause : IO.Ref (Option CloseCause)) : Std.Async.Async Unit := do
   let failed ← Std.Async.Selectable.one #[
@@ -1101,7 +1089,7 @@ private def watchTlsWriterFailure (session : Grpc.Tls.ServerSession)
       | none => "TLS record writer stopped"
     reportCloseCause closeCause (CloseCause.transportError message)
     Connection.signalCancelActiveShared stateMutex
-    discard <| Grpc.CancellationToken.cancel stopToken
+    discard <| _root_.Http2.CancellationToken.cancel stopToken
       (reason := Std.CancellationReason.shutdown)
   else
     pure ()
@@ -1110,13 +1098,12 @@ private def watchTlsWriterFailure (session : Grpc.Tls.ServerSession)
 connection should keep serving.  Shared by the event loop below and by the
 handshake leftover — application bytes the peer coalesced behind its TLS
 Finished flight — so both paths report causes identically. -/
-private def serveTlsInboundPlaintext (applications : Applications)
-    (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
+private def serveTlsInboundPlaintext (registry : Registry)
+    (session : _root_.Http2.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
     (closeCause : IO.Ref (Option CloseCause)) (plaintext : ByteArray) :
     Std.Async.Async Bool := do
   match ← Connection.processBytesEncodedSharedWithOwned
-      applications.grpc stateMutex plaintext (tlsServerSend session)
-        applications.extendedConnect (some (tlsServerSendAcknowledged session)) with
+      registry stateMutex plaintext (tlsServerSend session) with
   | .ok () =>
       if Connection.isDrainedAfterOutboundGoAway (← getConnectionState stateMutex) then
         reportCloseCause closeCause CloseCause.peerClosed
@@ -1132,8 +1119,8 @@ private def serveTlsInboundPlaintext (applications : Applications)
 `serveManagedClientLoop`, including its cause reporting: every exit records why,
 and the GOAWAY naming it is emitted once by `finishManagedTlsClient` rather than
 inline here, so a TLS connection dies exactly as attributably as an h2c one. -/
-private partial def serveTlsClientLoop (applications : Applications) (config : Config)
-    (session : Grpc.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
+private partial def serveTlsClientLoop (registry : Registry) (config : Config)
+    (session : _root_.Http2.Tls.ServerSession) (stateMutex : Std.Mutex Connection.State)
     (stopToken : Std.CancellationToken) (closeCause : IO.Ref (Option CloseCause)) :
     Std.Async.Async Unit := do
   let deadline? := Connection.nextPendingDeadlineFallback? (← getConnectionState stateMutex)
@@ -1151,9 +1138,9 @@ private partial def serveTlsClientLoop (applications : Applications) (config : C
       match ← Connection.expirePendingDeadlinesEncodedSharedWith
           stateMutex (tlsServerSend session) with
       | .ok () =>
-          serveTlsClientLoop applications config session stateMutex stopToken closeCause
+          serveTlsClientLoop registry config session stateMutex stopToken closeCause
       | .error status =>
-          reportCloseCause closeCause (CloseCause.protocolError status)
+          reportCloseCause closeCause (CloseCause.protocolError (.application status))
           discard <| Connection.cancelActiveSharedOwned stateMutex
   | TlsConnectionEvent.received none =>
       reportCloseCause closeCause CloseCause.peerClosed
@@ -1165,8 +1152,8 @@ private partial def serveTlsClientLoop (applications : Applications) (config : C
           reportCloseCause closeCause CloseCause.peerClosed
           discard <| Connection.cancelActiveSharedOwned stateMutex
       | some plaintext =>
-          if ← serveTlsInboundPlaintext applications session stateMutex closeCause plaintext then
-            serveTlsClientLoop applications config session stateMutex stopToken closeCause
+          if ← serveTlsInboundPlaintext registry session stateMutex closeCause plaintext then
+            serveTlsClientLoop registry config session stateMutex stopToken closeCause
 
 /-- Single teardown point for a managed TLS connection, mirroring
 `finishManagedClient`: record the cause, seal the GOAWAY that names it through the
@@ -1175,12 +1162,17 @@ emits once the HTTP/2 preface has been seen, which is exactly "far enough along 
 carry a GOAWAY" — a connection that died during the TLS handshake has no HTTP/2
 framing to say it in, and gets a recorded cause but no frame. -/
 private def finishManagedTlsClient (server : Server) (id : Nat)
-    (client : TCP.Socket.Client) (session? : Option Grpc.Tls.ServerSession)
+    (client : TCP.Socket.Client) (session? : Option _root_.Http2.Tls.ServerSession)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
-    (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause)) :
+    (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
+    (keepaliveTask? : Option (Task (Except IO.Error Unit))) :
     Std.Async.Async Unit := do
-  discard <| Grpc.CancellationToken.cancel stopToken
+  discard <| _root_.Http2.CancellationToken.cancel stopToken
     (reason := Std.CancellationReason.shutdown)
+  match keepaliveTask? with
+  | none => pure ()
+  | some task =>
+      try Std.Async.Async.ofAsyncTask task catch _ => pure ()
   discard <| Connection.cancelActiveSharedOwned stateMutex
   let cause := (← closeCause.get).getD CloseCause.peerClosed
   recordClosedConnection server id cause
@@ -1195,13 +1187,14 @@ private def finishManagedTlsClient (server : Server) (id : Nat)
   | none => closeConnectionSocket client
   | some session => retireConnection none (some session) client
 
-private def serveManagedTlsClient (server : Server) (applications : Applications) (config : Config)
+private def serveManagedTlsClient (server : Server) (registry : Registry) (config : Config)
     (tlsConfig : TlsConfig) (id : Nat) (client : TCP.Socket.Client)
     (stateMutex : Std.Mutex Connection.State) (stopToken : Std.CancellationToken)
     (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
-    (tlsSession : IO.Ref (Option Grpc.Tls.ServerSession))
+    (tlsSession : IO.Ref (Option _root_.Http2.Tls.ServerSession))
     (retained : IO.Promise Unit) : Std.Async.Async Unit := do
   let mut writerWatchTask? : Option (Task (Except IO.Error Unit)) := none
+  let mut keepaliveTask? : Option (Task (Except IO.Error Unit)) := none
   let runError? ← try
       waitUntilConnectionTaskRetained retained
       installDeadlineScheduler stateMutex
@@ -1209,19 +1202,19 @@ private def serveManagedTlsClient (server : Server) (applications : Applications
         client.noDelay
       let serverConfig ← freshTlsServerConfig tlsConfig
       let (session, handshakeLeftover) ←
-        Grpc.Tls.ServerSession.establishWithLeftover client serverConfig
+        _root_.Http2.Tls.ServerSession.establishWithLeftover client serverConfig
         config.readSize (stopToken := some stopToken)
       unless (← session.alpnSelected) == some "h2" do
-        throw (IO.userError "TLS peer did not negotiate the h2 ALPN protocol")
+        throw (IO.userError "gRPC TLS peer did not negotiate the h2 ALPN protocol")
       -- Publish the session before any byte of HTTP/2: from here on every
       -- teardown byte must be sealed instead of written plaintext.
       tlsSession.set (some session)
       writerWatchTask? ← some <$> Std.Async.Async.toIO
         (watchTlsWriterFailure session stateMutex stopToken closeCause)
-      let preface ← ofStatusExcept
-        (Connection.serverPrefaceBytes config.maxConcurrentStreams config.maxHeaderListSize
-          (enableExtendedConnect := applications.extendedConnect.isSome))
+      let preface ← initialConnectionWireBytes stateMutex
       session.send preface
+      keepaliveTask? ← spawnKeepalive config (tlsServerSend session)
+        stateMutex stopToken closeCause
       -- A fast client's HTTP/2 preface can ride in the same transport chunk as
       -- its TLS Finished; those bytes were decrypted during the handshake and
       -- must reach the connection before the first socket read.
@@ -1229,16 +1222,16 @@ private def serveManagedTlsClient (server : Server) (applications : Applications
         if handshakeLeftover.isEmpty then
           pure true
         else
-          serveTlsInboundPlaintext applications session stateMutex closeCause handshakeLeftover
+          serveTlsInboundPlaintext registry session stateMutex closeCause handshakeLeftover
       if continue? then
-        serveTlsClientLoop applications config session stateMutex stopToken closeCause
+        serveTlsClientLoop registry config session stateMutex stopToken closeCause
       pure none
     catch err =>
       -- A handshake that failed has no session and cannot carry HTTP/2 GOAWAY,
       -- but it still has the same one local cause/cleanup owner.
       reportCloseCause closeCause (CloseCause.transportError (toString err))
       pure (some err)
-  discard <| Grpc.CancellationToken.cancel stopToken
+  discard <| _root_.Http2.CancellationToken.cancel stopToken
     (reason := Std.CancellationReason.shutdown)
   match writerWatchTask? with
   | none => pure ()
@@ -1248,21 +1241,20 @@ private def serveManagedTlsClient (server : Server) (applications : Applications
       catch _ =>
         pure ()
   finishManagedTlsClient server id client (← tlsSession.get) stateMutex stopToken
-    connection? closeCause
+    connection? closeCause keepaliveTask?
   match runError? with
   | none => pure ()
   | some err => throw err
 
-private def spawnManagedTlsClient (server : Server) (applications : Applications)
+private def spawnManagedTlsClient (server : Server) (registry : Registry)
     (tlsConfig : TlsConfig) (client : TCP.Socket.Client)
     (shutdownToken : Std.CancellationToken) : IO Unit := do
   let id ← nextActiveConnectionId server
-  let stateMutex ← newConnectionStateMutex server.config
-    (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize
-      (enableExtendedConnect := applications.extendedConnect.isSome))
+  let stateMutex ← newConnectionStateMutex registry server.config
+    (Connection.initialState server.config.maxConcurrentStreams server.config.maxHeaderListSize)
   let stopToken ← Std.CancellationToken.new
   let closeCause ← IO.mkRef (none : Option CloseCause)
-  let tlsSession ← IO.mkRef (none : Option Grpc.Tls.ServerSession)
+  let tlsSession ← IO.mkRef (none : Option _root_.Http2.Tls.ServerSession)
   -- Registered before the handshake runs, so `shutdown`/`wait` can see and drain a
   -- connection that is still negotiating TLS.  `sendGracefulGoAway` is a no-op
   -- until the HTTP/2 preface has been read, so registering this early cannot put a
@@ -1272,14 +1264,14 @@ private def spawnManagedTlsClient (server : Server) (applications : Applications
   let retained ← IO.Promise.new
   let task ← try
       Std.Async.Async.toIO <|
-        serveManagedTlsClient server applications server.config tlsConfig id client stateMutex
+        serveManagedTlsClient server registry server.config tlsConfig id client stateMutex
           stopToken connection? closeCause tlsSession retained
     catch err =>
       retained.resolve ()
       let cause := CloseCause.transportError (toString err)
       reportCloseCause closeCause cause
       recordClosedConnection server id cause
-      discard <| Grpc.CancellationToken.cancel stopToken
+      discard <| _root_.Http2.CancellationToken.cancel stopToken
         (reason := Std.CancellationReason.shutdown)
       unregisterActiveConnection server connection?
       Std.Async.Async.block (retireConnection none (← tlsSession.get) client)
@@ -1292,21 +1284,23 @@ private def spawnManagedTlsClient (server : Server) (applications : Applications
     | some connection =>
         try sendGracefulGoAway connection catch err => do
           reportCloseCause closeCause (CloseCause.transportError (toString err))
-          discard <| Grpc.CancellationToken.cancel stopToken
+          discard <| _root_.Http2.CancellationToken.cancel stopToken
             (reason := Std.CancellationReason.shutdown)
   pruneFinishedConnectionTasks server
 
-private partial def acceptTlsLoop (server : Server) (applications : Applications)
+private partial def acceptTlsLoop (server : Server) (registry : Registry)
     (tlsConfig : TlsConfig) (token : Std.CancellationToken) : Std.Async.Async Unit := do
   match ← nextAcceptLoopEvent server token with
   | AcceptLoopEvent.shutdown => pure ()
   | AcceptLoopEvent.accepted client =>
-      spawnManagedTlsClient server applications tlsConfig client token
-      acceptTlsLoop server applications tlsConfig token
+      spawnManagedTlsClient server registry tlsConfig client token
+      acceptTlsLoop server registry tlsConfig token
 
 /-- Bind, then accept connections and serve gRPC over TLS 1.3 on each. -/
-def serveTlsApplications (applications : Applications) (tlsConfig : TlsConfig)
-    (config : Config := {}) : IO Server := do
+def serveTls (registry : Registry) (tlsConfig : TlsConfig) (config : Config := {}) : IO Server := do
+  unless tlsConfig.alpnProtocols.contains "h2" do
+    throw (IO.userError "gRPC TLS server ALPN policy must include h2")
+  validateRegistryLimits registry
   let server ← bind config
   let token ← Std.CancellationToken.new
   let activeConnections ← Std.Mutex.new #[]
@@ -1321,17 +1315,14 @@ def serveTlsApplications (applications : Applications) (tlsConfig : TlsConfig)
     nextConnectionId := some nextConnectionId,
     closedConnections := some closedConnections
   }
-  let task ← Std.Async.Async.toIO (acceptTlsLoop server applications tlsConfig token)
+  let task ← Std.Async.Async.toIO (acceptTlsLoop server registry tlsConfig token)
   pure { server with acceptTask := some task }
-
-def serveTls (registry : Registry) (tlsConfig : TlsConfig) (config : Config := {}) : IO Server :=
-  serveTlsApplications { grpc := registry } tlsConfig config
 
 def shutdown (server : Server) : IO Unit := do
   match server.shutdownToken with
   | none => signalActiveConnectionsShutdown server
   | some token => do
-      let elected ← Grpc.CancellationToken.cancel token
+      let elected ← _root_.Http2.CancellationToken.cancel token
         (reason := Std.CancellationReason.shutdown)
       if elected then
         signalActiveConnectionsShutdown server
@@ -1343,7 +1334,7 @@ private def forceStopActiveConnections (server : Server) : IO Unit := do
   for connection in connections do
     reportCloseCause connection.closeCause CloseCause.serverShutdown
     Connection.signalCancelActiveShared connection.stateMutex
-    discard <| Grpc.CancellationToken.cancel connection.stopToken
+    discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
       (reason := Std.CancellationReason.shutdown)
 
 private partial def waitActiveConnectionsDrained (server : Server)

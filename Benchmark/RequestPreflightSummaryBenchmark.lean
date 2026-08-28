@@ -4,7 +4,7 @@ import Grpc
 # Request-header preflight summary differential benchmark
 
 Both benchmark-local wrappers perform the unchanged two-pass
-`Metadata.validate`.  The reference wrapper then calls the former ten-lookup
+`Grpc.Metadata.validate`.  The reference wrapper then calls the former ten-lookup
 classifier, while the candidate wrapper calls the one-scan classifier:
 for accepted requests, the scaled comparison is therefore twelve complete
 metadata traversals versus three.  Rejected requests retain their
@@ -35,20 +35,20 @@ namespace Grpc.RequestPreflightSummaryBenchmarkHarness
 
 private abbrev Result := Headers.RequestHeaderPreflightResult
 private abbrev Outcome := Except Status Result
-private abbrev Classifier := Metadata → Outcome
+private abbrev Classifier := _root_.Http2.Headers → Outcome
 
 private inductive Mode where
   | reference
   | candidate
 
 /-- Symmetric production prefix plus the exact former repeated-scan seam. -/
-@[noinline] private def classifyReference (metadata : Metadata) : Outcome := do
-  Metadata.validate metadata
+@[noinline] private def classifyReference (metadata : _root_.Http2.Headers) : Outcome := do
+  Grpc.Metadata.validate metadata
   pure (Headers.TestSupport.requestHeaderPreflightReferenceForBenchmark metadata)
 
 /-- Symmetric production prefix plus the executable one-summary-pass seam. -/
-@[noinline] private def classifyCandidate (metadata : Metadata) : Outcome := do
-  Metadata.validate metadata
+@[noinline] private def classifyCandidate (metadata : _root_.Http2.Headers) : Outcome := do
+  Grpc.Metadata.validate metadata
   pure (Headers.TestSupport.requestHeaderPreflightCandidateForBenchmark metadata)
 
 private structure ClassifierBox where
@@ -70,15 +70,15 @@ private structure ClassifierBox where
 
 private structure Fixture where
   label : String
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   expected : Result
   expectedHeaders : Nat
 
-private def header (name value : String) : Header :=
-  Header.of name value
+private def header (name value : String) : _root_.Http2.Header :=
+  _root_.Http2.Header.of name value
 
 private def requestPrefix (path : String) (method : String := "POST")
-    (scheme : String := "https") (authority : String := "benchmark.local") : Metadata :=
+    (scheme : String := "https") (authority : String := "benchmark.local") : _root_.Http2.Headers :=
   #[
     header ":method" method,
     header ":scheme" scheme,
@@ -86,7 +86,7 @@ private def requestPrefix (path : String) (method : String := "POST")
     header ":authority" authority
   ]
 
-private def fillerHeaders (count : Nat) : Metadata :=
+private def fillerHeaders (count : Nat) : _root_.Http2.Headers :=
   (Array.range count).map fun index =>
     header s!"x-benchmark-{index}" s!"value-{index}-0123456789abcdef"
 
@@ -178,7 +178,7 @@ private def makeFixtures : Array Fixture :=
       header "content-type" "application/grpc",
       header "te" "trailers"
     ]
-  let forbiddenStatus : Metadata := #[
+  let forbiddenStatus : _root_.Http2.Headers := #[
     header ":method" "POST",
     header ":scheme" "https",
     header ":status" "200",
@@ -428,7 +428,7 @@ private def validateFixtures (fixtures : Array Fixture) : IO Nat := do
       throw (IO.userError <|
         s!"{fixture.label}: metadata size {fixture.metadata.size} != " ++
           s!"declared {fixture.expectedHeaders}")
-    match Metadata.validate fixture.metadata with
+    match Grpc.Metadata.validate fixture.metadata with
     | .error status =>
         throw (IO.userError <|
           s!"{fixture.label}: fixture violates the already-validated seam contract: " ++
@@ -451,7 +451,7 @@ private def validateFixtures (fixtures : Array Fixture) : IO Nat := do
 
 /-- One common indirect-call recurrence for both selected implementations. -/
 @[noinline] private def runRepeated (classify : @& Classifier)
-    (metadata : @& Metadata) (iterations : Nat) : UInt64 := Id.run do
+    (metadata : @& _root_.Http2.Headers) (iterations : Nat) : UInt64 := Id.run do
   let mut digest : UInt64 := 0
   for _ in [0:iterations] do
     digest := digest + outcomeDigest (classify metadata)

@@ -2,7 +2,7 @@ module
 
 public import Std.Async
 public import Std.Sync.CancellationToken
-public import Grpc.CancellationToken
+public import Http2.CancellationToken
 
 public section
 
@@ -19,7 +19,7 @@ Cancellation here is callback-safe on the pinned toolchain: the stock
 token-state mutex, so a synchronous `Selectable.one` completion can re-enter
 that same non-recursive mutex through the winning selector's unregister hook.
 `Cancellation.cancel` therefore commits the sticky cancellation transition
-through `Grpc.CancellationToken.cancel`, which extracts all consumers under
+through `Http2.CancellationToken.cancel`, which extracts all consumers under
 the mutex and resolves them only after the mutex has been released.
 -/
 
@@ -49,7 +49,7 @@ inside `state.atomically`; a selector winner may synchronously run its
 `unregisterFn`, which takes the same non-reentrant mutex.
 -/
 def cancel (cancellation : Cancellation) : BaseIO Unit := do
-  discard <| Grpc.CancellationToken.cancel cancellation.token
+  discard <| _root_.Http2.CancellationToken.cancel cancellation.token
 
 def isCancelled (cancellation : Cancellation) : IO Bool :=
   cancellation.token.isCancelled

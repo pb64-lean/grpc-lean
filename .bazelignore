@@ -1,3 +1,4 @@
 examples/grpc_service/
 third_party/Lean-zh/binary/
 third_party/Lean-zh/protobuf/
+.lake/

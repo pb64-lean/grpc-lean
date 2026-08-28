@@ -18,10 +18,10 @@ def expect (condition : Bool) (message : String) : IO Unit := do
 def expectEq [BEq α] (actual expected : α) (message : String) : IO Unit := do
   expect (actual == expected) message
 
-def expectStatusOk (result : Except Status α) : IO α := do
+def expectStatusOk [Repr ε] (result : Except ε α) : IO α := do
   match result with
   | .ok value => pure value
-  | .error status => throw (IO.userError status.messageD)
+  | .error error => throw (IO.userError (repr error).pretty)
 
 /-- Generous: only bounds how long a genuine failure takes to report. -/
 def observeTimeoutMs : Nat := 5000
@@ -48,11 +48,11 @@ partial def awaitTaskWithin (task : Task (Except IO.Error α)) (remainingMs : Na
     awaitTaskWithin task (remainingMs - 1)
 
 structure ReadHttp2FrameState where
-  decoder : Http2.Frame.DecodeState := {}
-  frames : Array Http2.Frame := #[]
+  decoder : _root_.Http2.Frame.DecodeState := {}
+  frames : Array _root_.Http2.Frame := #[]
 
 partial def readFramesUntilFromSocket (client : Std.Async.TCP.Socket.Client)
-    (state : ReadHttp2FrameState) (done : Array Http2.Frame -> Bool) :
+    (state : ReadHttp2FrameState) (done : Array _root_.Http2.Frame -> Bool) :
     IO ReadHttp2FrameState := do
   if done state.frames then
     pure state
@@ -60,14 +60,14 @@ partial def readFramesUntilFromSocket (client : Std.Async.TCP.Socket.Client)
     match ← (client.recv? 8192).block with
     | none => pure state
     | some chunk =>
-        let decoded ← expectStatusOk (Http2.Frame.decodeChunk state.decoder chunk)
+        let decoded ← expectStatusOk (_root_.Http2.Frame.decodeChunk state.decoder chunk)
         readFramesUntilFromSocket client
           { decoder := { buffered := decoded.buffered },
             frames := state.frames.append decoded.frames }
           done
 
 def readFramesUntil (client : Std.Async.TCP.Socket.Client) (state : ReadHttp2FrameState)
-    (done : Array Http2.Frame -> Bool) (message : String) : IO ReadHttp2FrameState := do
+    (done : Array _root_.Http2.Frame -> Bool) (message : String) : IO ReadHttp2FrameState := do
   let readTask ← IO.asTask (readFramesUntilFromSocket client state done)
   match ← awaitTaskWithin readTask observeTimeoutMs with
   | some result =>
@@ -92,20 +92,20 @@ def expectPeerClosed (client : Std.Async.TCP.Socket.Client) (message : String) :
       IO.cancel eofTask
       throw (IO.userError message)
 
-def hasGoAway (frames : Array Http2.Frame) : Bool :=
-  frames.any fun frame => frame.header.frameType == Http2.FrameType.goAway
+def hasGoAway (frames : Array _root_.Http2.Frame) : Bool :=
+  frames.any fun frame => frame.header.frameType == _root_.Http2.FrameType.goAway
 
-def firstGoAway (frames : Array Http2.Frame) : IO Http2.GoAway.Decoded := do
-  match frames.find? (fun frame => frame.header.frameType == Http2.FrameType.goAway) with
+def firstGoAway (frames : Array _root_.Http2.Frame) : IO _root_.Http2.GoAway.Decoded := do
+  match frames.find? (fun frame => frame.header.frameType == _root_.Http2.FrameType.goAway) with
   | none => throw (IO.userError "expected a GOAWAY frame")
-  | some frame => expectStatusOk (Http2.GoAway.decode frame)
+  | some frame => expectStatusOk (_root_.Http2.GoAway.decode frame)
 
-def goAwayReason (decoded : Http2.GoAway.Decoded) : String :=
+def goAwayReason (decoded : _root_.Http2.GoAway.Decoded) : String :=
   String.fromUTF8! decoded.debugData
 
 def clientSettingsWire (ack : Bool) : IO ByteArray := do
-  let frame ← expectStatusOk (Http2.Settings.frame #[] (ack := ack))
-  expectStatusOk (Http2.Frame.encode frame)
+  let frame ← expectStatusOk (_root_.Http2.Settings.frame #[] (ack := ack))
+  expectStatusOk (_root_.Http2.Frame.encode frame)
 
 def connectRaw (server : Grpc.Server.Instance) : IO Std.Async.TCP.Socket.Client := do
   let client ← Std.Async.TCP.Socket.Client.mk
@@ -113,7 +113,7 @@ def connectRaw (server : Grpc.Server.Instance) : IO Std.Async.TCP.Socket.Client 
   client.noDelay
   pure client
 
-def closeCauses (server : Grpc.Server.Instance) : IO (Array Http2.Server.CloseCause) := do
+def closeCauses (server : Grpc.Server.Instance) : IO (Array Grpc.Http2.Server.CloseCause) := do
   pure ((← Grpc.Server.closedConnections server).map (·.cause))
 
 def activeConnectionCount (server : Grpc.Server.Instance) : IO Nat := do
@@ -126,11 +126,11 @@ def ownedConnectionCount (server : Grpc.Server.Instance) : IO Nat := do
   | none => pure 0
   | some owners => owners.atomically do pure (← get).size
 
-def isKeepaliveTimeout : Http2.Server.CloseCause → Bool
+def isKeepaliveTimeout : Grpc.Http2.Server.CloseCause → Bool
   | .keepaliveTimeout => true
   | _ => false
 
-def isProtocolError : Http2.Server.CloseCause → Bool
+def isProtocolError : Grpc.Http2.Server.CloseCause → Bool
   | .protocolError _ => true
   | _ => false
 
@@ -145,14 +145,14 @@ def testKeepaliveTimeoutIsAttributable : IO Unit := do
   }
   let client ← connectRaw server
   -- A complete client preface, then silence: PINGs are never acknowledged.
-  (client.send (Http2.connectionPreface.append (← clientSettingsWire false))).block
+  (client.send (_root_.Http2.connectionPreface.append (← clientSettingsWire false))).block
 
   let state ← readFramesUntil client {} hasGoAway
     "keepalive timeout did not emit a GOAWAY"
   let goAway ← firstGoAway state.frames
   expectEq (goAwayReason goAway) "keepalive ping timeout"
     "keepalive-timeout GOAWAY must name the keepalive timeout as the cause"
-  expectEq goAway.errorCode Http2.ErrorCode.noError
+  expectEq goAway.errorCode _root_.Http2.ErrorCode.noError
     "a keepalive timeout is not a framing violation by the peer"
   expectPeerClosed client "keepalive timeout did not retire the socket"
 
@@ -167,13 +167,13 @@ preface is followed by a SETTINGS *ack*, which RFC 9113 §3.4 forbids. -/
 def testConnectionErrorIsAttributable : IO Unit := do
   let server ← Grpc.Server.serve Registry.empty { address := Grpc.Server.loopback 0 }
   let client ← connectRaw server
-  (client.send (Http2.connectionPreface.append (← clientSettingsWire true))).block
+  (client.send (_root_.Http2.connectionPreface.append (← clientSettingsWire true))).block
 
   let state ← readFramesUntil client {} hasGoAway
     "connection error did not emit a GOAWAY"
   let goAway ← firstGoAway state.frames
-  expectEq goAway.errorCode Http2.ErrorCode.internalError
-    "a connection error GOAWAY must not claim NO_ERROR"
+  expectEq goAway.errorCode _root_.Http2.ErrorCode.protocolError
+    "the invalid initial SETTINGS acknowledgement must produce PROTOCOL_ERROR"
   expect (((goAwayReason goAway).splitOn "SETTINGS").length > 1)
     ("connection-error GOAWAY must carry the failing status, got: " ++ goAwayReason goAway)
   expectPeerClosed client "connection error did not retire the socket"
@@ -194,7 +194,7 @@ but the server must still finish its own write side so the peer observes EOF. -/
 def testPeerCloseIsAttributable : IO Unit := do
   let server ← Grpc.Server.serve Registry.empty { address := Grpc.Server.loopback 0 }
   let client ← connectRaw server
-  (client.send (Http2.connectionPreface.append (← clientSettingsWire false))).block
+  (client.send (_root_.Http2.connectionPreface.append (← clientSettingsWire false))).block
   let _ ← readFramesUntil client {} (fun frames => frames.size > 0)
     "server did not send its preface"
   (client.shutdown).block
@@ -218,7 +218,7 @@ def testAcceptLoopIsObservable : IO Unit := do
   | some err => throw (IO.userError s!"live accept loop reported a failure: {err}")
 
   let client ← connectRaw server
-  (client.send (Http2.connectionPreface.append (← clientSettingsWire false))).block
+  (client.send (_root_.Http2.connectionPreface.append (← clientSettingsWire false))).block
   let _ ← readFramesUntil client {} (fun frames => frames.size > 0)
     "accepting server did not serve the accepted connection"
   (client.shutdown).block
@@ -419,7 +419,7 @@ pins that the teardown bytes are *sealed*: a GOAWAY written straight to the
 socket would be plaintext on an encrypted stream, and `feedInbound` below could
 not decrypt it. -/
 
-def tlsIdentity : IO Http2.Server.TlsConfig := do
+def tlsIdentity : IO Grpc.Http2.Server.TlsConfig := do
   let certificateDer ← IO.FS.readBinFile "Test/Fixtures/Tls/server_cert.der"
   let signingKey ← IO.FS.readBinFile "Test/Fixtures/Tls/server_key.raw"
   pure { certificateChain := #[certificateDer], signingKey := signingKey }
@@ -439,7 +439,7 @@ def rawTlsClientHello : IO ByteArray := do
 
 /-- A raw TLS peer: a real TLS 1.3 handshake with ALPN "h2", and nothing above it,
 so this test drives HTTP/2 by hand exactly as the plaintext tests do. -/
-def connectRawTls (server : Grpc.Server.Instance) : IO Grpc.Tls.ClientSession := do
+def connectRawTls (server : Grpc.Server.Instance) : IO _root_.Http2.Tls.ClientSession := do
   let socket ← Std.Async.TCP.Socket.Client.mk
   (socket.connect server.localAddress).block
   socket.noDelay
@@ -452,15 +452,16 @@ def connectRawTls (server : Grpc.Server.Instance) : IO Grpc.Tls.ClientSession :=
     alpnProtocols := #["h2"]
   }
   let (session, handshakeLeftover) ←
-    Std.Async.Async.block (Grpc.Tls.ClientSession.establishWithLeftover socket config 16384)
+    Std.Async.Async.block
+      (_root_.Http2.Tls.ClientSession.establishWithLeftover socket config 16384)
   -- This server never sends 0.5-RTT application data, so callers may treat the
   -- socket as the sole frame source; fail loudly if that ever changes.
   unless handshakeLeftover.isEmpty do
     throw (IO.userError "unexpected TLS application bytes coalesced with the server flight")
   pure session
 
-partial def readTlsFramesUntilFromSession (session : Grpc.Tls.ClientSession)
-    (state : ReadHttp2FrameState) (done : Array Http2.Frame -> Bool) :
+partial def readTlsFramesUntilFromSession (session : _root_.Http2.Tls.ClientSession)
+    (state : ReadHttp2FrameState) (done : Array _root_.Http2.Frame -> Bool) :
     IO ReadHttp2FrameState := do
   if done state.frames then
     pure state
@@ -471,14 +472,14 @@ partial def readTlsFramesUntilFromSession (session : Grpc.Tls.ClientSession)
         match ← session.feedInbound raw with
         | none => pure state
         | some plaintext =>
-            let decoded ← expectStatusOk (Http2.Frame.decodeChunk state.decoder plaintext)
+            let decoded ← expectStatusOk (_root_.Http2.Frame.decodeChunk state.decoder plaintext)
             readTlsFramesUntilFromSession session
               { decoder := { buffered := decoded.buffered },
                 frames := state.frames.append decoded.frames }
               done
 
-def readTlsFramesUntil (session : Grpc.Tls.ClientSession) (state : ReadHttp2FrameState)
-    (done : Array Http2.Frame -> Bool) (message : String) : IO ReadHttp2FrameState := do
+def readTlsFramesUntil (session : _root_.Http2.Tls.ClientSession) (state : ReadHttp2FrameState)
+    (done : Array _root_.Http2.Frame -> Bool) (message : String) : IO ReadHttp2FrameState := do
   let readTask ← IO.asTask (readTlsFramesUntilFromSession session state done)
   match ← awaitTaskWithin readTask observeTimeoutMs with
   | some result =>
@@ -513,7 +514,7 @@ partial def completeTlsHandshakeKeepingFlight (socket : Std.Async.TCP.Socket.Cli
 
 partial def readCoalescedTestFrames (socket : Std.Async.TCP.Socket.Client)
     (state : _root_.Tls.Client.State) (decode : ReadHttp2FrameState)
-    (done : Array Http2.Frame -> Bool) : IO ReadHttp2FrameState := do
+    (done : Array _root_.Http2.Frame -> Bool) : IO ReadHttp2FrameState := do
   if done decode.frames then
     pure decode
   else
@@ -522,7 +523,7 @@ partial def readCoalescedTestFrames (socket : Std.Async.TCP.Socket.Client)
     | some raw =>
         let output ← expectTlsClientOk (_root_.Tls.Client.feed state raw)
           "coalescing-test application feed"
-        let decoded ← expectStatusOk (Http2.Frame.decodeChunk decode.decoder output.plaintext)
+        let decoded ← expectStatusOk (_root_.Http2.Frame.decodeChunk decode.decoder output.plaintext)
         readCoalescedTestFrames socket output.state
           { decoder := { buffered := decoded.buffered },
             frames := decode.frames.append decoded.frames }
@@ -553,14 +554,14 @@ def testTlsCoalescedPrefaceAfterFinished : IO Unit := do
   (socket.send hello.wireBytes).block
   let (state, finishedFlight) ← completeTlsHandshakeKeepingFlight socket hello.state
   let pingPayload := ByteArray.mk (Array.replicate 8 7)
-  let ping ← expectStatusOk (Http2.Ping.frame pingPayload)
-  let pingWire ← expectStatusOk (Http2.Frame.encode ping)
-  let appBytes := (Http2.connectionPreface.append (← clientSettingsWire false)).append pingWire
+  let ping ← expectStatusOk (_root_.Http2.Ping.frame pingPayload)
+  let pingWire ← expectStatusOk (_root_.Http2.Frame.encode ping)
+  let appBytes := (_root_.Http2.connectionPreface.append (← clientSettingsWire false)).append pingWire
   let sealed ← expectTlsClientOk (_root_.Tls.Client.sealApplication state appBytes)
     "coalescing-test seal"
   (socket.send (finishedFlight.append sealed.wireBytes)).block
-  let donePingAck (frames : Array Http2.Frame) : Bool :=
-    frames.any Http2.Ping.isAck || hasGoAway frames
+  let donePingAck (frames : Array _root_.Http2.Frame) : Bool :=
+    frames.any _root_.Http2.Ping.isAck || hasGoAway frames
   let readTask ← IO.asTask (readCoalescedTestFrames socket sealed.state {} donePingAck)
   let frames ← match ← awaitTaskWithin readTask observeTimeoutMs with
     | some result => pure result.frames
@@ -573,7 +574,7 @@ def testTlsCoalescedPrefaceAfterFinished : IO Unit := do
         throw (IO.userError "coalesced preface: no PING ack within the observation window")
   expect (!hasGoAway frames)
     "a preface coalesced behind TLS Finished must not be treated as a protocol error"
-  expect (frames.any Http2.Ping.isAck)
+  expect (frames.any _root_.Http2.Ping.isAck)
     "the server must answer the PING that rode in with the TLS Finished chunk"
   Grpc.Server.shutdown server
   Grpc.Server.wait server
@@ -587,13 +588,13 @@ def testTlsConnectionErrorIsAttributable : IO Unit := do
     { address := Grpc.Server.loopback 0 }
   let session ← connectRawTls server
   expectEq (← session.alpnSelected) (some "h2") "the TLS peer must negotiate h2"
-  session.send (Http2.connectionPreface.append (← clientSettingsWire true))
+  session.send (_root_.Http2.connectionPreface.append (← clientSettingsWire true))
 
   let state ← readTlsFramesUntil session {} hasGoAway
     "TLS connection error did not emit a GOAWAY"
   let goAway ← firstGoAway state.frames
-  expectEq goAway.errorCode Http2.ErrorCode.internalError
-    "a TLS connection error GOAWAY must not claim NO_ERROR"
+  expectEq goAway.errorCode _root_.Http2.ErrorCode.protocolError
+    "the invalid initial TLS SETTINGS acknowledgement must produce PROTOCOL_ERROR"
   expect (((goAwayReason goAway).splitOn "SETTINGS").length > 1)
     ("TLS connection-error GOAWAY must carry the failing status, got: " ++ goAwayReason goAway)
   expectPeerClosed session.socket "TLS connection error did not retire the socket"
@@ -614,7 +615,7 @@ def testTlsPeerCloseIsAttributable : IO Unit := do
   let server ← Grpc.Server.serveTls Registry.empty (← tlsIdentity)
     { address := Grpc.Server.loopback 0 }
   let session ← connectRawTls server
-  session.send (Http2.connectionPreface.append (← clientSettingsWire false))
+  session.send (_root_.Http2.connectionPreface.append (← clientSettingsWire false))
   let _ ← readTlsFramesUntil session {} (fun frames => frames.size > 0)
     "TLS server did not send its preface"
   Std.Async.Async.block session.close
@@ -705,7 +706,7 @@ def testTlsShutdownDrainsConnections : IO Unit := do
   let server ← Grpc.Server.serveTls Registry.empty (← tlsIdentity)
     { address := Grpc.Server.loopback 0 }
   let session ← connectRawTls server
-  session.send (Http2.connectionPreface.append (← clientSettingsWire false))
+  session.send (_root_.Http2.connectionPreface.append (← clientSettingsWire false))
   -- Carry the decoder forward, so a frame split across TLS records is not
   -- re-parsed from the middle by the second read.
   let afterPreface ← readTlsFramesUntil session {} (fun frames => frames.size > 0)
@@ -715,7 +716,7 @@ def testTlsShutdownDrainsConnections : IO Unit := do
   let state ← readTlsFramesUntil session afterPreface hasGoAway
     "TLS graceful shutdown did not reach the connection with a GOAWAY"
   let goAway ← firstGoAway state.frames
-  expectEq goAway.errorCode Http2.ErrorCode.noError
+  expectEq goAway.errorCode _root_.Http2.ErrorCode.noError
     "a graceful TLS shutdown GOAWAY must claim NO_ERROR"
   Grpc.Server.wait server
 

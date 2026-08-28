@@ -3,7 +3,7 @@ module
 public import Std.Async.TCP
 public import Std.Async.Timer
 public import Std.Sync.CancellationToken
-public import Grpc.Tls.Session
+public import Http2.Tls.Session
 
 public section
 
@@ -117,7 +117,7 @@ private def encodeResponse (response : Response) : ByteArray :=
 
 /-- Read a full request (head + body) from the session, dispatch it, and write
 the JSON response. Reads on-demand (no eager pump). -/
-private partial def serveOneRequest (session : ServerSession) (handler : Handler)
+private partial def serveOneRequest (session : _root_.Http2.Tls.ServerSession) (handler : Handler)
     (shutdownToken : Std.CancellationToken)
     (reportFailure : ConnectionFailureStage → String → IO Unit)
     (buffered : ByteArray) : Async Unit := do
@@ -223,7 +223,7 @@ private def shutdownSocket (client : TCP.Socket.Client) : Async Unit := do
 TLS `close_notify`, bounded writer drain, then transport half-close. The normal
 path delivers the coalesced response/alert before EOF; a non-reading peer cannot
 hold teardown open indefinitely. -/
-private def retireSession (session : ServerSession)
+private def retireSession (session : _root_.Http2.Tls.ServerSession)
     (reportFailure : ConnectionFailureStage → String → IO Unit) : Async Unit := do
   try session.closeNotify catch _ => pure ()
   try
@@ -244,7 +244,7 @@ private def serveRestConnection (connectionId : Nat) (handler : Handler) (config
     (client : TCP.Socket.Client) : Async Unit := do
   let reportFailure (stage : ConnectionFailureStage) (message : String) : IO Unit :=
     recordConnectionFailure failures { connectionId, stage, message }
-  let established : Except IO.Error (ServerSession × ByteArray) ← try
+  let established : Except IO.Error (_root_.Http2.Tls.ServerSession × ByteArray) ← try
       if config.noDelay then
         client.noDelay
       let entropy ← IO.getRandomBytes 64
@@ -255,7 +255,8 @@ private def serveRestConnection (connectionId : Nat) (handler : Handler) (config
         signingKey := config.signingKey
         alpnProtocols := ["http/1.1"]
       }
-      Except.ok <$> ServerSession.establishWithLeftover client serverConfig config.readSize
+      Except.ok <$> _root_.Http2.Tls.ServerSession.establishWithLeftover
+        client serverConfig config.readSize
         (stopToken := some shutdownToken)
     catch err =>
       pure (Except.error err)

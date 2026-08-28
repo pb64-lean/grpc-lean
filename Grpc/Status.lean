@@ -1,5 +1,7 @@
 module
 
+public import Http2.Error
+
 public section
 
 namespace Grpc
@@ -130,6 +132,15 @@ def deadlineExceeded (message : String) : Status :=
 
 def resourceExhausted (message : String) : Status :=
   error .resourceExhausted message
+
+/-- Translate a protocol-foundation failure only where it crosses into the
+gRPC status domain. Wire errors remain transport-internal; rejected local
+inputs retain the argument/resource distinction exposed by the foundation. -/
+def ofHttp2Error (error : Http2.Error) : Status :=
+  match error.scope, error.code with
+  | .localInput, .protocolError => invalidArgument error.message
+  | .localInput, .enhanceYourCalm => resourceExhausted error.message
+  | _, _ => internal error.message
 
 def unimplemented (message : String) : Status :=
   error .unimplemented message

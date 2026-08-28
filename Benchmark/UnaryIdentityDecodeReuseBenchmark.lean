@@ -11,7 +11,7 @@ wire, then unary decoding parses that wire again. The candidate retains the
 first all-identity message array from `prepareBody` and applies the same unary
 cardinality/flag checks without the second parse.
 
-Only framing and unary payload selection are measured. Header validation,
+Only framing and unary payload selection are measured. _root_.Http2.Header validation,
 authorization, protobuf codecs, handlers, HTTP/2, networking, and response
 work are deliberately excluded.
 -/

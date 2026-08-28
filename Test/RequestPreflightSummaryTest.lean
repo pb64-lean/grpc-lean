@@ -13,24 +13,24 @@ private def expect (condition : Bool) (message : String) : IO Unit := do
   unless condition do
     fail message
 
-private def expectOk (context : String) (result : Except Status α) : IO α := do
+private def expectOk [Repr ε] (context : String) (result : Except ε α) : IO α := do
   match result with
   | .ok value => pure value
-  | .error status => fail s!"{context}: {status.code}: {status.messageD}"
+  | .error error => fail s!"{context}: {(repr error).pretty}"
 
-private def reference (metadata : Metadata) : PreflightResult :=
+private def reference (metadata : _root_.Http2.Headers) : PreflightResult :=
   Headers.TestSupport.requestHeaderPreflightReferenceForBenchmark metadata
 
-private def candidate (metadata : Metadata) : PreflightResult :=
+private def candidate (metadata : _root_.Http2.Headers) : PreflightResult :=
   Headers.TestSupport.requestHeaderPreflightCandidateForBenchmark metadata
 
-private def validatedReference (metadata : Metadata) : PreflightResult :=
+private def validatedReference (metadata : _root_.Http2.Headers) : PreflightResult :=
   Headers.TestSupport.validateRequestHeaderPreflightReferenceForBenchmark metadata
 
-private def validatedCandidate (metadata : Metadata) : PreflightResult :=
+private def validatedCandidate (metadata : _root_.Http2.Headers) : PreflightResult :=
   Headers.TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata
 
-private def expectExact (label : String) (metadata : Metadata)
+private def expectExact (label : String) (metadata : _root_.Http2.Headers)
     (expected? : Option PreflightResult := none) : IO Unit := do
   let referenceResult := reference metadata
   let candidateResult := candidate metadata
@@ -42,7 +42,7 @@ private def expectExact (label : String) (metadata : Metadata)
   expect (validatedCandidateResult == validatedReferenceResult) <|
     s!"{label}: fused validation/classification differs from the exact separate sequence; " ++
       s!"reference={repr validatedReferenceResult}, candidate={repr validatedCandidateResult}"
-  match Metadata.validate metadata with
+  match Grpc.Metadata.validate metadata with
   | .error status =>
       expect (validatedReferenceResult == .reject status) <|
         s!"{label}: metadata validation failure did not retain precedence; " ++
@@ -58,7 +58,7 @@ private def expectExact (label : String) (metadata : Metadata)
         s!"{label}: reference result differs from the independent expectation; " ++
           s!"expected={repr expected}, actual={repr referenceResult}"
 
-private def expectValidatedExact (label : String) (metadata : Metadata)
+private def expectValidatedExact (label : String) (metadata : _root_.Http2.Headers)
     (expected : PreflightResult) : IO Unit := do
   let referenceResult := validatedReference metadata
   let candidateResult := validatedCandidate metadata
@@ -80,36 +80,36 @@ private def unknownMethod : MethodName := {
 }
 
 private def basePseudoHeaders (scheme : String := "https")
-    (path : String := method.path) : List Header := [
-  Header.of ":method" "POST",
-  Header.of ":scheme" scheme,
-  Header.of ":path" path,
-  Header.of ":authority" "widgets.internal"
+    (path : String := method.path) : List _root_.Http2.Header := [
+  _root_.Http2.Header.of ":method" "POST",
+  _root_.Http2.Header.of ":scheme" scheme,
+  _root_.Http2.Header.of ":path" path,
+  _root_.Http2.Header.of ":authority" "widgets.internal"
 ]
 
-private def metadataFrom (pseudo regular : List Header) : Metadata :=
-  (pseudo ++ regular).foldl (fun metadata header => metadata.push header) Metadata.empty
+private def metadataFrom (pseudo regular : List _root_.Http2.Header) : _root_.Http2.Headers :=
+  (pseudo ++ regular).foldl (fun metadata header => metadata.push header) _root_.Http2.Headers.empty
 
-private def pushOptional (metadata : Metadata) (name : String) :
-    Option String → Metadata
+private def pushOptional (metadata : _root_.Http2.Headers) (name : String) :
+    Option String → _root_.Http2.Headers
   | none => metadata
   | some value => metadata.insert name value
 
-private def replaceValues (metadata : Metadata) (name : String)
-    (values : Array String) : Metadata :=
-  let key := Header.normalizeName name
+private def replaceValues (metadata : _root_.Http2.Headers) (name : String)
+    (values : Array String) : _root_.Http2.Headers :=
+  let key := _root_.Http2.Header.normalizeName name
   let retained := metadata.filter fun header => header.name != key
   values.foldl (fun result value => result.insert name value) retained
 
-private def replaceHeaderValue (metadata : Metadata) (name value : String) : Metadata :=
-  let key := Header.normalizeName name
+private def replaceHeaderValue (metadata : _root_.Http2.Headers) (name value : String) : _root_.Http2.Headers :=
+  let key := _root_.Http2.Header.normalizeName name
   metadata.map fun header =>
     if header.name == key then { header with value := value } else header
 
-private def minimalAccepted (path : String := method.path) : Metadata :=
+private def minimalAccepted (path : String := method.path) : _root_.Http2.Headers :=
   metadataFrom (basePseudoHeaders (path := path)) [
-    Header.of "content-type" "application/grpc",
-    Header.of "te" "trailers"
+    _root_.Http2.Header.of "content-type" "application/grpc",
+    _root_.Http2.Header.of "te" "trailers"
   ]
 
 private structure TimeoutCase where
@@ -191,8 +191,8 @@ private def testAcceptedCartesianProduct : IO Nat := do
           for encodingCase in encodingCases do
             for acceptCase in acceptEncodingCases do
               let metadata := metadataFrom (basePseudoHeaders scheme) [
-                Header.of "te" "trailers",
-                Header.of "content-type" contentType
+                _root_.Http2.Header.of "te" "trailers",
+                _root_.Http2.Header.of "content-type" contentType
               ]
               let metadata := pushOptional metadata "grpc-timeout" timeoutCase.raw?
               let metadata := pushOptional metadata "content-length" lengthCase.raw?
@@ -229,14 +229,14 @@ private def permutations : List α → List (List α)
 headers are permuted separately while remaining before regular metadata, as
 required by HTTP/2. -/
 private def testPermutations : IO Nat := do
-  let regular : List Header := [
-    Header.of "content-type" "application/grpc+proto",
-    Header.of "te" "trailers",
-    Header.of "grpc-timeout" "250m",
-    Header.of "content-length" "18446744073709551616",
-    Header.of "grpc-encoding" "gzip",
-    Header.of "grpc-accept-encoding" "identity, gzip",
-    Header.of "x-request-id" "permutation-control"
+  let regular : List _root_.Http2.Header := [
+    _root_.Http2.Header.of "content-type" "application/grpc+proto",
+    _root_.Http2.Header.of "te" "trailers",
+    _root_.Http2.Header.of "grpc-timeout" "250m",
+    _root_.Http2.Header.of "content-length" "18446744073709551616",
+    _root_.Http2.Header.of "grpc-encoding" "gzip",
+    _root_.Http2.Header.of "grpc-accept-encoding" "identity, gzip",
+    _root_.Http2.Header.of "x-request-id" "permutation-control"
   ]
   let expected : PreflightResult := .accept {
     method
@@ -253,14 +253,14 @@ private def testPermutations : IO Nat := do
   expect (checked == 5040)
     s!"regular-header corpus checked {checked} permutations instead of 5,040"
 
-  let fixedRegular : List Header := [
-    Header.of "content-type" "application/grpc",
-    Header.of "te" "trailers"
+  let fixedRegular : List _root_.Http2.Header := [
+    _root_.Http2.Header.of "content-type" "application/grpc",
+    _root_.Http2.Header.of "te" "trailers"
   ]
   let mut pseudoChecked := 0
   for ordering in permutations (basePseudoHeaders) do
     let metadata := metadataFrom ordering fixedRegular
-    match Metadata.validate metadata with
+    match Grpc.Metadata.validate metadata with
     | .error status =>
         fail s!"pseudo-permutation/{pseudoChecked}: unexpectedly invalid: {status.messageD}"
     | .ok () => pure ()
@@ -278,11 +278,11 @@ private def testPermutations : IO Nat := do
   pure (checked + pseudoChecked)
 
 private def duplicateStatus (name : String) : Status :=
-  Status.invalidArgument s!"duplicate {Header.normalizeName name} header"
+  Status.invalidArgument s!"duplicate {_root_.Http2.Header.normalizeName name} header"
 
 private def testSingletonDuplicates : IO Nat := do
   let base := minimalAccepted
-  let cases : Array (String × Metadata × PreflightResult) := #[
+  let cases : Array (String × _root_.Http2.Headers × PreflightResult) := #[
     ("content-type/unsupported-first",
       replaceValues base "content-type" #["application/json", "application/grpc"],
       .unsupportedContentType),
@@ -327,41 +327,41 @@ private def testSingletonDuplicates : IO Nat := do
 
 private structure ValidationStage where
   label : String
-  good : Header
-  bad : Header
+  good : _root_.Http2.Header
+  bad : _root_.Http2.Header
   expected : Status
   deriving Inhabited
 
 private def validationStages : Array ValidationStage := #[
   {
     label := "te"
-    good := Header.of "te" "trailers"
-    bad := Header.of "te" "not-trailers"
+    good := _root_.Http2.Header.of "te" "trailers"
+    bad := _root_.Http2.Header.of "te" "not-trailers"
     expected := Status.invalidArgument "gRPC requests must send te: trailers"
   },
   {
     label := "timeout"
-    good := Header.of "grpc-timeout" "1S"
-    bad := Header.of "grpc-timeout" "not-a-timeout"
+    good := _root_.Http2.Header.of "grpc-timeout" "1S"
+    bad := _root_.Http2.Header.of "grpc-timeout" "not-a-timeout"
     expected := Status.invalidArgument "invalid grpc-timeout header not-a-timeout"
   },
   {
     label := "content-length"
-    good := Header.of "content-length" "7"
-    bad := Header.of "content-length" "not-a-length"
+    good := _root_.Http2.Header.of "content-length" "7"
+    bad := _root_.Http2.Header.of "content-length" "not-a-length"
     expected := Status.invalidArgument "invalid content-length header not-a-length"
   },
   {
     label := "encoding"
-    good := Header.of "grpc-encoding" "gzip"
-    bad := Header.of "grpc-encoding" "deflate"
+    good := _root_.Http2.Header.of "grpc-encoding" "gzip"
+    bad := _root_.Http2.Header.of "grpc-encoding" "deflate"
     expected := Status.unimplemented "unsupported grpc-encoding deflate"
   }
 ]
 
 private def stagedMetadata (firstInvalid secondInvalid : Nat)
-    (order : Array Nat) : Metadata :=
-  let regular := order.foldl (init := [Header.of "content-type" "application/grpc"])
+    (order : Array Nat) : _root_.Http2.Headers :=
+  let regular := order.foldl (init := [_root_.Http2.Header.of "content-type" "application/grpc"])
     fun headers index =>
       let stage := validationStages[index]!
       headers ++ [if index == firstInvalid || index == secondInvalid then stage.bad else stage.good]
@@ -403,13 +403,13 @@ private def testErrorPrecedence : IO Nat := do
   checked := checked + 1
 
   let statusMetadata := metadataFrom [
-      Header.of ":method" "POST",
-      Header.of ":scheme" "https",
-      Header.of ":status" "200",
-      Header.of ":path" "/invalid"
+      _root_.Http2.Header.of ":method" "POST",
+      _root_.Http2.Header.of ":scheme" "https",
+      _root_.Http2.Header.of ":status" "200",
+      _root_.Http2.Header.of ":path" "/invalid"
     ] [
-      Header.of "content-type" "application/grpc",
-      Header.of "te" "trailers"
+      _root_.Http2.Header.of "content-type" "application/grpc",
+      _root_.Http2.Header.of "te" "trailers"
     ]
   expectExact "precedence/status-before-path" statusMetadata
     (some (.reject (Status.invalidArgument "gRPC requests must not include :status")))
@@ -424,41 +424,41 @@ private def testErrorPrecedence : IO Nat := do
 
   pure checked
 
-/- A short-circuiting executable must remain total over arbitrary `Metadata`,
-not only metadata admitted by `Metadata.validate`.  These physically invalid
+/- A short-circuiting executable must remain total over arbitrary `_root_.Http2.Headers`,
+not only metadata admitted by `Grpc.Metadata.validate`.  These physically invalid
 orders put higher-precedence pseudo-header facts after a supported content type
 or put a later unsupported content type after the supported first value. -/
 private def testArbitraryOrderSuffixSafety : IO Nat := do
-  let cases : Array (String × Metadata × PreflightResult) := #[
+  let cases : Array (String × _root_.Http2.Headers × PreflightResult) := #[
     ("supported-content-type-before-late-bad-method", #[
-        Header.of "content-type" "application/grpc",
-        Header.of ":method" "GET",
-        Header.of ":scheme" "https",
-        Header.of ":path" method.path,
-        Header.of "te" "trailers"
+        _root_.Http2.Header.of "content-type" "application/grpc",
+        _root_.Http2.Header.of ":method" "GET",
+        _root_.Http2.Header.of ":scheme" "https",
+        _root_.Http2.Header.of ":path" method.path,
+        _root_.Http2.Header.of "te" "trailers"
       ], .reject (Status.invalidArgument "gRPC requests must use POST")),
     ("pending-bad-scheme-before-later-bad-method", #[
-        Header.of ":scheme" "ftp",
-        Header.of "content-type" "application/grpc",
-        Header.of ":method" "GET",
-        Header.of ":path" method.path,
-        Header.of "te" "trailers"
+        _root_.Http2.Header.of ":scheme" "ftp",
+        _root_.Http2.Header.of "content-type" "application/grpc",
+        _root_.Http2.Header.of ":method" "GET",
+        _root_.Http2.Header.of ":path" method.path,
+        _root_.Http2.Header.of "te" "trailers"
       ], .reject (Status.invalidArgument "gRPC requests must use POST")),
     ("invalid-path-before-late-status", #[
-        Header.of ":method" "POST",
-        Header.of ":scheme" "https",
-        Header.of ":path" "/invalid",
-        Header.of "content-type" "application/grpc",
-        Header.of "te" "trailers",
-        Header.of ":status" "200"
+        _root_.Http2.Header.of ":method" "POST",
+        _root_.Http2.Header.of ":scheme" "https",
+        _root_.Http2.Header.of ":path" "/invalid",
+        _root_.Http2.Header.of "content-type" "application/grpc",
+        _root_.Http2.Header.of "te" "trailers",
+        _root_.Http2.Header.of ":status" "200"
       ], .reject (Status.invalidArgument "gRPC requests must not include :status")),
     ("later-unsupported-content-type-is-still-a-duplicate", #[
-        Header.of ":method" "POST",
-        Header.of ":scheme" "https",
-        Header.of ":path" method.path,
-        Header.of "content-type" "application/grpc",
-        Header.of "te" "trailers",
-        Header.of "content-type" "application/json"
+        _root_.Http2.Header.of ":method" "POST",
+        _root_.Http2.Header.of ":scheme" "https",
+        _root_.Http2.Header.of ":path" method.path,
+        _root_.Http2.Header.of "content-type" "application/grpc",
+        _root_.Http2.Header.of "te" "trailers",
+        _root_.Http2.Header.of "content-type" "application/json"
       ], .reject (duplicateStatus "content-type"))
   ]
   for (label, metadata, expected) in cases do
@@ -469,8 +469,8 @@ private def testArbitraryOrderSuffixSafety : IO Nat := do
 errors outrank every ordinary header error; after the layout succeeds, the
 first ordinary validation error outranks HTTP 415 and all semantic outcomes. -/
 private def testFusedValidationPrecedence : IO Nat := do
-  let cases : Array (String × Metadata × PreflightResult) := #[
-    ("late-pseudo-after-invalid-regular", Metadata.empty
+  let cases : Array (String × _root_.Http2.Headers × PreflightResult) := #[
+    ("late-pseudo-after-invalid-regular", _root_.Http2.Headers.empty
       |>.insert ":method" "POST"
       |>.insert ":scheme" "https"
       |>.insert ":path" method.path
@@ -478,11 +478,11 @@ private def testFusedValidationPrecedence : IO Nat := do
       |>.insert ":authority" "widgets.internal",
       .reject (Status.invalidArgument
         "HTTP/2 pseudo-header :authority appeared after regular metadata")),
-    ("duplicate-unknown-pseudo-before-invalid-name", Metadata.empty
+    ("duplicate-unknown-pseudo-before-invalid-name", _root_.Http2.Headers.empty
       |>.insert ":bogus" "first"
       |>.insert ":bogus" "second",
       .reject (Status.invalidArgument "duplicate HTTP/2 pseudo-header :bogus")),
-    ("duplicate-pseudo-after-invalid-pseudo-value", Metadata.empty
+    ("duplicate-pseudo-after-invalid-pseudo-value", _root_.Http2.Headers.empty
       |>.insert ":method" "\u0000"
       |>.insert ":scheme" "https"
       |>.insert ":scheme" "http",
@@ -509,7 +509,7 @@ private def testFusedValidationPrecedence : IO Nat := do
     ("first-ordinary-validation-error",
       minimalAccepted
         |>.push { name := "bad header", value := "x" }
-        |>.push (Header.of "connection" "keep-alive"),
+        |>.push (_root_.Http2.Header.of "connection" "keep-alive"),
       .reject (Status.invalidArgument "invalid gRPC metadata name bad header"))
   ]
   for (label, metadata, expected) in cases do
@@ -542,7 +542,7 @@ private def testDirectedValues : IO Nat := do
       (some (.reject (Status.unimplemented s!"unsupported grpc-encoding {value}")))
     checked := checked + 1
 
-  let requiredCases : Array (String × Metadata × PreflightResult) := #[
+  let requiredCases : Array (String × _root_.Http2.Headers × PreflightResult) := #[
     ("missing-method", replaceValues base ":method" #[],
       .reject (Status.invalidArgument "missing :method header")),
     ("missing-scheme", replaceValues base ":scheme" #[],
@@ -570,30 +570,17 @@ private def testDirectedValues : IO Nat := do
     expectExact s!"directed/{label}" metadata (some expected)
   pure (checked + requiredCases.size)
 
-private def decodeRejectedHeaders (frames : Array Http2.Frame) : IO Metadata := do
-  let block := frames.foldl (init := ByteArray.empty) fun bytes frame =>
-    if frame.header.frameType == .headers || frame.header.frameType == .continuation then
-      bytes.append frame.payload
-    else
-      bytes
-  expect (!block.isEmpty) "production rejection did not contain a header block"
-  let decoded ← expectOk "decode production rejection" (Http2.Hpack.decodeHeaderBlock {} block)
-  pure decoded.headers
-
-private def productionRejectionHeaders (registry : Registry) (metadata : Metadata) :
-    IO Metadata := do
-  let decision ← expectOk "run production request preflight"
-    (Http2.Transport.preflightEarlyRequest registry {} 1 metadata)
-  match decision with
-  | .accept _ _ => fail "production preflight unexpectedly accepted the request"
-  | .reject frames _ => decodeRejectedHeaders frames
 
 private def expectProductionGrpcStatus (label : String) (registry : Registry)
-    (metadata : Metadata) (expected : Status) : IO Unit := do
-  let headers ← productionRejectionHeaders registry metadata
-  let actual ← expectOk s!"{label}: decode gRPC status" (Headers.statusFromTrailers headers)
-  expect (actual == expected)
-    s!"{label}: production status differs; expected={repr expected}, actual={repr actual}"
+    (metadata : _root_.Http2.Headers) (expected : Status) : IO Unit := do
+  match Grpc.Http2.Transport.preflightRequest registry metadata with
+  | .rejectGrpc actual =>
+      expect (actual == expected)
+        s!"{label}: production status differs; expected={repr expected}, actual={repr actual}"
+  | .rejectHttp statusCode =>
+      fail s!"{label}: expected gRPC rejection, got HTTP {statusCode}"
+  | .accept _ _ =>
+      fail s!"{label}: production preflight unexpectedly accepted the request"
 
 private def testProductionPath : IO Nat := do
   let registry := Registry.empty.registerUnary method fun request =>
@@ -603,10 +590,11 @@ private def testProductionPath : IO Nat := do
     |>.insert "content-length" "7"
     |>.insert "grpc-encoding" "gzip"
     |>.insert "grpc-accept-encoding" "identity, gzip"
-  let decision ← expectOk "production registered preflight"
-    (Http2.Transport.preflightEarlyRequest registry {} 1 acceptedMetadata)
-  match decision with
-  | .reject _ _ => fail "production preflight rejected registered valid metadata"
+  match Grpc.Http2.Transport.preflightRequest registry acceptedMetadata with
+  | .rejectGrpc status =>
+      fail s!"production preflight rejected registered metadata: {status.messageD}"
+  | .rejectHttp statusCode =>
+      fail s!"production preflight rejected registered metadata with HTTP {statusCode}"
   | .accept entry preflight =>
       expect (entry.name == method && entry.shape == .unary)
         "production preflight selected the wrong registered entry"
@@ -623,11 +611,14 @@ private def testProductionPath : IO Nat := do
     (Status.unimplemented s!"unknown gRPC method {unknownMethod.path}")
 
   let unsupported := replaceValues (minimalAccepted) "content-type" #["application/json"]
-  let unsupportedHeaders ← productionRejectionHeaders registry unsupported
-  expect (Metadata.get? unsupportedHeaders ":status" == some "415")
-    "production unsupported content type did not use HTTP 415"
-  expect (Metadata.get? unsupportedHeaders "grpc-status" == none)
-    "production HTTP 415 unexpectedly contained a gRPC status"
+  match Grpc.Http2.Transport.preflightRequest registry unsupported with
+  | .rejectHttp "415" => pure ()
+  | .rejectHttp statusCode =>
+      fail s!"production unsupported content type returned HTTP {statusCode}"
+  | .rejectGrpc status =>
+      fail s!"production unsupported content type returned gRPC {status.code}"
+  | .accept _ _ =>
+      fail "production unsupported content type was accepted"
 
   let invalidMetadata := (replaceValues
       (replaceHeaderValue (minimalAccepted) ":method" "GET")
@@ -636,23 +627,23 @@ private def testProductionPath : IO Nat := do
   expectProductionGrpcStatus "production/metadata-before-415" registry invalidMetadata
     (Status.invalidArgument "invalid gRPC metadata name bad header")
 
-  let latePseudo := metadataFrom [Header.of ":method" "POST"] [
-    Header.of "content-type" "application/json",
-    Header.of ":scheme" "https",
-    Header.of ":path" method.path,
-    Header.of "te" "trailers"
+  let latePseudo := metadataFrom [_root_.Http2.Header.of ":method" "POST"] [
+    _root_.Http2.Header.of "content-type" "application/json",
+    _root_.Http2.Header.of ":scheme" "https",
+    _root_.Http2.Header.of ":path" method.path,
+    _root_.Http2.Header.of "te" "trailers"
   ]
   expectProductionGrpcStatus "production/late-pseudo-before-415" registry latePseudo
     (Status.invalidArgument "HTTP/2 pseudo-header :scheme appeared after regular metadata")
 
   let duplicatePseudo := metadataFrom [
-    Header.of ":method" "POST",
-    Header.of ":scheme" "http",
-    Header.of ":scheme" "https",
-    Header.of ":path" method.path
+    _root_.Http2.Header.of ":method" "POST",
+    _root_.Http2.Header.of ":scheme" "http",
+    _root_.Http2.Header.of ":scheme" "https",
+    _root_.Http2.Header.of ":path" method.path
   ] [
-    Header.of "content-type" "application/json",
-    Header.of "te" "trailers"
+    _root_.Http2.Header.of "content-type" "application/json",
+    _root_.Http2.Header.of "te" "trailers"
   ]
   expectProductionGrpcStatus "production/duplicate-pseudo-before-415" registry duplicatePseudo
     (Status.invalidArgument "duplicate HTTP/2 pseudo-header :scheme")

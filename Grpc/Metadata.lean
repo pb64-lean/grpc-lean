@@ -1,175 +1,14 @@
 module
 
-public import Grpc.Bytes
+public import Http2.Bytes
 public import Grpc.Status
+public import Http2.Header
 
 public section
 
-open Grpc.Bytes
+open _root_.Http2.Bytes
 
 namespace Grpc
-
-structure Header where
-  name : String
-  value : String
-  deriving Inhabited, Repr, DecidableEq
-
-abbrev Metadata := Array Header
-
-namespace Header
-
-@[inline] private def isAsciiNonUpperByte (byte : UInt8) : Bool :=
-  byte < 128 && !(65 <= byte && byte <= 90)
-
-private def isAsciiWithoutUpperFrom (name : String) (index : Nat) : Bool :=
-  if h : index < name.utf8ByteSize then
-    let byte := name.getUTF8Byte ⟨index⟩ (by
-      simpa only [String.Pos.Raw.lt_iff, String.byteIdx_rawEndPos] using h)
-    if isAsciiNonUpperByte byte then
-      isAsciiWithoutUpperFrom name (index + 1)
-    else
-      false
-  else
-    true
-termination_by name.utf8ByteSize - index
-
-/-- Executable header-name normalization. Common already-normalized ASCII names
-retain their original String object; ASCII uppercase and every non-ASCII input
-fall back to the exact existing `String.toLower` behavior. -/
-def normalizeNameByteIndexed (name : String) : String :=
-  if isAsciiWithoutUpperFrom name 0 then name else name.toLower
-
-/-- Logical header-name normalization. Generated code first uses the
-differential-tested byte scan to reuse already-normalized ASCII names. -/
-@[implemented_by normalizeNameByteIndexed]
-def normalizeName (name : String) : String :=
-  name.toLower
-
-/-- A name already fixed by lowercase normalization is also fixed by the
-public header-name normalizer. -/
-theorem normalizeName_eq_self (name : String) (h : name.toLower = name) :
-    normalizeName name = name := by
-  unfold normalizeName
-  exact h
-
-@[expose] def of (name value : String) : Header :=
-  { name := normalizeName name, value := value }
-
-def isBinary (header : Header) : Bool :=
-  header.name.endsWith "-bin"
-
-end Header
-
-namespace Metadata
-
-def empty : Metadata := #[]
-
-def insert (metadata : Metadata) (name value : String) : Metadata :=
-  metadata.push (Header.of name value)
-
-def singleton (name value : String) : Metadata :=
-  empty.insert name value
-
-@[expose] def getAll (metadata : Metadata) (name : String) : Array String :=
-  let key := Header.normalizeName name
-  metadata.filterMap fun header =>
-    if header.name == key then some header.value else none
-
-@[expose] def get? (metadata : Metadata) (name : String) : Option String :=
-  (getAll metadata name)[0]?
-
-private def getLastUSizeLoop (metadata : Metadata) (key : String)
-    (i : USize) (bound : i.toNat ≤ metadata.size) : Option String :=
-  if atStart : i = 0 then
-    none
-  else
-    have positive : 0 < i.toNat := by
-      have nonzero : i.toNat ≠ 0 := by
-        intro zero
-        apply atStart
-        exact USize.toNat_inj.mp (by simpa using zero)
-      omega
-    have oneLe : (1 : USize) ≤ i := by
-      rw [USize.le_iff_toNat_le]
-      simpa using positive
-    let previous := i - 1
-    have previousToNat : previous.toNat = i.toNat - 1 := by
-      simpa [previous] using USize.toNat_sub_of_le i 1 oneLe
-    have previousBound : previous.toNat < metadata.size := by
-      omega
-    let header := metadata.uget previous previousBound
-    if header.name == key then
-      some header.value
-    else
-      getLastUSizeLoop metadata key previous (Nat.le_of_lt previousBound)
-termination_by i.toNat
-decreasing_by
-  rw [USize.toNat_sub_of_le i 1 oneLe]
-  rw [USize.toNat_one]
-  omega
-
-private def getLastUSize (metadata : Metadata) (name : String) : Option String :=
-  let key := Header.normalizeName name
-  getLastUSizeLoop metadata key metadata.usize (by
-    simp only [Array.usize, Nat.toUSize_eq, USize.toNat_ofNat']
-    exact Nat.mod_le _ _)
-
-/-- Return the last value for a header name without materializing the complete
-array of matches. Header names use the same normalization and stored-name
-comparison as `getAll`. The runtime implementation short-circuits a reverse
-scan with native indices and statically proved array bounds. Full-range
-coverage relies on Lean's documented runtime invariant that `Array.usize` is
-the exact size of every representable array. -/
-@[implemented_by getLastUSize, expose]
-def getLast? (metadata : Metadata) (name : String) : Option String :=
-  let key := Header.normalizeName name
-  metadata.findSomeRev? fun header =>
-    if header.name == key then some header.value else none
-
-/-- The reverse search is exactly the former `getAll`/`back?` composition. -/
-theorem getLast?_eq_getAll_back? (metadata : Metadata) (name : String) :
-    getLast? metadata name = (getAll metadata name).back? := by
-  simp [getLast?, getAll]
-
-def contains (metadata : Metadata) (name value : String) : Bool :=
-  (getAll metadata name).contains value
-
-def append (left right : Metadata) : Metadata :=
-  right.foldl (fun acc header => acc.push header) left
-
-private def headerListEntrySizeReference (header : Header) : Nat :=
-  header.name.toUTF8.size + header.value.toUTF8.size + 32
-
-private def headerListEntrySizeCandidate (header : Header) : Nat :=
-  header.name.utf8ByteSize + header.value.utf8ByteSize + 32
-
-private theorem headerListEntrySizeCandidate_eq_reference (header : Header) :
-    headerListEntrySizeCandidate header = headerListEntrySizeReference header := by
-  unfold headerListEntrySizeCandidate headerListEntrySizeReference
-  rw [String.toUTF8_eq_toByteArray, String.toUTF8_eq_toByteArray,
-    String.size_toByteArray, String.size_toByteArray]
-
-/-- HTTP/2 header-list accounting.  The logical definition retains the former
-byte-array sizes; generated code reads each string's cached UTF-8 byte size
-without allocating a temporary `ByteArray`. -/
-@[implemented_by headerListEntrySizeCandidate]
-def headerListEntrySize (header : Header) : Nat :=
-  headerListEntrySizeReference header
-
-def headerListSize (metadata : Metadata) : Nat :=
-  metadata.foldl (fun total header => total + headerListEntrySize header) 0
-
-def validateHeaderListSize (maxSize? : Option Nat) (metadata : Metadata) : Except Status Unit := do
-  match maxSize? with
-  | none => pure ()
-  | some maxSize =>
-      let actual := headerListSize metadata
-      if actual > maxSize then
-        throw (Status.resourceExhausted s!"HTTP/2 header list exceeds configured size limit {maxSize}")
-      else
-        pure ()
-
-end Metadata
 
 namespace Ascii
 
@@ -579,11 +418,15 @@ end Base64
 
 namespace Metadata
 
+/-- Whether a field carries gRPC binary metadata. -/
+def isBinary (header : Http2.Header) : Bool :=
+  header.name.endsWith "-bin"
+
 private def binaryKey (name : String) : String :=
-  let key := Header.normalizeName name
+  let key := Http2.Header.normalizeName name
   if key.endsWith "-bin" then key else key ++ "-bin"
 
-def insertBinary (metadata : Metadata) (name : String) (bytes : ByteArray) : Metadata :=
+def insertBinary (metadata : Http2.Headers) (name : String) (bytes : ByteArray) : Http2.Headers :=
   metadata.insert (binaryKey name) (Base64.encodeBytesUnpadded bytes)
 
 private def binaryValues (value : String) : List String :=
@@ -598,13 +441,13 @@ private def decodeBinaryHeaderValue (name value : String) : Except String (Array
   (binaryValues value).foldlM (init := #[]) fun values part => do
     pure (values.push (← decodeBinaryValue name part))
 
-def getBinaryAll (metadata : Metadata) (name : String) : Except String (Array ByteArray) :=
+def getBinaryAll (metadata : Http2.Headers) (name : String) : Except String (Array ByteArray) :=
   let key := binaryKey name
   (metadata.getAll key).foldlM (init := #[]) fun values value => do
     pure (values.append (← decodeBinaryHeaderValue key value))
 
-def getBinary? (metadata : Metadata) (name : String) : Except String (Option ByteArray) := do
-  pure (← metadata.getBinaryAll name)[0]?
+def getBinary? (metadata : Http2.Headers) (name : String) : Except String (Option ByteArray) := do
+  pure (← getBinaryAll metadata name)[0]?
 
 private def knownPseudoHeader (name : String) : Bool :=
   name == ":method"
@@ -629,7 +472,7 @@ private def forbiddenHttp2HeaderName (name : String) : Bool :=
 /-- Validate the HTTP/2 pseudo-header layout before ordinary header values.
 This is exposed as the first stage of metadata validation so proved fused
 consumers can retain the exact `validate` error precedence. -/
-def validatePseudoHeaders (metadata : Metadata) : Except Status Unit := do
+def validatePseudoHeaders (metadata : Http2.Headers) : Except Status Unit := do
   let _ ← metadata.foldlM (init := (false, (#[] : Array String))) fun state header => do
     let (seenRegular, seenPseudo) := state
     let name := header.name
@@ -644,12 +487,12 @@ def validatePseudoHeaders (metadata : Metadata) : Except Status Unit := do
       pure (true, seenPseudo)
   pure ()
 
-def validateHeader (header : Header) : Except Status Unit := do
+def validateHeader (header : Http2.Header) : Except Status Unit := do
   if !validHeaderName header.name then
     throw (Status.invalidArgument s!"invalid gRPC metadata name {header.name}")
   if forbiddenHttp2HeaderName header.name then
     throw (Status.invalidArgument s!"HTTP/2 connection-specific metadata is forbidden: {header.name}")
-  if header.isBinary then
+  if isBinary header then
     match decodeBinaryHeaderValue header.name header.value with
     | .ok _ => pure ()
     | .error err => throw (Status.invalidArgument err)
@@ -658,14 +501,14 @@ def validateHeader (header : Header) : Except Status Unit := do
   else
     throw (Status.invalidArgument s!"invalid ASCII gRPC metadata value for {header.name}")
 
-private theorem validateHeader_eq_visible_of_plainName (header : Header)
+private theorem validateHeader_eq_visible_of_plainName (header : Http2.Header)
     (hvalid : validHeaderName header.name = true)
     (hconnection : header.name ≠ "connection")
     (hkeepAlive : header.name ≠ "keep-alive")
     (hproxyConnection : header.name ≠ "proxy-connection")
     (htransferEncoding : header.name ≠ "transfer-encoding")
     (hupgrade : header.name ≠ "upgrade")
-    (hbinary : header.isBinary = false) :
+    (hbinary : isBinary header = false) :
     validateHeader header =
       if Ascii.isVisibleString header.value then
         .ok ()
@@ -678,7 +521,7 @@ private theorem validateHeader_eq_visible_of_plainName (header : Header)
 
 /-- Fixed managed-request names bypass name, forbidden-header, and binary
 validation; their exact remaining validation is the visible-string check. -/
-theorem validateHeader_eq_visible_of_fixedRequestName (header : Header)
+theorem validateHeader_eq_visible_of_fixedRequestName (header : Http2.Header)
     (hname :
       header.name = "te" ∨
       header.name = ":path" ∨
@@ -706,7 +549,7 @@ theorem validateHeader_eq_visible_of_fixedRequestName (header : Header)
       all_goals simp only at hname
       all_goals subst name
       all_goals apply validateHeader_eq_visible_of_plainName
-      all_goals simp only [Header.isBinary]
+      all_goals simp only [isBinary]
       all_goals try simp [validHeaderName, knownPseudoHeader,
         Ascii.validHeaderName, Ascii.isLowercaseHeaderNameChar]
       all_goals rw [String.endsWith_eq_endsWith_toSlice,
@@ -714,13 +557,13 @@ theorem validateHeader_eq_visible_of_fixedRequestName (header : Header)
       all_goals simp
       all_goals decide
 
-@[expose] def validate (metadata : Metadata) : Except Status Unit := do
+@[expose] def validate (metadata : Http2.Headers) : Except Status Unit := do
   validatePseudoHeaders metadata
   metadata.forM validateHeader
 
 /-- The public validation sequence is pseudo-header layout first, followed by
 ordinary name/value validation in array order. -/
-theorem validate_eq_stages (metadata : Metadata) :
+theorem validate_eq_stages (metadata : Http2.Headers) :
     validate metadata = (do
       validatePseudoHeaders metadata
       metadata.forM validateHeader) := rfl

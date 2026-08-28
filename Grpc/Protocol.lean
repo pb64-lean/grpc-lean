@@ -5,13 +5,14 @@ import all Init.Data.String.Slice
 import all Init.Data.String.TakeDrop
 
 public import Std.Sync.Channel
-public import Grpc.Bytes
+public import Http2.Bytes
+public import Http2.Header
 public import Grpc.Framing
 public import Grpc.Metadata
 
 public section
 
-open Grpc.Bytes
+open _root_.Http2.Bytes
 
 namespace Grpc
 
@@ -502,7 +503,7 @@ end Deadline
 
 structure UnaryRequest where
   method : MethodName
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   timeout : Option Timeout := none
   /-- Absolute deadline on `IO.monoNanosNow`'s clock, set when the request
   carried a `grpc-timeout`.  Pass it to `Deadline.remaining?` (or
@@ -513,7 +514,7 @@ structure UnaryRequest where
 
 structure ClientStreamingRequest where
   method : MethodName
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   timeout : Option Timeout := none
   /-- Absolute deadline on `IO.monoNanosNow`'s clock; see
   `UnaryRequest.deadline`. -/
@@ -522,7 +523,7 @@ structure ClientStreamingRequest where
 
 structure ClientStreamingStreamRequest where
   method : MethodName
-  metadata : Metadata
+  metadata : _root_.Http2.Headers
   timeout : Option Timeout := none
   /-- Absolute deadline on `IO.monoNanosNow`'s clock; see
   `UnaryRequest.deadline`. -/
@@ -530,22 +531,22 @@ structure ClientStreamingStreamRequest where
   messages : MessageStream ByteArray
 
 structure UnaryResponse where
-  metadata : Metadata := Metadata.empty
+  metadata : _root_.Http2.Headers := _root_.Http2.Headers.empty
   data : ByteArray := ByteArray.empty
   status : Status := Status.ok
-  trailers : Metadata := Metadata.empty
+  trailers : _root_.Http2.Headers := _root_.Http2.Headers.empty
 
 structure ServerStreamingResponse where
-  metadata : Metadata := Metadata.empty
+  metadata : _root_.Http2.Headers := _root_.Http2.Headers.empty
   messages : Array ByteArray := #[]
   status : Status := Status.ok
-  trailers : Metadata := Metadata.empty
+  trailers : _root_.Http2.Headers := _root_.Http2.Headers.empty
 
 structure ServerStreamingStreamResponse where
-  metadata : Metadata := Metadata.empty
+  metadata : _root_.Http2.Headers := _root_.Http2.Headers.empty
   messages : MessageStream ByteArray
   status : Status := Status.ok
-  trailers : Metadata := Metadata.empty
+  trailers : _root_.Http2.Headers := _root_.Http2.Headers.empty
 
 namespace Percent
 
@@ -685,7 +686,7 @@ end Percent
 
 namespace Headers
 
-def contentType (metadata : Metadata) : Option String :=
+def contentType (metadata : _root_.Http2.Headers) : Option String :=
   metadata.get? "content-type"
 
 def isGrpcContentType (value : String) : Bool :=
@@ -694,14 +695,14 @@ def isGrpcContentType (value : String) : Bool :=
 private def singletonValues? (name : String) (values : Array String) :
     Except Status (Option String) := do
   if values.size > 1 then
-    throw (Status.invalidArgument s!"duplicate {Header.normalizeName name} header")
+    throw (Status.invalidArgument s!"duplicate {_root_.Http2.Header.normalizeName name} header")
   else
     pure values[0]?
 
-private def singletonHeader? (metadata : Metadata) (name : String) : Except Status (Option String) :=
+private def singletonHeader? (metadata : _root_.Http2.Headers) (name : String) : Except Status (Option String) :=
   singletonValues? name (metadata.getAll name)
 
-def timeout? (metadata : Metadata) : Except Status (Option Timeout) := do
+def timeout? (metadata : _root_.Http2.Headers) : Except Status (Option Timeout) := do
   match ← singletonHeader? metadata "grpc-timeout" with
   | none => pure none
   | some value =>
@@ -709,7 +710,7 @@ def timeout? (metadata : Metadata) : Except Status (Option Timeout) := do
       | some timeout => pure (some timeout)
       | none => throw (Status.invalidArgument s!"invalid grpc-timeout header {value}")
 
-def contentLength? (metadata : Metadata) : Except Status (Option Nat) := do
+def contentLength? (metadata : _root_.Http2.Headers) : Except Status (Option Nat) := do
   match ← singletonHeader? metadata "content-length" with
   | none => pure none
   | some value =>
@@ -727,7 +728,7 @@ def validateContentLengthValue (contentLength : Option Nat) (actual : Nat) :
       else
         throw (Status.invalidArgument s!"content-length {expected} does not match request body size {actual}")
 
-def validateContentLength (metadata : Metadata) (actual : Nat) : Except Status Unit := do
+def validateContentLength (metadata : _root_.Http2.Headers) (actual : Nat) : Except Status Unit := do
   validateContentLengthValue (← contentLength? metadata) actual
 
 def identityEncoding : String := "identity"
@@ -739,7 +740,7 @@ def acceptedEncodings : String := s!"{identityEncoding},{gzipEncoding}"
 /-- The validated `grpc-encoding` of a request: `none`/`identity` mean no
 compression, `gzip` means gzip-compressed messages. Other encodings reject
 with `UNIMPLEMENTED` per the gRPC spec. Returns whether gzip is in use. -/
-def requestUsesGzip (metadata : Metadata) : Except Status Bool := do
+def requestUsesGzip (metadata : _root_.Http2.Headers) : Except Status Bool := do
   match ← singletonHeader? metadata "grpc-encoding" with
   | none => pure false
   | some value =>
@@ -750,7 +751,7 @@ def requestUsesGzip (metadata : Metadata) : Except Status Bool := do
       else
         throw (Status.unimplemented s!"unsupported grpc-encoding {value}")
 
-def validateRequestEncoding (metadata : Metadata) : Except Status Unit := do
+def validateRequestEncoding (metadata : _root_.Http2.Headers) : Except Status Unit := do
   discard <| requestUsesGzip metadata
 
 /-- Exact former split/trim/list-any parser retained as the logical reference. -/
@@ -877,7 +878,7 @@ def valueAcceptsGzip (value : String) : Bool :=
   valueAcceptsGzipReference value
 
 /-- Whether the client's `grpc-accept-encoding` header advertises gzip. -/
-def clientAcceptsGzip (metadata : Metadata) : Bool :=
+def clientAcceptsGzip (metadata : _root_.Http2.Headers) : Bool :=
   metadata.getAll "grpc-accept-encoding" |>.any valueAcceptsGzip
 
 namespace TestSupport
@@ -959,7 +960,7 @@ private structure RequestHeaderSummary where
   | some first => some first
 
 @[inline] private def summarizeRequestHeader (summary : RequestHeaderSummary)
-    (header : Header) : RequestHeaderSummary :=
+    (header : _root_.Http2.Header) : RequestHeaderSummary :=
   let nameLength := header.name.utf8ByteSize
   match nameLength with
   | 2 =>
@@ -1018,7 +1019,7 @@ private def invalidMethodStatus : Status :=
   Status.invalidArgument "gRPC requests must use POST"
 
 @[inline] private def scanRequestHeader (state : RequestHeaderScanState)
-    (header : Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
+    (header : _root_.Http2.Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
   let nameLength := header.name.utf8ByteSize
   match state with
   | .pendingReject status =>
@@ -1104,20 +1105,20 @@ private def invalidMethodStatus : Status :=
       | _ => .ok state
 
 /-- Proof-facing fold specification for the direct scanner below. -/
-private def scanRequestHeadersCandidate (metadata : Metadata) :
+private def scanRequestHeadersCandidate (metadata : _root_.Http2.Headers) :
     Except RequestHeaderScanStop RequestHeaderScanState :=
   metadata.foldlM scanRequestHeader (.summarize {})
 
-private def summarizeRequestHeadersCandidate (metadata : Metadata) :
+private def summarizeRequestHeadersCandidate (metadata : _root_.Http2.Headers) :
     RequestHeaderSummary :=
   metadata.foldl summarizeRequestHeader {}
 
-private def occurrenceReference (metadata : Metadata) (name : String) :
+private def occurrenceReference (metadata : _root_.Http2.Headers) (name : String) :
     HeaderOccurrence :=
   let values := metadata.getAll name
   { first? := values[0]?, count := values.size }
 
-private def summarizeRequestHeadersReference (metadata : Metadata) :
+private def summarizeRequestHeadersReference (metadata : _root_.Http2.Headers) :
     RequestHeaderSummary :=
   {
     method? := metadata.get? ":method"
@@ -1134,54 +1135,54 @@ private def summarizeRequestHeadersReference (metadata : Metadata) :
 
 private theorem normalizeName_eq_self_of_map (name : String)
     (h : name.toList.map Char.toLower = name.toList) :
-    Header.normalizeName name = name := by
-  apply Header.normalizeName_eq_self
+    _root_.Http2.Header.normalizeName name = name := by
+  apply _root_.Http2.Header.normalizeName_eq_self
   unfold String.toLower
   rw [← String.toList_inj, String.toList_map]
   exact h
 
-private theorem normalizeName_method : Header.normalizeName ":method" = ":method" := by
+private theorem normalizeName_method : _root_.Http2.Header.normalizeName ":method" = ":method" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
-private theorem normalizeName_scheme : Header.normalizeName ":scheme" = ":scheme" := by
+private theorem normalizeName_scheme : _root_.Http2.Header.normalizeName ":scheme" = ":scheme" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
-private theorem normalizeName_status : Header.normalizeName ":status" = ":status" := by
+private theorem normalizeName_status : _root_.Http2.Header.normalizeName ":status" = ":status" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
-private theorem normalizeName_path : Header.normalizeName ":path" = ":path" := by
+private theorem normalizeName_path : _root_.Http2.Header.normalizeName ":path" = ":path" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
 private theorem normalizeName_contentType :
-    Header.normalizeName "content-type" = "content-type" := by
+    _root_.Http2.Header.normalizeName "content-type" = "content-type" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
-private theorem normalizeName_te : Header.normalizeName "te" = "te" := by
+private theorem normalizeName_te : _root_.Http2.Header.normalizeName "te" = "te" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
 private theorem normalizeName_timeout :
-    Header.normalizeName "grpc-timeout" = "grpc-timeout" := by
+    _root_.Http2.Header.normalizeName "grpc-timeout" = "grpc-timeout" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
 private theorem normalizeName_contentLength :
-    Header.normalizeName "content-length" = "content-length" := by
+    _root_.Http2.Header.normalizeName "content-length" = "content-length" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
 private theorem normalizeName_requestEncoding :
-    Header.normalizeName "grpc-encoding" = "grpc-encoding" := by
+    _root_.Http2.Header.normalizeName "grpc-encoding" = "grpc-encoding" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
 private theorem normalizeName_acceptEncoding :
-    Header.normalizeName "grpc-accept-encoding" = "grpc-accept-encoding" := by
+    _root_.Http2.Header.normalizeName "grpc-accept-encoding" = "grpc-accept-encoding" := by
   apply normalizeName_eq_self_of_map
   simp [Char.toLower]
 
@@ -1202,19 +1203,19 @@ private theorem normalizeName_acceptEncoding :
     "grpc-accept-encoding".utf8ByteSize = 20 := by decide
 
 private theorem summarizeRequestHeader_contentType_first?_of_some
-    (summary : RequestHeaderSummary) (header : Header) (value : String)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header) (value : String)
     (hfirst : summary.contentType.first? = some value) :
     (summarizeRequestHeader summary header).contentType.first? = some value := by
   grind [summarizeRequestHeader, HeaderOccurrence.add]
 
 private theorem summarizeRequestHeader_method?_of_some
-    (summary : RequestHeaderSummary) (header : Header) (value : String)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header) (value : String)
     (hfirst : summary.method? = some value) :
     (summarizeRequestHeader summary header).method? = some value := by
   grind [summarizeRequestHeader, rememberFirst]
 
 private theorem summarizeRequestHeader_contentType_first?_of_none
-    (summary : RequestHeaderSummary) (header : Header)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header)
     (hfirst : summary.contentType.first? = none) :
     (summarizeRequestHeader summary header).contentType.first? =
       if header.name == "content-type" then some header.value else none := by
@@ -1223,7 +1224,7 @@ private theorem summarizeRequestHeader_contentType_first?_of_none
   · grind [summarizeRequestHeader, HeaderOccurrence.add]
 
 private theorem summarizeRequestHeader_method?_of_none
-    (summary : RequestHeaderSummary) (header : Header)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header)
     (hfirst : summary.method? = none) :
     (summarizeRequestHeader summary header).method? =
       if header.name == ":method" then some header.value else none := by
@@ -1231,13 +1232,13 @@ private theorem summarizeRequestHeader_method?_of_none
   · simp_all [summarizeRequestHeader, rememberFirst]
   · grind [summarizeRequestHeader, rememberFirst]
 
-private theorem getAll_push (metadata : Metadata) (header : Header) (name : String) :
-    Metadata.getAll (metadata.push header) name =
-      if header.name == Header.normalizeName name then
-        (Metadata.getAll metadata name).push header.value
+private theorem getAll_push (metadata : _root_.Http2.Headers) (header : _root_.Http2.Header) (name : String) :
+    _root_.Http2.Headers.getAll (metadata.push header) name =
+      if header.name == _root_.Http2.Header.normalizeName name then
+        (_root_.Http2.Headers.getAll metadata name).push header.value
       else
-        Metadata.getAll metadata name := by
-  simp only [Metadata.getAll]
+        _root_.Http2.Headers.getAll metadata name := by
+  simp only [_root_.Http2.Headers.getAll]
   split <;> simp_all
 
 private theorem first?_push (values : Array String) (value : String) :
@@ -1245,13 +1246,13 @@ private theorem first?_push (values : Array String) (value : String) :
   cases values with
   | mk values => cases values <;> simp [rememberFirst]
 
-private theorem get?_push (metadata : Metadata) (header : Header) (name : String) :
-    Metadata.get? (metadata.push header) name =
-      if header.name == Header.normalizeName name then
-        rememberFirst (Metadata.get? metadata name) header.value
+private theorem get?_push (metadata : _root_.Http2.Headers) (header : _root_.Http2.Header) (name : String) :
+    _root_.Http2.Headers.get? (metadata.push header) name =
+      if header.name == _root_.Http2.Header.normalizeName name then
+        rememberFirst (_root_.Http2.Headers.get? metadata name) header.value
       else
-        Metadata.get? metadata name := by
-  unfold Metadata.get?
+        _root_.Http2.Headers.get? metadata name := by
+  unfold _root_.Http2.Headers.get?
   rw [getAll_push]
   split
   next => rw [first?_push]
@@ -1268,10 +1269,10 @@ private theorem occurrenceOfValues_push (values : Array String) (value : String)
   cases values with
   | mk values => cases values <;> simp [HeaderOccurrence.add]
 
-private theorem occurrenceReference_push (metadata : Metadata) (header : Header)
+private theorem occurrenceReference_push (metadata : _root_.Http2.Headers) (header : _root_.Http2.Header)
     (name : String) :
     occurrenceReference (metadata.push header) name =
-      if header.name == Header.normalizeName name then
+      if header.name == _root_.Http2.Header.normalizeName name then
         (occurrenceReference metadata name).add header.value
       else
         occurrenceReference metadata name := by
@@ -1281,8 +1282,8 @@ private theorem occurrenceReference_push (metadata : Metadata) (header : Header)
   next => exact occurrenceOfValues_push _ _
   next => rfl
 
-private theorem summarizeRequestHeadersReference_push (metadata : Metadata)
-    (header : Header) :
+private theorem summarizeRequestHeadersReference_push (metadata : _root_.Http2.Headers)
+    (header : _root_.Http2.Header) :
     summarizeRequestHeadersReference (metadata.push header) =
       summarizeRequestHeader (summarizeRequestHeadersReference metadata) header := by
   unfold summarizeRequestHeadersReference summarizeRequestHeader
@@ -1332,12 +1333,12 @@ private theorem array_push_induction {α : Type} {motive : Array α → Prop}
       rw [harray]
       exact push _ _ ih
 
-private theorem summarizeRequestHeadersCandidate_eq_reference (metadata : Metadata) :
+private theorem summarizeRequestHeadersCandidate_eq_reference (metadata : _root_.Http2.Headers) :
     summarizeRequestHeadersCandidate metadata =
       summarizeRequestHeadersReference metadata := by
   apply array_push_induction (values := metadata)
   · simp [summarizeRequestHeadersCandidate, summarizeRequestHeadersReference,
-      occurrenceReference, Metadata.get?, Metadata.getAll]
+      occurrenceReference, _root_.Http2.Headers.get?, _root_.Http2.Headers.getAll]
   · intro values value ih
     rw [summarizeRequestHeadersReference_push]
     unfold summarizeRequestHeadersCandidate at ih ⊢
@@ -1351,7 +1352,7 @@ private structure ValidatedRequestCore where
 
 /-- Fallible request validation shared by the legacy method-only API and the
 managed preflight. The managed wrapper alone scans response gzip acceptance. -/
-private def validateUnaryRequestCoreAfterMetadata (metadata : Metadata)
+private def validateUnaryRequestCoreAfterMetadata (metadata : _root_.Http2.Headers)
     (contentTypes : Array String) : Except Status ValidatedRequestCore := do
 
   match metadata.get? ":method" with
@@ -1402,7 +1403,7 @@ private def validateUnaryRequestCoreAfterMetadata (metadata : Metadata)
 /-- Complete request validation after `Metadata.validate` has already
 succeeded. `contentTypes` is supplied by the early HTTP-status preflight so
 that its first-value check and the full singleton check share one scan. -/
-def validateUnaryRequestPreflightAfterMetadata (metadata : Metadata)
+def validateUnaryRequestPreflightAfterMetadata (metadata : _root_.Http2.Headers)
     (contentTypes : Array String) : Except Status RequestPreflight := do
   let core ← validateUnaryRequestCoreAfterMetadata metadata contentTypes
   pure {
@@ -1416,7 +1417,7 @@ def validateUnaryRequestPreflightAfterMetadata (metadata : Metadata)
 private def singletonOccurrence? (name : String) (occurrence : HeaderOccurrence) :
     Except Status (Option String) := do
   if occurrence.count > 1 then
-    throw (Status.invalidArgument s!"duplicate {Header.normalizeName name} header")
+    throw (Status.invalidArgument s!"duplicate {_root_.Http2.Header.normalizeName name} header")
   else
     pure occurrence.first?
 
@@ -1508,38 +1509,38 @@ private def validateUnaryRequestSummary (summary : RequestHeaderSummary) :
     clientAcceptsGzip := summary.clientAcceptEncodingValues.any valueAcceptsGzip
   }
 
-private theorem singletonOccurrence_reference (metadata : Metadata) (name : String) :
+private theorem singletonOccurrence_reference (metadata : _root_.Http2.Headers) (name : String) :
     singletonOccurrence? name (occurrenceReference metadata name) =
       singletonHeader? metadata name := by
   unfold singletonOccurrence? occurrenceReference singletonHeader? singletonValues?
   rfl
 
-private theorem singletonOccurrence_values_reference (metadata : Metadata)
+private theorem singletonOccurrence_values_reference (metadata : _root_.Http2.Headers)
     (name : String) :
     singletonOccurrence? name (occurrenceReference metadata name) =
       singletonValues? name (metadata.getAll name) := by
   unfold singletonOccurrence? occurrenceReference singletonValues?
   rfl
 
-private theorem timeoutOccurrence_reference (metadata : Metadata) :
+private theorem timeoutOccurrence_reference (metadata : _root_.Http2.Headers) :
     timeoutOccurrence? (occurrenceReference metadata "grpc-timeout") =
       timeout? metadata := by
   unfold timeoutOccurrence? timeout?
   rw [singletonOccurrence_reference]
 
-private theorem contentLengthOccurrence_reference (metadata : Metadata) :
+private theorem contentLengthOccurrence_reference (metadata : _root_.Http2.Headers) :
     contentLengthOccurrence? (occurrenceReference metadata "content-length") =
       contentLength? metadata := by
   unfold contentLengthOccurrence? contentLength?
   rw [singletonOccurrence_reference]
 
-private theorem requestUsesGzipOccurrence_reference (metadata : Metadata) :
+private theorem requestUsesGzipOccurrence_reference (metadata : _root_.Http2.Headers) :
     requestUsesGzipOccurrence (occurrenceReference metadata "grpc-encoding") =
       requestUsesGzip metadata := by
   unfold requestUsesGzipOccurrence requestUsesGzip
   rw [singletonOccurrence_reference]
 
-private theorem validateUnaryRequestSummaryCore_reference (metadata : Metadata) :
+private theorem validateUnaryRequestSummaryCore_reference (metadata : _root_.Http2.Headers) :
     validateUnaryRequestSummaryCore (summarizeRequestHeadersReference metadata) =
       validateUnaryRequestCoreAfterMetadata metadata
         (metadata.getAll "content-type") := by
@@ -1549,7 +1550,7 @@ private theorem validateUnaryRequestSummaryCore_reference (metadata : Metadata) 
     timeoutOccurrence_reference, contentLengthOccurrence_reference,
     requestUsesGzipOccurrence_reference]
 
-private theorem validateUnaryRequestSummary_reference (metadata : Metadata) :
+private theorem validateUnaryRequestSummary_reference (metadata : _root_.Http2.Headers) :
     validateUnaryRequestSummary (summarizeRequestHeadersReference metadata) =
       validateUnaryRequestPreflightAfterMetadata metadata
         (metadata.getAll "content-type") := by
@@ -1573,7 +1574,7 @@ private def requestHeaderPreflightValidatedSummary (summary : RequestHeaderSumma
   | .error status => .reject status
   | .ok preflight => .accept preflight
 
-private def requestHeaderPreflightReference (metadata : Metadata) :
+private def requestHeaderPreflightReference (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   let contentTypes := metadata.getAll "content-type"
   match contentTypes[0]? with
@@ -1599,7 +1600,7 @@ private def requestHeaderPreflightSummary (summary : RequestHeaderSummary) :
         requestHeaderPreflightValidatedSummary summary
   | none => requestHeaderPreflightValidatedSummary summary
 
-private def requestHeaderPreflightCandidateLogical (metadata : Metadata) :
+private def requestHeaderPreflightCandidateLogical (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   requestHeaderPreflightSummary (summarizeRequestHeadersCandidate metadata)
 
@@ -1647,7 +1648,7 @@ private def RequestHeaderScanMatches
         ∃ value, summary.method? = some value ∧ value ≠ "POST"
 
 private theorem scanRequestHeader_regular (summary : RequestHeaderSummary)
-    (header : Header) (hmethod : header.name ≠ ":method")
+    (header : _root_.Http2.Header) (hmethod : header.name ≠ ":method")
     (hcontentType : header.name ≠ "content-type") :
     scanRequestHeader (.summarize summary) header =
       .ok (.summarize (summarizeRequestHeader summary header)) := by
@@ -1658,7 +1659,7 @@ private theorem scanRequestHeader_regular (summary : RequestHeaderSummary)
     utf8ByteSize_contentLength, utf8ByteSize_acceptEncoding, Except.pure]
 
 private theorem firstContentTypeSupported_regular
-    (summary : RequestHeaderSummary) (header : Header)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header)
     (hcontentType : header.name ≠ "content-type")
     (hsupported : firstContentTypeSupported summary) :
     firstContentTypeSupported (summarizeRequestHeader summary header) := by
@@ -1672,7 +1673,7 @@ private theorem firstContentTypeSupported_regular
       simpa [hfirst] using hsupported
 
 private theorem firstMethodAccepted_regular (summary : RequestHeaderSummary)
-    (header : Header) (hmethod : header.name ≠ ":method")
+    (header : _root_.Http2.Header) (hmethod : header.name ≠ ":method")
     (haccepted : firstMethodAccepted summary) :
     firstMethodAccepted (summarizeRequestHeader summary header) := by
   unfold firstMethodAccepted at haccepted ⊢
@@ -1685,7 +1686,7 @@ private theorem firstMethodAccepted_regular (summary : RequestHeaderSummary)
       simpa [hfirst] using haccepted
 
 private theorem scanRequestHeader_summarize_matches
-    (summary : RequestHeaderSummary) (header : Header)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header)
     (hcontentType : firstContentTypeSupported summary)
     (hmethod : firstMethodAccepted summary) :
     RequestHeaderScanMatches (scanRequestHeader (.summarize summary) header)
@@ -1735,7 +1736,7 @@ private theorem scanRequestHeader_summarize_matches
         firstMethodAccepted_regular summary header hmethodName hmethod]
 
 private theorem scanRequestHeader_pending_matches (status : Status)
-    (summary : RequestHeaderSummary) (header : Header)
+    (summary : RequestHeaderSummary) (header : _root_.Http2.Header)
     (hstatus : status = invalidMethodStatus)
     (hcontentType : summary.contentType.first? = none)
     (hmethod : ∃ value, summary.method? = some value ∧ value ≠ "POST") :
@@ -1754,7 +1755,7 @@ private theorem scanRequestHeader_pending_matches (status : Status)
     grind [scanRequestHeader, RequestHeaderScanMatches,
       utf8ByteSize_contentType]
 
-private theorem scanRequestHeadersCandidate_matches (metadata : Metadata) :
+private theorem scanRequestHeadersCandidate_matches (metadata : _root_.Http2.Headers) :
     RequestHeaderScanMatches (scanRequestHeadersCandidate metadata)
       (summarizeRequestHeadersCandidate metadata) := by
   apply array_push_induction (values := metadata)
@@ -1860,7 +1861,7 @@ private theorem finishRequestHeaderScan_matches
           simp [finishRequestHeaderScan, requestHeaderPreflightSummary,
             hcontentType, hvalidated]
 
-private theorem finishRequestHeaderScan_eq_logical (metadata : Metadata) :
+private theorem finishRequestHeaderScan_eq_logical (metadata : _root_.Http2.Headers) :
     finishRequestHeaderScan (scanRequestHeadersCandidate metadata) =
       requestHeaderPreflightCandidateLogical metadata := by
   unfold requestHeaderPreflightCandidateLogical
@@ -1868,7 +1869,7 @@ private theorem finishRequestHeaderScan_eq_logical (metadata : Metadata) :
     (scanRequestHeadersCandidate_matches metadata)
 
 private def requestHeaderPreflightPendingMethodDirect
-    (metadata : Metadata) (index : Nat) (status : Status) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (status : Status) :
     RequestHeaderPreflightResult :=
   if h : index < metadata.size then
     let header := metadata[index]
@@ -1888,7 +1889,7 @@ private def requestHeaderPreflightPendingMethodDirect
 termination_by metadata.size - index
 decreasing_by all_goals omega
 
-private def requestHeaderPreflightCandidateDirectLoop (metadata : Metadata)
+private def requestHeaderPreflightCandidateDirectLoop (metadata : _root_.Http2.Headers)
     (index : Nat) (summary : RequestHeaderSummary) :
     RequestHeaderPreflightResult :=
   if h : index < metadata.size then
@@ -1971,12 +1972,12 @@ private def requestHeaderPreflightCandidateDirectLoop (metadata : Metadata)
 termination_by metadata.size - index
 decreasing_by all_goals omega
 
-private def requestHeaderPreflightCandidateDirect (metadata : Metadata) :
+private def requestHeaderPreflightCandidateDirect (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   requestHeaderPreflightCandidateDirectLoop metadata 0 {}
 
 private theorem requestHeaderPreflightPendingMethodDirect_eq_foldlM
-    (metadata : Metadata) (index : Nat) (status : Status) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (status : Status) :
     requestHeaderPreflightPendingMethodDirect metadata index status =
       finishRequestHeaderScan
         ((metadata.toList.drop index).foldlM scanRequestHeader
@@ -1988,7 +1989,7 @@ private theorem requestHeaderPreflightPendingMethodDirect_eq_foldlM
       pure, Except.pure]
 
 private theorem requestHeaderPreflightCandidateDirectLoop_eq_foldlM
-    (metadata : Metadata) (index : Nat) (summary : RequestHeaderSummary) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (summary : RequestHeaderSummary) :
     requestHeaderPreflightCandidateDirectLoop metadata index summary =
       finishRequestHeaderScan
         ((metadata.toList.drop index).foldlM scanRequestHeader
@@ -2000,7 +2001,7 @@ private theorem requestHeaderPreflightCandidateDirectLoop_eq_foldlM
       pure, Except.pure]
 
 private theorem requestHeaderPreflightCandidateDirect_eq_logical
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     requestHeaderPreflightCandidateDirect metadata =
       requestHeaderPreflightCandidateLogical metadata := by
   unfold requestHeaderPreflightCandidateDirect
@@ -2008,11 +2009,11 @@ private theorem requestHeaderPreflightCandidateDirect_eq_logical
   simp only [List.drop_zero, Array.foldlM_toList]
   exact finishRequestHeaderScan_eq_logical metadata
 
-private def requestHeaderPreflightCandidate (metadata : Metadata) :
+private def requestHeaderPreflightCandidate (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   requestHeaderPreflightCandidateDirect metadata
 
-private theorem requestHeaderPreflightCandidate_eq_logical (metadata : Metadata) :
+private theorem requestHeaderPreflightCandidate_eq_logical (metadata : _root_.Http2.Headers) :
     requestHeaderPreflightCandidate metadata =
       requestHeaderPreflightReference metadata := by
   unfold requestHeaderPreflightCandidate
@@ -2028,18 +2029,18 @@ private theorem requestHeaderPreflightCandidate_eq_logical (metadata : Metadata)
 former repeated getters; generated code uses the proved direct index scan and
 its prefix-stable short-circuit outcomes. -/
 @[implemented_by requestHeaderPreflightCandidate]
-def requestHeaderPreflight (metadata : Metadata) : RequestHeaderPreflightResult :=
+def requestHeaderPreflight (metadata : _root_.Http2.Headers) : RequestHeaderPreflightResult :=
   requestHeaderPreflightReference metadata
 
 namespace TestSupport
 
 /-- Exact former repeated-scan classifier retained for differential tests. -/
-@[noinline] def requestHeaderPreflightReferenceForBenchmark (metadata : Metadata) :
+@[noinline] def requestHeaderPreflightReferenceForBenchmark (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   requestHeaderPreflightReference metadata
 
 /-- Executable direct one-pass classifier retained for differential tests. -/
-@[noinline] def requestHeaderPreflightCandidateForBenchmark (metadata : Metadata) :
+@[noinline] def requestHeaderPreflightCandidateForBenchmark (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   requestHeaderPreflightCandidate metadata
 
@@ -2048,7 +2049,7 @@ end TestSupport
 /-- The executable one-pass classifier has exactly the result of the logical
 repeated-scan definition for every metadata array. -/
 theorem requestHeaderPreflightCandidate_eq_requestHeaderPreflight
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     TestSupport.requestHeaderPreflightCandidateForBenchmark metadata =
       requestHeaderPreflight metadata := by
   unfold TestSupport.requestHeaderPreflightCandidateForBenchmark
@@ -2056,7 +2057,7 @@ theorem requestHeaderPreflightCandidate_eq_requestHeaderPreflight
   exact requestHeaderPreflightCandidate_eq_logical metadata
 
 /-- The independent benchmark seams agree for every metadata array. -/
-theorem requestHeaderPreflightCandidate_eq_reference (metadata : Metadata) :
+theorem requestHeaderPreflightCandidate_eq_reference (metadata : _root_.Http2.Headers) :
     TestSupport.requestHeaderPreflightCandidateForBenchmark metadata =
       TestSupport.requestHeaderPreflightReferenceForBenchmark metadata := by
   unfold TestSupport.requestHeaderPreflightCandidateForBenchmark
@@ -2072,18 +2073,18 @@ HTTP 415 and every gRPC semantic rejection. -/
 
 @[inline] private def advanceValidatedRequestHeaderScan
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
-    (header : Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
+    (header : _root_.Http2.Header) : Except RequestHeaderScanStop RequestHeaderScanState :=
   outcome.bind fun state => scanRequestHeader state header
 
 @[inline] private def validateAndScanRequestHeader
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState)
-    (header : Header) :
+    (header : _root_.Http2.Header) :
     Except Status (Except RequestHeaderScanStop RequestHeaderScanState) := do
   Metadata.validateHeader header
   pure (advanceValidatedRequestHeaderScan outcome header)
 
 private theorem validateAndScanRequestHeadersList_eq_separate
-    (headers : List Header)
+    (headers : List _root_.Http2.Header)
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
     headers.foldlM validateAndScanRequestHeader outcome =
       match headers.foldlM (fun _ header => Metadata.validateHeader header)
@@ -2105,7 +2106,7 @@ private theorem validateAndScanRequestHeadersList_eq_separate
           rw [ih]
 
 private theorem validateAndScanRequestHeaders_eq_separate
-    (metadata : Metadata)
+    (metadata : _root_.Http2.Headers)
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
     metadata.foldlM validateAndScanRequestHeader outcome =
       match metadata.forM Metadata.validateHeader with
@@ -2123,7 +2124,7 @@ private theorem validateAndScanRequestHeaders_eq_separate
   exact validateAndScanRequestHeadersList_eq_separate metadata.toList outcome
 
 private theorem advanceValidatedRequestHeaderScanList_eq_foldlM
-    (headers : List Header)
+    (headers : List _root_.Http2.Header)
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
     headers.foldl advanceValidatedRequestHeaderScan outcome =
       match outcome with
@@ -2142,7 +2143,7 @@ private theorem advanceValidatedRequestHeaderScanList_eq_foldlM
           cases scanRequestHeader state header <;> rfl
 
 private theorem advanceValidatedRequestHeaderScan_eq_foldlM
-    (metadata : Metadata)
+    (metadata : _root_.Http2.Headers)
     (outcome : Except RequestHeaderScanStop RequestHeaderScanState) :
     metadata.foldl advanceValidatedRequestHeaderScan outcome =
       match outcome with
@@ -2159,13 +2160,13 @@ private theorem advanceValidatedRequestHeaderScan_eq_foldlM
       exact advanceValidatedRequestHeaderScanList_eq_foldlM
         metadata.toList (.ok state)
 
-private def validateRequestHeaderPreflightReference (metadata : Metadata) :
+private def validateRequestHeaderPreflightReference (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   match Metadata.validate metadata with
   | .error status => .reject status
   | .ok () => requestHeaderPreflightReference metadata
 
-private def validateRequestHeaderPreflightCandidateFold (metadata : Metadata) :
+private def validateRequestHeaderPreflightCandidateFold (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   match Metadata.validatePseudoHeaders metadata with
   | .error status => .reject status
@@ -2175,7 +2176,7 @@ private def validateRequestHeaderPreflightCandidateFold (metadata : Metadata) :
       | .error status => .reject status
       | .ok outcome => finishRequestHeaderScan outcome
 
-private theorem finishRequestHeaderScan_eq_reference (metadata : Metadata) :
+private theorem finishRequestHeaderScan_eq_reference (metadata : _root_.Http2.Headers) :
     finishRequestHeaderScan (scanRequestHeadersCandidate metadata) =
       requestHeaderPreflightReference metadata := by
   calc
@@ -2189,7 +2190,7 @@ private theorem finishRequestHeaderScan_eq_reference (metadata : Metadata) :
       exact h
 
 private theorem validateRequestHeaderPreflightCandidateFold_eq_reference
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     validateRequestHeaderPreflightCandidateFold metadata =
       validateRequestHeaderPreflightReference metadata := by
   unfold validateRequestHeaderPreflightCandidateFold
@@ -2214,7 +2215,7 @@ summary rather than nested `Except` scan state. Once a prefix-stable semantic
 result is known, a small continuation validates the suffix without doing more
 classifier work. -/
 
-@[inline] private def validateKnownVisibleRequestHeader (header : Header) :
+@[inline] private def validateKnownVisibleRequestHeader (header : _root_.Http2.Header) :
     Except Status Unit :=
   if Ascii.isVisibleString header.value then
     .ok ()
@@ -2222,7 +2223,7 @@ classifier work. -/
     .error (Status.invalidArgument
       s!"invalid ASCII gRPC metadata value for {header.name}")
 
-@[inline] private def validateNonExtensionRequestHeaderFast (header : Header) :
+@[inline] private def validateNonExtensionRequestHeaderFast (header : _root_.Http2.Header) :
     Except Status Unit :=
   match header.name.utf8ByteSize with
   | 2 =>
@@ -2262,7 +2263,7 @@ classifier work. -/
   | _ => Metadata.validateHeader header
 
 private theorem validateKnownVisibleRequestHeader_eq_validateHeader
-    (header : Header)
+    (header : _root_.Http2.Header)
     (hname :
       header.name = "te" ∨
       header.name = ":path" ∨
@@ -2284,7 +2285,7 @@ private theorem validateKnownVisibleRequestHeader_eq_validateHeader
   split <;> rfl
 
 private theorem validateNonExtensionRequestHeaderFast_eq_validateHeader
-    (header : Header) :
+    (header : _root_.Http2.Header) :
     validateNonExtensionRequestHeaderFast header =
       Metadata.validateHeader header := by
   unfold validateNonExtensionRequestHeaderFast
@@ -2293,7 +2294,7 @@ private theorem validateNonExtensionRequestHeaderFast_eq_validateHeader
   all_goals apply validateKnownVisibleRequestHeader_eq_validateHeader
   all_goals grind
 
-private def validateRemainingRequestHeadersDirect (metadata : Metadata)
+private def validateRemainingRequestHeadersDirect (metadata : _root_.Http2.Headers)
     (index : Nat) (result : RequestHeaderPreflightResult) :
     RequestHeaderPreflightResult :=
   if h : index < metadata.size then
@@ -2307,7 +2308,7 @@ private def validateRemainingRequestHeadersDirect (metadata : Metadata)
 termination_by metadata.size - index
 decreasing_by all_goals omega
 
-private def validatePendingInvalidMethodDirect (metadata : Metadata)
+private def validatePendingInvalidMethodDirect (metadata : _root_.Http2.Headers)
     (index : Nat) (status : Status) : RequestHeaderPreflightResult :=
   if h : index < metadata.size then
     let header := metadata[index]
@@ -2331,7 +2332,7 @@ private def validatePendingInvalidMethodDirect (metadata : Metadata)
 termination_by metadata.size - index
 decreasing_by all_goals omega
 
-private def validateRequestHeaderPreflightFusedDirectLoop (metadata : Metadata)
+private def validateRequestHeaderPreflightFusedDirectLoop (metadata : _root_.Http2.Headers)
     (index : Nat) (summary : RequestHeaderSummary) :
     RequestHeaderPreflightResult :=
   if h : index < metadata.size then
@@ -2495,7 +2496,7 @@ private def validateRequestHeaderPreflightFusedDirectLoop (metadata : Metadata)
 termination_by metadata.size - index
 decreasing_by all_goals omega
 
-private def validateRequestHeaderPreflightFusedDirect (metadata : Metadata) :
+private def validateRequestHeaderPreflightFusedDirect (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   match Metadata.validatePseudoHeaders metadata with
   | .error status => .reject status
@@ -2510,7 +2511,7 @@ private def validateRequestHeaderPreflightFusedDirect (metadata : Metadata) :
   | .ok outcome => finishRequestHeaderScan outcome
 
 private theorem validateRemainingRequestHeadersDirect_eq_foldlM
-    (metadata : Metadata) (index : Nat) (stop : RequestHeaderScanStop) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (stop : RequestHeaderScanStop) :
     validateRemainingRequestHeadersDirect metadata index
         (requestHeaderScanStopResult stop) =
       finishValidatedRequestHeaderScan
@@ -2525,7 +2526,7 @@ private theorem validateRemainingRequestHeadersDirect_eq_foldlM
       requestHeaderScanStopResult, bind, Except.bind, pure, Except.pure]
 
 private theorem validateRemainingRequestHeadersDirect_reject_eq_foldlM
-    (metadata : Metadata) (index : Nat) (status : Status) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (status : Status) :
     validateRemainingRequestHeadersDirect metadata index (.reject status) =
       finishValidatedRequestHeaderScan
         ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
@@ -2533,7 +2534,7 @@ private theorem validateRemainingRequestHeadersDirect_reject_eq_foldlM
   validateRemainingRequestHeadersDirect_eq_foldlM metadata index (.reject status)
 
 private theorem validateRemainingRequestHeadersDirect_unsupported_eq_foldlM
-    (metadata : Metadata) (index : Nat) :
+    (metadata : _root_.Http2.Headers) (index : Nat) :
     validateRemainingRequestHeadersDirect metadata index .unsupportedContentType =
       finishValidatedRequestHeaderScan
         ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
@@ -2542,7 +2543,7 @@ private theorem validateRemainingRequestHeadersDirect_unsupported_eq_foldlM
     .unsupportedContentType
 
 private theorem validatePendingInvalidMethodDirect_eq_foldlM
-    (metadata : Metadata) (index : Nat) (status : Status) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (status : Status) :
     validatePendingInvalidMethodDirect metadata index status =
       finishValidatedRequestHeaderScan
         ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
@@ -2558,7 +2559,7 @@ private theorem validatePendingInvalidMethodDirect_eq_foldlM
       bind, Except.bind, pure, Except.pure]
 
 private theorem validateRequestHeaderPreflightFusedDirectLoop_eq_foldlM
-    (metadata : Metadata) (index : Nat) (summary : RequestHeaderSummary) :
+    (metadata : _root_.Http2.Headers) (index : Nat) (summary : RequestHeaderSummary) :
     validateRequestHeaderPreflightFusedDirectLoop metadata index summary =
       finishValidatedRequestHeaderScan
         ((metadata.toList.drop index).foldlM validateAndScanRequestHeader
@@ -2575,7 +2576,7 @@ private theorem validateRequestHeaderPreflightFusedDirectLoop_eq_foldlM
       bind, Except.bind, pure, Except.pure]
 
 private theorem validateRequestHeaderPreflightFusedDirect_eq_fold
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     validateRequestHeaderPreflightFusedDirect metadata =
       validateRequestHeaderPreflightCandidateFold metadata := by
   unfold validateRequestHeaderPreflightFusedDirect
@@ -2588,12 +2589,12 @@ private theorem validateRequestHeaderPreflightFusedDirect_eq_fold
       simp only [List.drop_zero, Array.foldlM_toList]
       rfl
 
-private def validateRequestHeaderPreflightCandidate (metadata : Metadata) :
+private def validateRequestHeaderPreflightCandidate (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   validateRequestHeaderPreflightFusedDirect metadata
 
 private theorem validateRequestHeaderPreflightCandidate_eq_reference
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
   validateRequestHeaderPreflightCandidate metadata =
       validateRequestHeaderPreflightReference metadata := by
   unfold validateRequestHeaderPreflightCandidate
@@ -2604,7 +2605,7 @@ private theorem validateRequestHeaderPreflightCandidate_eq_reference
 the former three-pass sequence; generated code uses the proved two-pass direct
 executor while retaining exact metadata and gRPC rejection precedence. -/
 @[implemented_by validateRequestHeaderPreflightCandidate]
-def validateRequestHeaderPreflight (metadata : Metadata) :
+def validateRequestHeaderPreflight (metadata : _root_.Http2.Headers) :
     RequestHeaderPreflightResult :=
   validateRequestHeaderPreflightReference metadata
 
@@ -2613,13 +2614,13 @@ namespace TestSupport
 /-- Exact separate validation/classification sequence retained for tests and
 incremental benchmarks. -/
 @[noinline] def validateRequestHeaderPreflightReferenceForBenchmark
-    (metadata : Metadata) : RequestHeaderPreflightResult :=
+    (metadata : _root_.Http2.Headers) : RequestHeaderPreflightResult :=
   validateRequestHeaderPreflightReference metadata
 
 /-- Executable fused validation/classification sequence retained for tests and
 incremental benchmarks. -/
 @[noinline] def validateRequestHeaderPreflightCandidateForBenchmark
-    (metadata : Metadata) : RequestHeaderPreflightResult :=
+    (metadata : _root_.Http2.Headers) : RequestHeaderPreflightResult :=
   validateRequestHeaderPreflightCandidate metadata
 
 end TestSupport
@@ -2627,7 +2628,7 @@ end TestSupport
 /-- The executable fused validator has exactly the result of the former
 separate production sequence for every metadata array. -/
 theorem validateRequestHeaderPreflightCandidate_eq_validateRequestHeaderPreflight
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata =
       validateRequestHeaderPreflight metadata := by
   unfold TestSupport.validateRequestHeaderPreflightCandidateForBenchmark
@@ -2637,24 +2638,24 @@ theorem validateRequestHeaderPreflightCandidate_eq_validateRequestHeaderPrefligh
 /-- The independent fused and separate benchmark seams agree for every
 metadata array. -/
 theorem validateRequestHeaderPreflightCandidate_eq_referenceForBenchmark
-    (metadata : Metadata) :
+    (metadata : _root_.Http2.Headers) :
     TestSupport.validateRequestHeaderPreflightCandidateForBenchmark metadata =
       TestSupport.validateRequestHeaderPreflightReferenceForBenchmark metadata := by
   unfold TestSupport.validateRequestHeaderPreflightCandidateForBenchmark
     TestSupport.validateRequestHeaderPreflightReferenceForBenchmark
   exact validateRequestHeaderPreflightCandidate_eq_reference metadata
 
-def validateUnaryRequestPreflight (metadata : Metadata) : Except Status RequestPreflight := do
+def validateUnaryRequestPreflight (metadata : _root_.Http2.Headers) : Except Status RequestPreflight := do
   Metadata.validate metadata
   validateUnaryRequestPreflightAfterMetadata metadata (metadata.getAll "content-type")
 
-def validateUnaryRequestHeaders (metadata : Metadata) : Except Status MethodName := do
+def validateUnaryRequestHeaders (metadata : _root_.Http2.Headers) : Except Status MethodName := do
   Metadata.validate metadata
   pure (← validateUnaryRequestCoreAfterMetadata metadata
     (metadata.getAll "content-type")).method
 
-def responseHeaders : Metadata :=
-  Metadata.empty
+def responseHeaders : _root_.Http2.Headers :=
+  _root_.Http2.Headers.empty
     |>.insert ":status" "200"
     |>.insert "content-type" "application/grpc"
     |>.insert "grpc-accept-encoding" acceptedEncodings
@@ -2675,28 +2676,28 @@ private def reservedResponseTrailerName (name : String) : Bool :=
     || name == "grpc-accept-encoding"
 
 private def validateOutboundHeader (kind : String) (reserved : String -> Bool)
-    (header : Header) : Except Status Unit := do
-  let name := Header.normalizeName header.name
+    (header : _root_.Http2.Header) : Except Status Unit := do
+  let name := _root_.Http2.Header.normalizeName header.name
   if reserved name then
     throw (Status.internal s!"reserved gRPC {kind} metadata name {name}")
   match Metadata.validateHeader { header with name := name } with
   | .ok _ => pure ()
   | .error status => throw (Status.internal status.messageD)
 
-def validateResponseMetadata (metadata : Metadata) : Except Status Unit :=
+def validateResponseMetadata (metadata : _root_.Http2.Headers) : Except Status Unit :=
   metadata.forM (validateOutboundHeader "response" reservedResponseMetadataName)
 
-def validateResponseTrailers (metadata : Metadata) : Except Status Unit :=
+def validateResponseTrailers (metadata : _root_.Http2.Headers) : Except Status Unit :=
   metadata.forM (validateOutboundHeader "trailer" reservedResponseTrailerName)
 
-def trailers (status : Status) (extra : Metadata := Metadata.empty) : Metadata :=
-  let base := Metadata.empty.insert "grpc-status" status.code.toHeaderValue
+def trailers (status : Status) (extra : _root_.Http2.Headers := _root_.Http2.Headers.empty) : _root_.Http2.Headers :=
+  let base := _root_.Http2.Headers.empty.insert "grpc-status" status.code.toHeaderValue
   let base := match status.message with
     | none => base
     | some message => base.insert "grpc-message" (Percent.encode message)
   base.append extra
 
-def statusFromTrailers (metadata : Metadata) : Except Status Status := do
+def statusFromTrailers (metadata : _root_.Http2.Headers) : Except Status Status := do
   Metadata.validate metadata
   let codeValue ← match ← singletonHeader? metadata "grpc-status" with
     | some value => pure value

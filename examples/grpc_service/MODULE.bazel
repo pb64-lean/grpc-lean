@@ -13,11 +13,14 @@ module(
 # rules_lean - Lean 4 build rules
 # ============================================================================
 
-# Use local_path_override to reference the parent rules_lean
 bazel_dep(name = "rules_lean", version = "0.1.0")
-local_path_override(
+archive_override(
     module_name = "rules_lean",
-    path = "../../../rules_lean",
+    integrity = "sha256-tPQDP5DWBNcwtCbZVLPkNqeFjKjWzJulx05ScxooN6M=",
+    strip_prefix = "rules_lean-ac0ad9a76428a9aa05f885a53bab6eb302682649",
+    urls = [
+        "https://github.com/pb64-lean/rules_lean/archive/ac0ad9a76428a9aa05f885a53bab6eb302682649.tar.gz",
+    ],
 )
 
 # Configure Lean toolchain from Nixpkgs
@@ -42,6 +45,26 @@ local_path_override(
     path = "../..",
 )
 
+bazel_dep(name = "http2-lean", version = "0.1.0", repo_name = "http2_lean")
+archive_override(
+    module_name = "http2-lean",
+    integrity = "sha256-rVteydmJ4HoqzdoL+9VEJMXCfJ07r++od1ftyBsnypI=",
+    strip_prefix = "http2-lean-0.1.0",
+    urls = [
+        "https://github.com/pb64-lean/http2-lean/archive/refs/tags/v0.1.0.tar.gz",
+    ],
+)
+
+bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
+archive_override(
+    module_name = "tls13-lean",
+    integrity = "sha256-wInyKUe/AxXRSO2YaKwpqgbBU/ek9UG+eYPAeGvpe6c=",
+    strip_prefix = "tls13-lean-4fa14fe068d9ea17c85294a6a27c224b2de5cddb",
+    urls = [
+        "https://github.com/pb64-lean/tls13-lean/archive/4fa14fe068d9ea17c85294a6a27c224b2de5cddb.tar.gz",
+    ],
+)
+
 bazel_dep(name = "grpc_lean_protobuf", version = "0.1.0")
 local_path_override(
     module_name = "grpc_lean_protobuf",
@@ -58,16 +81,16 @@ local_path_override(
 # Core Bazel dependencies
 # ============================================================================
 
-bazel_dep(name = "bazel_skylib", version = "1.5.0")
-bazel_dep(name = "platforms", version = "0.0.8")
-bazel_dep(name = "rules_cc", version = "0.0.9")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
+bazel_dep(name = "platforms", version = "0.0.11")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 
 # ============================================================================
 # Protocol Buffers
 # ============================================================================
 
-bazel_dep(name = "rules_proto", version = "6.0.0")
-bazel_dep(name = "protobuf", version = "27.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "protobuf", version = "33.4")
 
 # ============================================================================
 # Nixpkgs - CC toolchain and system dependencies

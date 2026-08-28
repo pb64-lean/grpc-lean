@@ -6,10 +6,11 @@ public import Std.Sync.CancellationToken
 public import Std.Sync.Notify
 public import Std.Sync.Channel
 
-public import Grpc.CancellationToken
-public import Grpc.Http2.Connection
-public import Grpc.Http2.ExtendedConnect
-public import Grpc.Tls.Session
+public import Http2.CancellationToken
+public import Http2.Client
+public import Http2.Connection
+public import Http2.Tls.Session
+public import Grpc.Protocol
 
 public section
 
@@ -47,6 +48,11 @@ uncompressed.
 namespace Grpc
 namespace Client
 
+private def ofHttp2 {α} (result : Except _root_.Http2.Error α) : Except Status α :=
+  match result with
+  | .ok value => .ok value
+  | .error error => .error (Status.ofHttp2Error error)
+
 open Std
 open Std.Net
 open Std.Async
@@ -67,12 +73,14 @@ structure Config where
   /--
   Maximum bytes accepted for one response message, both on the wire and after
   decompression. The length prefix is rejected before its payload is buffered.
+  The stream receive window also bounds the aggregate normalized response bytes
+  retained while the application has not yet consumed them.
   -/
   maxReceiveMessageSize : Nat := defaultMaxMessageSize
   deriving Inhabited
 
 structure CallOptions where
-  metadata : Metadata := Metadata.empty
+  metadata : _root_.Http2.Headers := _root_.Http2.Headers.empty
   /-- Raw grpc-timeout header value, e.g. "5S" or "250m". -/
   timeout : Option String := none
 
@@ -104,8 +112,8 @@ def propagating (options : CallOptions) (deadline? : Option Nat) :
 end CallOptions
 
 structure CallResult where
-  headers : Metadata := Metadata.empty
-  trailers : Metadata := Metadata.empty
+  headers : _root_.Http2.Headers := _root_.Http2.Headers.empty
+  trailers : _root_.Http2.Headers := _root_.Http2.Headers.empty
   messages : Array ByteArray := #[]
   status : Status := Status.ok
 
@@ -113,66 +121,48 @@ structure CallResult where
 polled by call handles under the connection mutex. -/
 structure CallRecord where
   streamId : Nat
-  /-- Outbound credit granted by the server; `Int` because a SETTINGS
-  `INITIAL_WINDOW_SIZE` reduction can drive it negative (RFC 9113 §6.9.2). -/
-  streamSendWindow : Int
   decode : Message.DecodeState := {}
   /-- Decoded (and decompressed) inbound messages awaiting `recv?`. -/
   inbound : Array ByteArray := #[]
   /-- Wire size of each inbound message; the stream WINDOW_UPDATE for a
   message is sent when `recv?` consumes it. -/
   pendingRecvCredits : Array Nat := #[]
-  headers : Metadata := Metadata.empty
+  /-- Normalized identity-framed bytes retained by each queued response. This
+  is parallel to `inbound` and lets consumption release the decoded-memory
+  budget independently of the compressed wire credit. -/
+  pendingRecvDecodedBytes : Array Nat := #[]
+  /-- Total normalized identity-framed bytes currently retained in `inbound`. -/
+  retainedDecodedBytes : Nat := 0
+  headers : _root_.Http2.Headers := _root_.Http2.Headers.empty
   seenHeaders : Bool := false
   responseGzip : Bool := false
-  trailers : Option Metadata := none
+  trailers : Option _root_.Http2.Headers := none
   failure : Option Status := none
-  sendClosed : Bool := false
 
-/-- Per-stream state for an RFC 8441 extended CONNECT tunnel.  Payload bytes
-remain opaque to this transport; stream credit is returned only when the
-consumer removes a chunk from `inbound`. -/
-structure TunnelRecord where
-  streamId : Nat
-  streamSendWindow : Int
-  inbound : Array ByteArray := #[]
-  pendingRecvCredits : Array Nat := #[]
-  response : Option Http2.ExtendedConnect.Response := none
-  failure : Option Status := none
-  sendClosed : Bool := false
-  recvClosed : Bool := false
-  deriving Inhabited
+private def retainedDecodedResponseLimit (maxReceiveMessageSize : Nat) : Nat :=
+  maxReceiveMessageSize + Message.prefixLength + 65536
+
+private def clientInitialStreamWindow (config : Config) : Nat :=
+  retainedDecodedResponseLimit config.maxReceiveMessageSize
+
+private def clientSettings (config : Config) : _root_.Http2.Connection.Settings := {
+  enablePush := false
+  initialWindowSize := clientInitialStreamWindow config
+}
 
 structure ConnState where
-  decoder : Http2.Frame.DecodeState := {}
-  hpackEncode : Http2.Hpack.State := {}
-  hpackDecode : Http2.Hpack.State := {}
-  nextStreamId : Nat := 1
-  connectionSendWindow : Nat := Http2.Connection.initialFlowControlWindow
-  initialStreamSendWindow : Nat := Http2.Connection.initialFlowControlWindow
-  maxFrameSize : Nat := Http2.defaultMaxFramePayloadLength
-  peerMaxConcurrentStreams : Option Nat := none
-  /-- The peer's first SETTINGS has arrived.  Extended CONNECT cannot be used
-  before its explicit opt-in is observed. -/
-  peerSettingsReceived : Bool := false
-  peerExtendedConnect : Bool := false
-  /-- A server header block awaiting CONTINUATION frames:
-  (stream id, accumulated block, END_STREAM flag from the HEADERS frame). -/
-  pendingHeaders : Option (Nat × ByteArray × Bool) := none
-  goAway : Option Http2.GoAway.Decoded := none
+  /-- Generic RFC 9113 framing, HPACK, settings, stream, and flow-control state. -/
+  protocol : _root_.Http2.Connection.State
   /-- Set when the connection is unusable; new and pending calls fail with it. -/
   dead : Option Status := none
   calls : Array CallRecord := #[]
-  tunnels : Array TunnelRecord := #[]
   deriving Inhabited
 
 private structure BackgroundTasks where
   writer : Option (AsyncTask Unit) := none
   reader : Option (AsyncTask Unit) := none
 
-/-- One FIFO item owned by the connection writer. Most HTTP/2 control traffic
-is fire-and-forget; raw tunnel DATA attaches a completion promise so its send
-contract reaches the actual transport write. -/
+/-- One FIFO item owned by the connection writer. -/
 structure OutboundWrite where
   bytes : ByteArray
   private completion : Option (IO.Promise (Except IO.Error Unit)) := none
@@ -203,9 +193,15 @@ structure Connection where
   drain deadline and cancels a task that cannot finish because the peer is stuck.
   -/
   private background : IO.Ref BackgroundTasks
+  /-- Elects the one owner permitted to retire background tasks and the
+  underlying transport. Concurrent and repeated close calls only wait. -/
+  private closeClaimed : Std.Mutex Bool
+  /-- Resolved exactly once after the elected close owner finishes transport
+  retirement, so every competing close observes the same completion point. -/
+  private closed : IO.Promise Unit
   /-- When present, the connection runs over TLS: outbound bytes are sealed and
   inbound raw bytes are decrypted through this session. `none` is plaintext. -/
-  tls : Option Tls.ClientSession := none
+  tls : Option _root_.Http2.Tls.ClientSession := none
 
 /-- Non-blocking lifecycle diagnostic: `true` once both exact background owners
 have terminated (or before either was installed).  This exposes no task handle
@@ -235,12 +231,12 @@ returned send task is ignored since ordering is guaranteed by the single writer.
 private def enqueueBytes (connection : Connection) (bytes : ByteArray) : BaseIO Unit := do
   if bytes.isEmpty then pure () else discard <| connection.outbound.send { bytes := bytes }
 
-/-- Encode and enqueue a frame. Encoding only fails for malformed frames, which we
-never construct here; such a frame is dropped rather than corrupting the stream. -/
-private def enqueueFrame (connection : Connection) (frame : Http2.Frame) : BaseIO Unit := do
-  match Http2.Frame.encode frame with
-  | .ok bytes => enqueueBytes connection bytes
-  | .error _ => pure ()
+private def enqueueFrames (connection : Connection)
+    (frames : Array _root_.Http2.Frame) : BaseIO Unit := do
+  unless frames.isEmpty do
+    match ofHttp2 <| _root_.Http2.Frame.encodeBatch frames with
+    | .ok bytes => enqueueBytes connection bytes
+    | .error _ => pure ()
 
 private structure OutboundTicket where
   completion : IO.Promise (Except IO.Error Unit)
@@ -265,12 +261,6 @@ private def enqueueBytesAcknowledged (connection : Connection) (bytes : ByteArra
         let error := (← connection.writerFailure.get).getD
           (IO.userError "connection writer is closed")
         pure (.error (Status.ofIOError error))
-
-private def enqueueFrameAcknowledged (connection : Connection) (frame : Http2.Frame) :
-    IO (Except Status OutboundTicket) :=
-  match Http2.Frame.encode frame with
-  | .ok bytes => enqueueBytesAcknowledged connection bytes
-  | .error status => pure (.error status)
 
 private def awaitOutboundTicket (ticket : OutboundTicket) : Async (Except Status Unit) := do
   match ← Async.ofTask ticket.completion.result? with
@@ -302,27 +292,16 @@ private def replaceCall (calls : Array CallRecord) (call : CallRecord) : Array C
 private def removeCall (calls : Array CallRecord) (streamId : Nat) : Array CallRecord :=
   calls.filter (fun call => call.streamId != streamId)
 
-private def findTunnel? (tunnels : Array TunnelRecord) (streamId : Nat) : Option TunnelRecord :=
-  tunnels.find? (fun tunnel => tunnel.streamId == streamId)
-
-private def replaceTunnel (tunnels : Array TunnelRecord) (tunnel : TunnelRecord) :
-    Array TunnelRecord :=
-  (tunnels.filter (fun existing => existing.streamId != tunnel.streamId)).push tunnel
-
-private def removeTunnel (tunnels : Array TunnelRecord) (streamId : Nat) : Array TunnelRecord :=
-  tunnels.filter (fun tunnel => tunnel.streamId != streamId)
-
-private def activeClientStreamCount (state : ConnState) : Nat :=
-  let calls := (state.calls.filter fun call => call.failure.isNone && call.trailers.isNone).size
-  let tunnels := (state.tunnels.filter fun tunnel =>
-      tunnel.failure.isNone && !(tunnel.sendClosed && tunnel.recvClosed) &&
-        !((tunnel.response.map fun response => !Http2.ExtendedConnect.isSuccess response).getD false)).size
-  calls + tunnels
-
 private def peerStreamCapacityAvailable (state : ConnState) : Bool :=
-  match state.peerMaxConcurrentStreams with
+  match state.protocol.peerSettings.maxConcurrentStreams with
   | none => true
-  | some limit => activeClientStreamCount state < limit
+  | some limit =>
+      let active := state.protocol.streams.foldl (init := 0) fun count stream =>
+        if state.protocol.role.isLocalStreamId stream.id && stream.phase != .closed then
+          count + 1
+        else
+          count
+      active < limit
 
 private def failCallRecord (status : Status) (call : CallRecord) : CallRecord :=
   if call.failure.isSome || call.trailers.isSome then
@@ -330,17 +309,13 @@ private def failCallRecord (status : Status) (call : CallRecord) : CallRecord :=
   else
     { call with failure := some status }
 
-private def failTunnelRecord (status : Status) (tunnel : TunnelRecord) : TunnelRecord :=
-  if tunnel.failure.isSome then tunnel else { tunnel with failure := some status }
-
 /-- Mark the connection dead (keeping the first cause) and fail every call
 that has not already reached a terminal state. -/
 private def failStateLocked (state : ConnState) (status : Status) : ConnState :=
   {
     state with
     dead := some (state.dead.getD status),
-    calls := state.calls.map (failCallRecord status),
-    tunnels := state.tunnels.map (failTunnelRecord status)
+    calls := state.calls.map (failCallRecord status)
   }
 
 private def failConnection (connection : Connection) (status : Status) : IO Unit := do
@@ -349,8 +324,8 @@ private def failConnection (connection : Connection) (status : Status) : IO Unit
   wake connection
 
 private def requestMetadata (connection : Connection) (path : String)
-    (options : CallOptions) : Metadata :=
-  let base := Metadata.empty
+    (options : CallOptions) : _root_.Http2.Headers :=
+  let base := _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" connection.config.scheme
     |>.insert ":path" path
@@ -363,332 +338,184 @@ private def requestMetadata (connection : Connection) (path : String)
     | some timeout => base.insert "grpc-timeout" timeout
   base.append options.metadata
 
-private def applyServerSetting (state : ConnState) (setting : Http2.Setting) :
-    Except Status ConnState :=
-  match setting.id with
-  | .maxFrameSize => pure { state with maxFrameSize := setting.value }
-  | .initialWindowSize =>
-      let delta : Int := Int.ofNat setting.value - Int.ofNat state.initialStreamSendWindow
-      pure {
-        state with
-        initialStreamSendWindow := setting.value,
-        calls := state.calls.map fun call =>
-          { call with streamSendWindow := call.streamSendWindow + delta },
-        tunnels := state.tunnels.map fun tunnel =>
-          { tunnel with streamSendWindow := tunnel.streamSendWindow + delta }
-      }
-  | .maxConcurrentStreams =>
-      pure { state with peerMaxConcurrentStreams := some setting.value }
-  | .unknown 0x8 =>
-      if setting.value > 1 then
-        throw (Status.internal "server sent an invalid SETTINGS_ENABLE_CONNECT_PROTOCOL value")
-      else if state.peerExtendedConnect && setting.value == 0 then
-        throw (Status.internal "server disabled SETTINGS_ENABLE_CONNECT_PROTOCOL after enabling it")
-      else
-        pure { state with peerExtendedConnect := setting.value == 1 }
-  | _ => pure state
-
-private def responseGzipOf (metadata : Metadata) : Bool :=
+private def responseGzipOf (metadata : _root_.Http2.Headers) : Bool :=
   metadata.get? "grpc-encoding" == some Headers.gzipEncoding
 
-/-- Fail one tunnel with a stream-level protocol error.  The caller has already
-decoded the complete header block, so resetting the stream cannot desynchronize
-the shared HPACK table. -/
-private def failTunnelProtocol (state : ConnState) (tunnel : TunnelRecord)
-    (message : String) : ConnState × Option Http2.Frame :=
-  let status := Status.internal message
-  let state := { state with
-    tunnels := replaceTunnel state.tunnels (failTunnelRecord status tunnel) }
-  (state, (Http2.RstStream.frame tunnel.streamId Http2.ErrorCode.protocolError).toOption)
-
-/-- Route a fully reassembled server header block. Every block must be decoded
-in arrival order — even for unknown or finished streams — to keep the shared
-HPACK dynamic table in sync with the server's encoder.  Invalid tunnel fields
-therefore become a stream reset only after successful HPACK decoding. -/
-private def routeHeaderBlock (state : ConnState) (streamId : Nat) (block : ByteArray)
-    (endStream : Bool) : Except Status (ConnState × Option Http2.Frame) := do
-  let decoded ← Http2.Hpack.decodeHeaderBlock state.hpackDecode block
-  let state := { state with hpackDecode := decoded.state }
-  match findTunnel? state.tunnels streamId with
-  | some tunnel =>
-      if tunnel.failure.isSome || tunnel.response.isSome then
-        pure (failTunnelProtocol state tunnel
-          "server sent HEADERS after the extended CONNECT final response")
-      else
-        match Http2.ExtendedConnect.decodeResponse decoded.headers with
-        | .error status =>
-            pure (failTunnelProtocol state tunnel status.messageD)
-        | .ok response =>
-            if response.status < 200 then
-              if endStream then
-                pure (failTunnelProtocol state tunnel
-                  "server ended an extended CONNECT stream with an interim response")
-              else
-                pure (state, none)
-            else
-              let tunnel := {
-                tunnel with response := some response, recvClosed := endStream }
-              pure ({ state with tunnels := replaceTunnel state.tunnels tunnel }, none)
-  | none =>
-      match findCall? state.calls streamId with
-      | none => pure (state, none)
-      | some call =>
-          if call.failure.isSome || call.trailers.isSome then
-            pure (state, none)
-          else
-            let call :=
-              if !call.seenHeaders && !endStream then
-                {
-                  call with
-                  seenHeaders := true,
-                  headers := decoded.headers,
-                  responseGzip := responseGzipOf decoded.headers
-                }
-              else
-                { call with trailers := some decoded.headers }
-            pure ({ state with calls := replaceCall state.calls call }, none)
-
-/-- Decode DATA payload into gRPC messages, recording each message's wire size
-so its stream flow-control credit can be granted on consumption. -/
+/-- Decode DATA payload into gRPC messages, recording both each message's wire
+size and its normalized retained size. The cumulative decoded queue uses the
+same finite bound as the advertised stream receive window, so compression can
+never turn bounded peer credit into unbounded client memory. -/
 private def processCallData
     (maxReceiveMessageSize : Nat) (call : CallRecord) (payload : ByteArray) :
     Except Status CallRecord := do
   let decoded ← Message.decodeChunkWithLimit (some maxReceiveMessageSize)
     { buffered := call.decode.buffered } payload
-  let credits := decoded.messages.map fun message => Message.prefixLength + message.data.size
-  let messages ← decoded.messages.mapM fun message => do
-    let message ← Message.decompress call.responseGzip maxReceiveMessageSize message
-    pure message.data
+  let limit := retainedDecodedResponseLimit maxReceiveMessageSize
+  let mut inbound := call.inbound
+  let mut pendingRecvCredits := call.pendingRecvCredits
+  let mut pendingRecvDecodedBytes := call.pendingRecvDecodedBytes
+  let mut retainedDecodedBytes := call.retainedDecodedBytes
+  for encoded in decoded.messages do
+    let wireCredit := Message.prefixLength + encoded.data.size
+    let message ← Message.decompress call.responseGzip maxReceiveMessageSize encoded
+    let decodedBytes := Message.prefixLength + message.data.size
+    if retainedDecodedBytes + decodedBytes > limit then
+      throw (Status.resourceExhausted
+        s!"gRPC response queue exceeds retained decoded-byte limit {limit}")
+    inbound := inbound.push message.data
+    pendingRecvCredits := pendingRecvCredits.push wireCredit
+    pendingRecvDecodedBytes := pendingRecvDecodedBytes.push decodedBytes
+    retainedDecodedBytes := retainedDecodedBytes + decodedBytes
   pure {
     call with
     decode := { buffered := decoded.buffered },
-    inbound := call.inbound.append messages,
-    pendingRecvCredits := call.pendingRecvCredits.append credits
+    inbound := inbound,
+    pendingRecvCredits := pendingRecvCredits,
+    pendingRecvDecodedBytes := pendingRecvDecodedBytes,
+    retainedDecodedBytes := retainedDecodedBytes
   }
 
-private def rstStatus (code : Http2.ErrorCode) : Status :=
+private structure PoppedInboundMessage where
+  data : ByteArray
+  wireCredit : Nat
+  call : CallRecord
+
+/-- Remove one queued response and release exactly its decoded-memory budget. -/
+private def popInboundMessage? (call : CallRecord) : Option PoppedInboundMessage := do
+  let data ← call.inbound[0]?
+  let wireCredit := call.pendingRecvCredits[0]?.getD 0
+  let decodedBytes := call.pendingRecvDecodedBytes[0]?.getD
+    (Message.prefixLength + data.size)
+  pure {
+    data := data
+    wireCredit := wireCredit
+    call := {
+      call with
+      inbound := call.inbound.extract 1 call.inbound.size,
+      pendingRecvCredits :=
+        call.pendingRecvCredits.extract 1 call.pendingRecvCredits.size,
+      pendingRecvDecodedBytes :=
+        call.pendingRecvDecodedBytes.extract 1 call.pendingRecvDecodedBytes.size,
+      retainedDecodedBytes := call.retainedDecodedBytes - decodedBytes
+    }
+  }
+
+private def responseDataFailureResetCode (status : Status) : _root_.Http2.ErrorCode :=
+  if status.code == .resourceExhausted then .enhanceYourCalm else .cancel
+
+private def rstStatus (code : _root_.Http2.ErrorCode) : Status :=
   match code with
   | .cancel => Status.cancelled "stream cancelled by server"
   | .refusedStream => Status.error .unavailable "stream refused by server"
   | .enhanceYourCalm => Status.resourceExhausted "server requested backoff"
   | code => Status.internal s!"stream reset by server (HTTP/2 error {code.toNat})"
 
-private def handleInboundFrame (connection : Connection) (frame : Http2.Frame) : IO Unit := do
-  connection.state.atomically do
-    let state ← get
-    match state.pendingHeaders with
-    | some (pendingStreamId, buffered, endStream) =>
-        -- A header block in progress must be continued before anything else.
-        if frame.header.frameType == Http2.FrameType.continuation
-            && frame.header.streamId == pendingStreamId then
-          let block := buffered.append frame.payload
-          if block.size > Http2.Connection.maxHeaderBlockSize then
-            set (failStateLocked state
-              (Status.internal "server header block exceeds the maximum supported size"))
-          else if Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endHeaders then
-            match routeHeaderBlock { state with pendingHeaders := none }
-                pendingStreamId block endStream with
-            | .ok (state, reset?) =>
-                set state
-                if let some reset := reset? then enqueueFrame connection reset
-            | .error status => set (failStateLocked state status)
+private def informationalResponse (headers : _root_.Http2.Headers) : Bool :=
+  match (headers.get? ":status").bind String.toNat? with
+  | some status => status < 200
+  | none => false
+
+private def resetProtocolStream (state : ConnState) (streamId : Nat)
+    (code : _root_.Http2.ErrorCode) : Except Status (ConnState × Array _root_.Http2.Frame) := do
+  let (protocol, reset?) ← ofHttp2 <|
+    _root_.Http2.Connection.resetStream state.protocol streamId code
+  let frames := match reset? with
+    | some frame => #[frame]
+    | none => #[]
+  pure ({ state with protocol }, frames)
+
+/-- Drop application ownership of a terminal call and close any request side
+the peer completed before the application half-closed it. -/
+private def retireCallLocked (connection : Connection) (state : ConnState)
+    (streamId : Nat) : BaseIO ConnState := do
+  let state := { state with calls := removeCall state.calls streamId }
+  if state.dead.isSome then
+    pure state
+  else
+    match _root_.Http2.Connection.resetStream state.protocol streamId .cancel with
+    | .error _ => pure state
+    | .ok (protocol, reset?) =>
+        if let some reset := reset? then enqueueFrames connection #[reset]
+        pure { state with protocol }
+
+private def handleHeadersEvent (state : ConnState) (streamId : Nat)
+    (headers : _root_.Http2.Headers) (endStream trailers : Bool) : ConnState :=
+  match findCall? state.calls streamId with
+  | none => state
+  | some call =>
+      if call.failure.isSome || call.trailers.isSome || informationalResponse headers then
+        state
+      else
+        let call :=
+          if trailers || endStream then
+            if call.decode.buffered.isEmpty then
+              { call with trailers := some headers }
+            else
+              failCallRecord (Status.internal
+                "server ended the response with an incomplete gRPC message") call
           else
-            set { state with pendingHeaders := some (pendingStreamId, block, endStream) }
-        else
-          set (failStateLocked state
-            (Status.internal "server violated HTTP/2 CONTINUATION sequencing"))
-    | none =>
-      match frame.header.frameType with
-      | .settings =>
-          if Http2.Settings.isAck frame then
-            pure ()
+            {
+              call with
+              seenHeaders := true
+              headers
+              responseGzip := responseGzipOf headers
+            }
+        { state with calls := replaceCall state.calls call }
+
+private def handleProtocolEvent (maxReceiveMessageSize : Nat) (state : ConnState)
+    (outbound : Array _root_.Http2.Frame) (event : _root_.Http2.Connection.Event) :
+    Except Status (ConnState × Array _root_.Http2.Frame) := do
+  match event with
+  | .headers streamId headers endStream trailers =>
+      pure (handleHeadersEvent state streamId headers endStream trailers, outbound)
+  | .data streamId payload endStream =>
+      match findCall? state.calls streamId with
+      | none => pure (state, outbound)
+      | some call =>
+          if call.failure.isSome || call.trailers.isSome then
+            pure (state, outbound)
+          else if endStream then
+            let status := Status.internal "server ended stream without gRPC trailers"
+            let state := { state with
+              calls := replaceCall state.calls (failCallRecord status call) }
+            let (state, reset) ← resetProtocolStream state streamId .protocolError
+            pure (state, outbound ++ reset)
           else
-            match Http2.Settings.decode frame with
-            | .error status => set (failStateLocked state status)
-            | .ok settings =>
-                match settings.foldlM applyServerSetting state with
-                | .error status => set (failStateLocked state status)
-                | .ok state =>
-                    set { state with peerSettingsReceived := true }
-                    match Http2.Settings.frame #[] (ack := true) with
-                    | .ok ack => enqueueFrame connection ack
-                    | .error _ => pure ()
-      | .ping =>
-          if Http2.Ping.isAck frame then
-            pure ()
+            match processCallData maxReceiveMessageSize call payload with
+            | .ok call =>
+                pure ({ state with calls := replaceCall state.calls call }, outbound)
+            | .error status =>
+                let state := { state with
+                  calls := replaceCall state.calls (failCallRecord status call) }
+                let (state, reset) ← resetProtocolStream state streamId
+                  (responseDataFailureResetCode status)
+                pure (state, outbound ++ reset)
+  | .reset streamId code =>
+      let calls := match findCall? state.calls streamId with
+        | none => state.calls
+        | some call => replaceCall state.calls (failCallRecord (rstStatus code) call)
+      pure ({ state with calls }, outbound)
+  | .streamError streamId code message =>
+      let status := match code with
+        | .cancel => Status.cancelled message
+        | .refusedStream => Status.error .unavailable message
+        | .enhanceYourCalm => Status.resourceExhausted message
+        | _ => Status.internal message
+      let calls := match findCall? state.calls streamId with
+        | none => state.calls
+        | some call => replaceCall state.calls (failCallRecord status call)
+      pure ({ state with calls }, outbound)
+  | .goAway lastStreamId _ _ =>
+      pure ({ state with
+        calls := state.calls.map fun call =>
+          if call.streamId > lastStreamId then
+            failCallRecord
+              (Status.error .unavailable "connection is shutting down (GOAWAY)") call
           else
-            match Http2.Ping.decode frame with
-            | .error status => set (failStateLocked state status)
-            | .ok payload =>
-                match Http2.Ping.frame payload (ack := true) with
-                | .ok ack => enqueueFrame connection ack
-                | .error _ => pure ()
-      | .windowUpdate =>
-          match Http2.WindowUpdate.decode frame with
-          | .error status => set (failStateLocked state status)
-          | .ok increment =>
-              if frame.header.streamId == 0 then
-                set { state with
-                  connectionSendWindow := state.connectionSendWindow + increment }
-              else
-                match findCall? state.calls frame.header.streamId with
-                | none =>
-                    match findTunnel? state.tunnels frame.header.streamId with
-                    | none => pure ()
-                    | some tunnel =>
-                        let tunnel := { tunnel with
-                          streamSendWindow := tunnel.streamSendWindow + Int.ofNat increment }
-                        set { state with
-                          tunnels := replaceTunnel state.tunnels tunnel }
-                | some call =>
-                    let call := { call with
-                      streamSendWindow := call.streamSendWindow + Int.ofNat increment }
-                    set { state with calls := replaceCall state.calls call }
-      | .goAway =>
-          match Http2.GoAway.decode frame with
-          | .error status => set (failStateLocked state status)
-          | .ok decoded =>
-              set {
-                state with
-                goAway := some decoded,
-                calls := state.calls.map fun (call : CallRecord) =>
-                  if call.streamId > decoded.lastStreamId then
-                    failCallRecord
-                      (Status.error .unavailable "connection is shutting down (GOAWAY)") call
-                  else
-                    call,
-                tunnels := state.tunnels.map fun (tunnel : TunnelRecord) =>
-                  if tunnel.streamId > decoded.lastStreamId then
-                    failTunnelRecord
-                      (Status.error .unavailable "connection is shutting down (GOAWAY)") tunnel
-                  else
-                    tunnel
-              }
-      | .rstStream =>
-          match Http2.RstStream.decode frame with
-          | .error status => set (failStateLocked state status)
-          | .ok code =>
-              match findCall? state.calls frame.header.streamId with
-              | none =>
-                  match findTunnel? state.tunnels frame.header.streamId with
-                  | none => pure ()
-                  | some tunnel =>
-                      let tunnel := failTunnelRecord (rstStatus code) tunnel
-                      set { state with tunnels := replaceTunnel state.tunnels tunnel }
-              | some call =>
-                  set { state with
-                    calls := replaceCall state.calls (failCallRecord (rstStatus code) call) }
-      | .headers =>
-          match Http2.Transport.normalizeHeadersFrame frame with
-          | .error status => set (failStateLocked state status)
-          | .ok frame =>
-              let endStream := Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endStream
-              if Http2.FrameFlag.has frame.header.flags Http2.FrameFlag.endHeaders then
-                match routeHeaderBlock state frame.header.streamId frame.payload endStream with
-                | .ok (state, reset?) =>
-                    set state
-                    if let some reset := reset? then enqueueFrame connection reset
-                | .error status => set (failStateLocked state status)
-              else
-                set { state with
-                  pendingHeaders := some (frame.header.streamId, frame.payload, endStream) }
-      | .continuation =>
-          set (failStateLocked state (Status.internal "unexpected HTTP/2 CONTINUATION from server"))
-      | .data =>
-          match Http2.Transport.normalizeDataFrame frame with
-          | .error status => set (failStateLocked state status)
-          | .ok normalized =>
-              -- Credit the connection window for the full padded frame right
-              -- away; stream credit for the payload waits for consumption.
-              (if frame.payload.size > 0 then
-                match Http2.WindowUpdate.frame 0 frame.payload.size with
-                | .ok update => enqueueFrame connection update
-                | .error _ => pure ()
-              else
-                pure ())
-              let paddingBytes := frame.payload.size - normalized.payload.size
-              (if paddingBytes > 0 then
-                match Http2.WindowUpdate.frame frame.header.streamId paddingBytes with
-                | .ok update => enqueueFrame connection update
-                | .error _ => pure ()
-              else
-                pure ())
-              match findCall? state.calls frame.header.streamId with
-              | none =>
-                  match findTunnel? state.tunnels frame.header.streamId with
-                  | none => pure ()
-                  | some tunnel =>
-                      if tunnel.failure.isSome then
-                        pure ()
-                      else
-                        match tunnel.response with
-                        | none =>
-                            let (state, reset?) := failTunnelProtocol state tunnel
-                              "server sent DATA before the extended CONNECT final response"
-                            set state
-                            if let some reset := reset? then enqueueFrame connection reset
-                        | some response =>
-                            if !Http2.ExtendedConnect.isSuccess response then
-                              -- The public rejection result has no response-body
-                              -- stream.  Discard any legal body while promptly
-                              -- returning its stream credit.
-                              (if normalized.payload.size > 0 then
-                                match Http2.WindowUpdate.frame
-                                    frame.header.streamId normalized.payload.size with
-                                | .ok update => enqueueFrame connection update
-                                | .error _ => pure ()
-                              else pure ())
-                              let recvClosed := tunnel.recvClosed || Http2.FrameFlag.has
-                                normalized.header.flags Http2.FrameFlag.endStream
-                              let tunnel := { tunnel with recvClosed := recvClosed }
-                              set { state with
-                                tunnels := replaceTunnel state.tunnels tunnel }
-                            else if tunnel.recvClosed then
-                              let (state, reset?) := failTunnelProtocol state tunnel
-                                "server sent DATA after END_STREAM on an extended CONNECT tunnel"
-                              set state
-                              if let some reset := reset? then enqueueFrame connection reset
-                            else
-                              let tunnel := {
-                                tunnel with
-                                inbound := if normalized.payload.isEmpty then tunnel.inbound
-                                  else tunnel.inbound.push normalized.payload,
-                                pendingRecvCredits := if normalized.payload.isEmpty then
-                                  tunnel.pendingRecvCredits
-                                else
-                                  tunnel.pendingRecvCredits.push normalized.payload.size,
-                                recvClosed := Http2.FrameFlag.has
-                                  normalized.header.flags Http2.FrameFlag.endStream
-                              }
-                              set { state with
-                                tunnels := replaceTunnel state.tunnels tunnel }
-              | some call =>
-                  if call.failure.isSome || call.trailers.isSome then
-                    pure ()
-                  else if Http2.FrameFlag.has normalized.header.flags Http2.FrameFlag.endStream then
-                    -- gRPC servers half-close via trailers, never via DATA.
-                    set { state with calls := replaceCall state.calls (failCallRecord
-                      (Status.internal "server ended stream without gRPC trailers") call) }
-                  else
-                    match processCallData
-                        connection.config.maxReceiveMessageSize call normalized.payload with
-                    | .ok call =>
-                        set { state with calls := replaceCall state.calls call }
-                    | .error status =>
-                        -- Stop the peer from continuing a response that this
-                        -- stream has rejected (notably an oversized message).
-                        match Http2.RstStream.frame
-                            frame.header.streamId Http2.ErrorCode.cancel with
-                        | .ok rst => enqueueFrame connection rst
-                        | .error _ => pure ()
-                        set { state with
-                          calls := replaceCall state.calls (failCallRecord status call) }
-      | .pushPromise =>
-          set (failStateLocked state
-            (Status.internal "server sent PUSH_PROMISE although push is disabled"))
-      | .priority => pure ()
-      | .unknown _ => pure ()
-  wake connection
+            call
+      }, outbound)
+  | .settingsChanged _ | .settingsAcknowledged | .pingAcknowledged _ | .priority _ =>
+      pure (state, outbound)
 
 private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
   try
@@ -700,6 +527,35 @@ private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
 
 namespace TestSupport
 
+structure ResponseDataObservation where
+  messageCount : Nat
+  retainedDecodedBytes : Nat
+  retainedAfterOneReceive : Nat
+  deriving Inhabited, Repr
+
+/-- Exercise the production response decoder and production queue-pop
+accounting without a socket. -/
+def processResponseDataForTest (maxReceiveMessageSize : Nat) (responseGzip : Bool)
+    (payload : ByteArray) : Except Status ResponseDataObservation := do
+  let call ← processCallData maxReceiveMessageSize {
+    streamId := 1
+    responseGzip := responseGzip
+  } payload
+  let retainedAfterOneReceive :=
+    (popInboundMessage? call).map (·.call.retainedDecodedBytes)
+      |>.getD call.retainedDecodedBytes
+  pure {
+    messageCount := call.inbound.size
+    retainedDecodedBytes := call.retainedDecodedBytes
+    retainedAfterOneReceive := retainedAfterOneReceive
+  }
+
+def retainedDecodedResponseLimitForTest (maxReceiveMessageSize : Nat) : Nat :=
+  retainedDecodedResponseLimit maxReceiveMessageSize
+
+def responseDataFailureResetCodeForTest (status : Status) : _root_.Http2.ErrorCode :=
+  responseDataFailureResetCode status
+
 /-- Test-only fault injection: retire the socket write side, then verify that
 an exact writer ticket reports failure instead of an earlier queue-admission
 success. The connection is unusable afterwards. -/
@@ -709,10 +565,6 @@ def acknowledgedWriteAfterSocketShutdown (connection : Connection) :
   match ← enqueueBytesAcknowledged connection (ByteArray.mk #[0]) with
   | .error status => pure (.error status)
   | .ok ticket => awaitOutboundTicket ticket
-
-/-- Number of retained extended CONNECT stream records. -/
-def activeTunnelCount (connection : Connection) : IO Nat :=
-  connection.state.atomically do pure (← get).tunnels.size
 
 end TestSupport
 
@@ -741,86 +593,49 @@ private def nextReaderEvent (connection : Connection) : Async ReaderEvent :=
           let error := error?.getD (IO.userError "TLS record writer failed")
           pure (ReaderEvent.writerFailed (Status.ofIOError error))
 
-/-- Decode one decrypted chunk into frames and dispatch them; `true` means the
-reader should continue.  Shared by the socket path and the TLS handshake
-leftover (application bytes the server coalesced behind its Finished flight). -/
+/-- Feed one decrypted chunk through the shared HTTP/2 state machine, then
+translate its semantic events into gRPC call state. `true` means the reader
+should continue. Shared by the socket path and TLS handshake leftovers. -/
 private def processInboundChunk (connection : Connection) (chunk : ByteArray) :
     Async Bool := do
-  let frames? ← connection.state.atomically do
+  let keepGoing ← connection.state.atomically do
     let state ← get
     if state.dead.isSome then
-      pure none
+      pure false
     else
-      match Http2.Frame.decodeChunk state.decoder chunk with
-      | .error status =>
-          set (failStateLocked state status)
-          pure none
-      | .ok decoded =>
-          set { state with decoder := { buffered := decoded.buffered } }
-          pure (some decoded.frames)
-  match frames? with
-  | none => pure false
-  | some frames => do
-      for frame in frames do
-        handleInboundFrame connection frame
-      pure true
-
-/-- Connection reader. Runs in `Async`: while idle (no inbound bytes) it suspends
-cooperatively instead of parking a worker thread, so open-but-idle connections are
-free. Frame handling in the body is ordinary `IO`.  `pending?` carries decrypted
-application bytes that arrived before the reader existed (the TLS handshake
-leftover); they enter exactly where a decrypted socket chunk would. -/
-private partial def readerLoop (connection : Connection)
-    (pending? : Option ByteArray := none) : Async Unit := do
-  if let some chunk := pending? then
-    if ← processInboundChunk connection chunk then
-      readerLoop connection none
-    return
-  let event ← try
-      Except.ok <$> nextReaderEvent connection
-    catch err =>
-      pure (Except.error (Status.ofIOError err))
-  -- `.stop` (this side closing the connection) and a peer EOF both end the
-  -- loop, but they are very different diagnoses, so they are not collapsed into
-  -- one status: a report of "connection closed" then always means the peer went
-  -- away, never that we shut ourselves down.
-  let localStop : Bool := match event with
-    | .ok .stop => true
-    | _ => false
-  let writerFailed : Bool := match event with
-    | .ok (.writerFailed _) => true
-    | _ => false
-  let chunk? : Except Status (Option ByteArray) := match event with
-    | .error status => .error status
-    | .ok .stop => .ok none
-    | .ok (.writerFailed status) => .error status
-    | .ok (.received chunk?) => .ok chunk?
-  -- Over TLS, decrypt the raw chunk into application bytes first; `none` means the
-  -- peer closed (close_notify or EOF). A `some #[]` (control-only record) decodes to
-  -- no frames and loops, exactly like an empty plaintext read.
-  let chunk? : Except Status (Option ByteArray) ← do
-    match chunk?, connection.tls with
-    | .ok (some raw), some session =>
-        match ← (session.feedInbound raw).toBaseIO with
-        | .ok plaintext => pure (.ok plaintext)
-        | .error err => pure (.error (Status.ofIOError err))
-    | other, _ => pure other
-  match chunk? with
-  | .error status => do
-      failConnection connection status
-      -- A failed writer cannot make further protocol progress.  Retire the
-      -- write side here, in the reader owner, so a silent peer cannot leave a
-      -- blocked reader/background owner behind until a later explicit close.
-      if writerFailed then
-        shutdownSocket connection.socket
-  | .ok none =>
-      if localStop then
-        failConnection connection (Status.error .unavailable "connection shut down locally")
-      else
-        failConnection connection (Status.error .unavailable "connection closed by peer")
-  | .ok (some chunk) =>
-      if ← processInboundChunk connection chunk then
-        readerLoop connection none
+      match _root_.Http2.Connection.processBytes state.protocol chunk with
+      | .error error =>
+          set (failStateLocked state (Status.ofHttp2Error error))
+          pure false
+      | .ok processed =>
+          let mut state := { state with protocol := processed.state }
+          let mut outbound := processed.outbound
+          let mut applicationError? : Option Status := none
+          for event in processed.events do
+            if applicationError?.isNone then
+              match handleProtocolEvent connection.config.maxReceiveMessageSize
+                  state outbound event with
+              | .ok (next, frames) =>
+                  state := next
+                  outbound := frames
+              | .error status => applicationError? := some status
+          let protocolError? := processed.error?
+          if let some error := protocolError? then
+            match _root_.Http2.Connection.beginGoAway state.protocol error.code
+                error.message.toUTF8 with
+            | .ok (protocol, goAway) =>
+                state := { state with protocol }
+                outbound := outbound.push goAway
+            | .error _ => pure ()
+          let terminal? := applicationError?.orElse fun _ =>
+            protocolError?.map Status.ofHttp2Error
+          if let some status := terminal? then
+            state := failStateLocked state status
+          set state
+          enqueueFrames connection outbound
+          pure terminal?.isNone
+  wake connection
+  pure keepGoing
 
 /-- Resolve every completion-aware item left behind after the sole writer
 fails. Closing the channel preserves queued items for this drain. -/
@@ -857,16 +672,8 @@ private partial def writerLoop (connection : Connection) : Async Unit := do
           connection.writerFailure.set (some err)
         discard <| connection.outbound.close.toBaseIO
         failQueuedOutboundWrites connection err
-        discard <| Grpc.CancellationToken.cancel connection.writerFailureToken
+        discard <| _root_.Http2.CancellationToken.cancel connection.writerFailureToken
           (reason := Std.CancellationReason.shutdown)
-
-private def startBackgroundTasks (connection : Connection)
-    (initialInbound : ByteArray := ByteArray.empty) : IO Unit := do
-  let pending? := if initialInbound.isEmpty then none else some initialInbound
-  let reader ← Async.toIO (readerLoop connection pending?)
-  connection.background.set { reader := some reader }
-  let writer ← Async.toIO (writerLoop connection)
-  connection.background.set { writer := some writer, reader := some reader }
 
 private def awaitBackgroundTask (task : AsyncTask Unit) : Async Unit := do
   let finished ← Async.race
@@ -893,7 +700,7 @@ private def joinBackgroundTasks (connection : Connection) : Async Unit := do
 
 private def shutdownConnection (connection : Connection) : Async Unit := do
   failConnection connection (Status.cancelled "connection closed locally")
-  discard <| Grpc.CancellationToken.cancel connection.stopToken
+  discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
     (reason := Std.CancellationReason.shutdown)
   discard <| connection.outbound.close.toBaseIO
   match connection.tls with
@@ -909,30 +716,124 @@ private def shutdownConnection (connection : Connection) : Async Unit := do
       shutdownSocket connection.socket
       joinBackgroundTasks connection
 
-private def clientPrefaceWire : IO ByteArray := do
-  let settings ← ofStatus
-    (Http2.Settings.frame #[
-      { id := Http2.SettingId.enablePush, value := 0 },
-      { id := Http2.SettingId.initialWindowSize, value := Http2.Connection.defaultStreamWindow }
-    ])
-  let settingsWire ← ofStatus (Http2.Frame.encode settings)
-  pure (Http2.connectionPreface.append settingsWire)
+private def closeConnection (connection : Connection) : Async Unit := do
+  let owner ← connection.closeClaimed.atomically do
+    if ← get then
+      pure false
+    else
+      set true
+      pure true
+  if owner then
+    try
+      shutdownConnection connection
+    finally
+      connection.closed.resolve ()
+  else
+    match ← Async.ofTask connection.closed.result? with
+    | some () => pure ()
+    | none => pure ()
+
+/-- Start the elected close owner without making the reader join itself. The
+spawned owner closes the outbound queue and transport, waits for this reader to
+return, and resolves the shared completion promise for every close caller. -/
+private def requestTransportRetirement (connection : Connection) : IO Unit := do
+  discard <| Async.toIO (closeConnection connection)
+
+/-- Connection reader. Runs in `Async`: while idle (no inbound bytes) it suspends
+cooperatively instead of parking a worker thread, so open-but-idle connections are
+free. Frame handling in the body is ordinary `IO`.  `pending?` carries decrypted
+application bytes that arrived before the reader existed (the TLS handshake
+leftover); they enter exactly where a decrypted socket chunk would. -/
+private partial def readerLoop (connection : Connection)
+    (pending? : Option ByteArray := none) : Async Unit := do
+  if let some chunk := pending? then
+    if ← processInboundChunk connection chunk then
+      readerLoop connection none
+    else
+      requestTransportRetirement connection
+    return
+  let event ← try
+      Except.ok <$> nextReaderEvent connection
+    catch err =>
+      pure (Except.error (Status.ofIOError err))
+  -- `.stop` (this side closing the connection) and a peer EOF both end the
+  -- loop, but they are very different diagnoses, so they are not collapsed into
+  -- one status: a report of "connection closed" then always means the peer went
+  -- away, never that we shut ourselves down.
+  let localStop : Bool := match event with
+    | .ok .stop => true
+    | _ => false
+  let chunk? : Except Status (Option ByteArray) := match event with
+    | .error status => .error status
+    | .ok .stop => .ok none
+    | .ok (.writerFailed status) => .error status
+    | .ok (.received chunk?) => .ok chunk?
+  -- Over TLS, decrypt the raw chunk into application bytes first; `none` means the
+  -- peer closed (close_notify or EOF). A `some #[]` (control-only record) decodes to
+  -- no frames and loops, exactly like an empty plaintext read.
+  let chunk? : Except Status (Option ByteArray) ← do
+    match chunk?, connection.tls with
+    | .ok (some raw), some session =>
+        match ← (session.feedInbound raw).toBaseIO with
+        | .ok plaintext => pure (.ok plaintext)
+        | .error err => pure (.error (Status.ofIOError err))
+    | other, _ => pure other
+  match chunk? with
+  | .error status =>
+      failConnection connection status
+      requestTransportRetirement connection
+  | .ok none =>
+      if localStop then
+        failConnection connection (Status.error .unavailable "connection shut down locally")
+      else
+        failConnection connection (Status.error .unavailable "connection closed by peer")
+        requestTransportRetirement connection
+  | .ok (some chunk) =>
+      if ← processInboundChunk connection chunk then
+        readerLoop connection none
+      else
+        requestTransportRetirement connection
+
+private def startBackgroundTasks (connection : Connection)
+    (initialInbound : ByteArray := ByteArray.empty) : IO Unit := do
+  let pending? := if initialInbound.isEmpty then none else some initialInbound
+  let reader ← Async.toIO (readerLoop connection pending?)
+  connection.background.set { reader := some reader }
+  let writer ← Async.toIO (writerLoop connection)
+  connection.background.set { writer := some writer, reader := some reader }
+
+private def clientOpening (config : Config) : IO
+    (_root_.Http2.Connection.State × ByteArray) := do
+  if config.readSize == 0 then
+    throw (IO.userError "HTTP/2 client readSize must be positive")
+  let initialWindowSize := clientInitialStreamWindow config
+  if initialWindowSize > _root_.Http2.Connection.maximumWindowSize then
+    throw (IO.userError
+      "maxReceiveMessageSize exceeds the largest safe HTTP/2 stream receive window")
+  let protocol := _root_.Http2.Connection.initial .client (clientSettings config)
+  let wire ← ofStatus <| ofHttp2 <| _root_.Http2.Connection.initialWireBytes protocol
+  pure (protocol, wire)
 
 private def initializeConnection
     (socket : TCP.Socket.Client) (config : Config)
-    (prefaceWire : ByteArray) (tls : Option Tls.ClientSession := none)
+    (protocol : _root_.Http2.Connection.State) (prefaceWire : ByteArray)
+    (tls : Option _root_.Http2.Tls.ClientSession := none)
     (initialInbound : ByteArray := ByteArray.empty) :
     IO Connection := do
   let connection : Connection := {
     socket := socket,
     config := config,
-    state := ← Std.Mutex.new {},
+    state := ← Std.Mutex.new {
+      protocol := protocol
+    },
     outbound := ← Std.CloseableChannel.new,
     wakeup := ← Std.Notify.new,
     stopToken := ← Std.CancellationToken.new,
     writerFailure := ← IO.mkRef (none : Option IO.Error),
     writerFailureToken := ← Std.CancellationToken.new,
     background := ← IO.mkRef {},
+    closeClaimed := ← Std.Mutex.new false,
+    closed := ← IO.Promise.new,
     tls := tls
   }
   try
@@ -972,7 +873,7 @@ is not a cleanup boundary in `Std.Async`. -/
 def connectAsync (config : Config := {})
     (cancellation? : Option Std.CancellationToken := none) : Async Connection := do
   -- Finish all pure framing work before acquiring a socket.
-  let prefaceWire ← clientPrefaceWire
+  let (protocol, prefaceWire) ← clientOpening config
   if ← openingCancelled cancellation? then
     throw (openingCancelledError "HTTP/2 connection opening")
   let socket ← TCP.Socket.Client.mk
@@ -982,7 +883,7 @@ def connectAsync (config : Config := {})
       shutdownSocket socket
       throw (openingCancelledError "HTTP/2 connection opening")
     socket.noDelay
-    let connection ← initializeConnection socket config prefaceWire
+    let connection ← initializeConnection socket config protocol prefaceWire
     if ← openingCancelled cancellation? then
       shutdownConnection connection
       throw (openingCancelledError "HTTP/2 connection opening")
@@ -998,156 +899,49 @@ def connectAsync (config : Config := {})
 def connect (config : Config := {}) : IO Connection :=
   Async.block (connectAsync config)
 
-/-- TLS options for a gRPC-over-TLS client connection. -/
-structure TlsConfig where
-  /-- Optional SNI host. When `verificationName` is absent, this is also the
-  certificate identity checked during hostname verification. -/
-  serverName : Option String := none
-  /-- ALPN protocols to offer; gRPC requires "h2". -/
-  alpnProtocols : Array String := #["h2"]
-  /-- PEM trust anchors for X.509 chain validation. `none` skips chain and
-  hostname validation (development / self-signed peers); the TLS engine still
-  cryptographically verifies the server's CertificateVerify either way. -/
-  trustAnchorsPEM : Option String := none
-  /-- Verify the leaf certificate identity (needs anchors). -/
-  verifyHostname : Bool := true
-  /-- Optional certificate identity independent of SNI. This is useful for
-  endpoints such as IP literals that must be verified but should not be sent in
-  a TLS `server_name` extension. -/
-  verificationName : Option String := none
-
-private def verifyTlsPeer
-    (session : Tls.ClientSession)
-    (trustStore? : Option TLS13.X509.Chain.TrustStore)
-    (tlsConfig : TlsConfig) : IO Unit := do
-  match trustStore? with
-  | none => pure ()
-  | some trustStore =>
-      let certificates ← session.peerCertificates
-      let some leaf := certificates[0]?
-        | throw (IO.userError "TLS peer sent no certificate")
-      let presented := certificates.extract 1 certificates.size
-      let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt
-      let verified ← match TLS13.X509.Chain.validate now leaf presented trustStore with
-        | .ok verified => pure verified
-        | .error failure => throw (IO.userError s!"TLS certificate chain: {repr failure}")
-      if tlsConfig.verifyHostname then
-        match tlsConfig.verificationName.orElse fun _ => tlsConfig.serverName with
-        | none => pure ()
-        | some host =>
-            match TLS13.X509.Hostname.verifyHostname host verified.leaf with
-            | .ok () => pure ()
-            | .error failure => throw (IO.userError s!"TLS hostname: {repr failure}")
-
-/-- A verified TLS transport before an application protocol has consumed it.
-`initialInbound` contains authenticated application bytes coalesced with the
-server's Finished flight and must be handed to the selected protocol exactly
-once. -/
-structure TlsBootstrap where
-  session : Tls.ClientSession
-  initialInbound : ByteArray := ByteArray.empty
-
-namespace TlsBootstrap
-
-/-- Retire a bootstrap that will not be adopted by an application protocol. -/
-def close (bootstrap : TlsBootstrap) : Async Unit :=
-  bootstrap.session.close
-
-end TlsBootstrap
-
-/-- Asynchronously connect, negotiate TLS 1.3, and apply certificate/hostname
-policy without emitting bytes for an application protocol. The optional token
-is threaded through the TLS handshake; cancellation retires the exact socket or
-session before returning. A native connect already in flight may have to settle
-first because the pinned libuv adapter exposes no cancel-connect operation. -/
-def bootstrapTlsAsync (config : Config := {}) (tlsConfig : TlsConfig := {})
-    (cancellation? : Option Std.CancellationToken := none) : Async TlsBootstrap := do
-  let trustStore? ← match tlsConfig.trustAnchorsPEM with
-    | none => pure none
-    | some pem =>
-        match TLS13.X509.Chain.TrustStore.decodePEM pem with
-        | .ok store => pure (some store)
-        | .error message => throw (IO.userError s!"TLS trust anchors: {message}")
-  if ← openingCancelled cancellation? then
-    throw (openingCancelledError "TLS connection opening")
-  let socket ← TCP.Socket.Client.mk
-  let sessionRef ← IO.mkRef (none : Option Tls.ClientSession)
-  try
-    socket.connect config.address
-    if ← openingCancelled cancellation? then
-      shutdownSocket socket
-      throw (openingCancelledError "TLS connection opening")
-    socket.noDelay
-    let entropy ← IO.getRandomBytes 96
-    let clientConfig : Tls.Client.Config := {
-      clientRandom := entropy.extract 0 32
-      x25519Private := entropy.extract 32 64
-      legacySessionId := entropy.extract 64 96
-      serverName := tlsConfig.serverName
-      alpnProtocols := tlsConfig.alpnProtocols
-    }
-    let (session, initialInbound) ←
-      Tls.ClientSession.establishWithLeftover socket clientConfig config.readSize cancellation?
-    sessionRef.set (some session)
-    if ← openingCancelled cancellation? then
-      session.close
-      throw (openingCancelledError "TLS connection opening")
-    verifyTlsPeer session trustStore? tlsConfig
-    if ← openingCancelled cancellation? then
-      session.close
-      throw (openingCancelledError "TLS peer verification")
-    pure { session := session, initialInbound := initialInbound }
-  catch error =>
-    match ← sessionRef.get with
-    | some session => session.close
-    | none => shutdownSocket socket
-    throw error
-
-/-- Synchronous compatibility wrapper for `bootstrapTlsAsync`. -/
-def bootstrapTls (config : Config := {}) (tlsConfig : TlsConfig := {}) : IO TlsBootstrap :=
-  Async.block (bootstrapTlsAsync config tlsConfig)
-
-namespace Connection
-
-/-- Adopt a verified TLS bootstrap as HTTP/2. Adoption requires the exact `h2`
-ALPN token and preserves any application bytes received with the TLS Finished
-flight. An ALPN mismatch leaves the bootstrap untouched for another adapter. -/
-def adoptTlsH2 (config : Config) (bootstrap : TlsBootstrap) : IO Client.Connection := do
-  unless (← bootstrap.session.alpnSelected) == some "h2" do
-    throw (IO.userError "TLS peer did not negotiate the h2 ALPN protocol")
-  let prefaceWire ← clientPrefaceWire
-  initializeConnection bootstrap.session.socket config prefaceWire
-    (some bootstrap.session) bootstrap.initialInbound
-
-/-- Cooperative Async composition point for a TLS bootstrap. Initialization
-itself performs no network wait; token cancellation detected after publication
-retires the newly-created HTTP/2 connection before returning. -/
-def adoptTlsH2Async (config : Config) (bootstrap : TlsBootstrap)
-    (cancellation? : Option Std.CancellationToken := none) : Async Client.Connection := do
-  if ← openingCancelled cancellation? then
-    throw (openingCancelledError "HTTP/2 TLS adoption")
-  let connection ← adoptTlsH2 config bootstrap
-  if ← openingCancelled cancellation? then
-    shutdownConnection connection
-    throw (openingCancelledError "HTTP/2 TLS adoption")
-  pure connection
-
-end Connection
+private def transportConfig (config : Config) : _root_.Http2.Client.Config := {
+  address := config.address
+  authority := config.authority
+  scheme := config.scheme
+  readSize := config.readSize
+  initialWindowSize := clientInitialStreamWindow config
+}
 
 /-- Connect over TLS 1.3, then run the gRPC client exactly as `connect` does but
 with every byte sealed/opened through the TLS session. Fresh ECDHE and random
 values are generated internally. -/
-def connectTlsAsync (config : Config := {}) (tlsConfig : TlsConfig := {})
+def connectTlsAsync (config : Config := {})
+    (tlsConfig : _root_.Http2.Client.TlsConfig := {})
     (cancellation? : Option Std.CancellationToken := none) : Async Connection := do
-  let bootstrap ← bootstrapTlsAsync config tlsConfig cancellation?
+  -- Finish gRPC-specific settings validation before the shared transport owns a
+  -- socket. The transport bootstrap performs the generic HTTP/2 and TLS policy
+  -- validation, handshake, chain validation, and hostname verification.
+  let (protocol, prefaceWire) ← clientOpening config
+  let bootstrap ← _root_.Http2.Client.bootstrapTlsAsync
+    (transportConfig config) tlsConfig cancellation?
+  let transferred ← IO.mkRef false
   try
-    Connection.adoptTlsH2Async config bootstrap cancellation?
+    unless (← bootstrap.session.alpnSelected) == some "h2" do
+      throw (IO.userError "TLS peer did not negotiate the h2 ALPN protocol")
+    if ← openingCancelled cancellation? then
+      throw (openingCancelledError "HTTP/2 TLS adoption")
+    -- `initializeConnection` owns and retires the session from this point,
+    -- including on an initialization error.
+    transferred.set true
+    let connection ← initializeConnection bootstrap.session.socket config protocol prefaceWire
+      (some bootstrap.session) bootstrap.initialInbound
+    if ← openingCancelled cancellation? then
+      shutdownConnection connection
+      throw (openingCancelledError "HTTP/2 TLS adoption")
+    pure connection
   catch error =>
-    bootstrap.close
+    unless ← transferred.get do
+      bootstrap.close
     throw error
 
 /-- Synchronous compatibility wrapper for `connectTlsAsync`. -/
-def connectTls (config : Config := {}) (tlsConfig : TlsConfig := {}) : IO Connection :=
+def connectTls (config : Config := {})
+    (tlsConfig : _root_.Http2.Client.TlsConfig := {}) : IO Connection :=
   Async.block (connectTlsAsync config tlsConfig)
 
 /-- Cooperatively close the connection and retire its exact reader and writer tasks.
@@ -1160,433 +954,8 @@ promise and descriptor reference can remain suspended until the OS settles it.
 A hard `uv_close` is not exposed; finalization releases the native handle after
 remaining `Connection`/promise references are gone.
 -/
-def close (connection : Connection) : Async Unit := do
-  shutdownConnection connection
-
-private def chunkFlags (isLast : Bool) : UInt8 :=
-  if isLast then Http2.FrameFlag.endHeaders else 0
-
-/-- Split a request header block into HEADERS + CONTINUATION frames bounded by
-the server's max frame size. -/
-private def headerBlockRequestFrames (streamId : Nat) (block : ByteArray)
-    (maxFrameSize : Nat) : Array Http2.Frame := Id.run do
-  let chunkSize := Nat.max 1 maxFrameSize
-  let mut frames : Array Http2.Frame := #[]
-  let mut offset := 0
-  let mut first := true
-  while first || offset < block.size do
-    let chunk := block.extract offset (Nat.min block.size (offset + chunkSize))
-    let isLast := offset + chunkSize >= block.size
-    frames := frames.push {
-      header := {
-        length := chunk.size,
-        frameType := if first then Http2.FrameType.headers else Http2.FrameType.continuation,
-        flags := chunkFlags isLast,
-        streamId := streamId
-      },
-      payload := chunk
-    }
-    offset := offset + chunkSize
-    first := false
-  pure frames
-
-private inductive TunnelSendStep where
-  | wait (waiter : AsyncTask Unit)
-  | sent (bytes : Nat) (ticket : OutboundTicket)
-  | failed (status : Status)
-
-private partial def sendTunnelChunks (connection : Connection) (streamId : Nat)
-    (payload : ByteArray) (offset : Nat) : Async (Except Status Unit) := do
-  if offset >= payload.size then
-    pure (.ok ())
-  else
-    let step ← connection.state.atomically do
-      let state ← get
-      match state.dead with
-      | some status => pure (TunnelSendStep.failed status)
-      | none =>
-          match findTunnel? state.tunnels streamId with
-          | none => pure (TunnelSendStep.failed
-              (Status.internal "extended CONNECT tunnel is no longer active"))
-          | some tunnel =>
-              match tunnel.failure with
-              | some status => pure (TunnelSendStep.failed status)
-              | none =>
-                  if tunnel.sendClosed then
-                    pure (TunnelSendStep.failed
-                      (Status.internal "send after extended CONNECT closeSend"))
-                  else
-                    let available := Nat.min state.connectionSendWindow
-                      tunnel.streamSendWindow.toNat
-                    if available == 0 then
-                      let waiter ← connection.wakeup.wait
-                      pure (TunnelSendStep.wait waiter)
-                    else
-                      let sendSize := Nat.min (Nat.min available state.maxFrameSize)
-                        (payload.size - offset)
-                      let chunk := payload.extract offset (offset + sendSize)
-                      let frame : Http2.Frame := {
-                        header := {
-                          length := chunk.size,
-                          frameType := Http2.FrameType.data,
-                          streamId := streamId
-                        },
-                        payload := chunk
-                      }
-                      let tunnel := { tunnel with
-                        streamSendWindow := tunnel.streamSendWindow - Int.ofNat sendSize }
-                      match ← enqueueFrameAcknowledged connection frame with
-                      | .error status => pure (TunnelSendStep.failed status)
-                      | .ok ticket =>
-                          set {
-                            state with
-                            connectionSendWindow := state.connectionSendWindow - sendSize,
-                            tunnels := replaceTunnel state.tunnels tunnel
-                          }
-                          pure (TunnelSendStep.sent sendSize ticket)
-    match step with
-    | .wait waiter =>
-        awaitWaiter waiter
-        sendTunnelChunks connection streamId payload offset
-    | .sent bytes ticket =>
-        match ← awaitOutboundTicket ticket with
-        | .error status => pure (.error status)
-        | .ok () => sendTunnelChunks connection streamId payload (offset + bytes)
-    | .failed status => pure (.error status)
-
-private inductive TunnelRecvStep where
-  | chunk (data : ByteArray)
-  | done
-  | wait (waiter : AsyncTask Unit)
-  | failed (status : Status)
-
-private partial def recvTunnelLoop (connection : Connection) (streamId : Nat) :
-    Async (Except Status (Option ByteArray)) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    match findTunnel? state.tunnels streamId with
-    | none => pure (TunnelRecvStep.failed
-        (state.dead.getD (Status.internal "extended CONNECT tunnel is no longer active")))
-    | some tunnel =>
-        match tunnel.inbound[0]? with
-        | some data =>
-            let credit := tunnel.pendingRecvCredits[0]?.getD data.size
-            let tunnel := {
-              tunnel with
-              inbound := tunnel.inbound.extract 1 tunnel.inbound.size,
-              pendingRecvCredits :=
-                tunnel.pendingRecvCredits.extract 1 tunnel.pendingRecvCredits.size
-            }
-            set { state with tunnels := replaceTunnel state.tunnels tunnel }
-            if credit > 0 && !tunnel.recvClosed && tunnel.failure.isNone then
-              match Http2.WindowUpdate.frame streamId credit with
-              | .ok update => enqueueFrame connection update
-              | .error _ => pure ()
-            pure (TunnelRecvStep.chunk data)
-        | none =>
-            match tunnel.failure with
-            | some status => pure (TunnelRecvStep.failed status)
-            | none =>
-                if tunnel.recvClosed then
-                  pure TunnelRecvStep.done
-                else
-                  match state.dead with
-                  | some status => pure (TunnelRecvStep.failed status)
-                  | none =>
-                      let waiter ← connection.wakeup.wait
-                      pure (TunnelRecvStep.wait waiter)
-  match step with
-  | .chunk data => pure (.ok (some data))
-  | .done => pure (.ok none)
-  | .wait waiter =>
-      awaitWaiter waiter
-      recvTunnelLoop connection streamId
-  | .failed status => pure (.error status)
-
-private inductive TunnelCloseStep where
-  | done
-  | sent (ticket : OutboundTicket)
-  | failed (status : Status)
-
-private def closeTunnelSend (connection : Connection) (streamId : Nat) :
-    Async (Except Status Unit) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    match state.dead with
-    | some status => pure (TunnelCloseStep.failed status)
-    | none =>
-        match findTunnel? state.tunnels streamId with
-        | none => pure (TunnelCloseStep.failed
-            (Status.internal "extended CONNECT tunnel is no longer active"))
-        | some tunnel =>
-            match tunnel.failure with
-            | some status => pure (TunnelCloseStep.failed status)
-            | none =>
-                if tunnel.sendClosed then
-                  pure TunnelCloseStep.done
-                else
-                  let frame : Http2.Frame := {
-                    header := {
-                      length := 0,
-                      frameType := Http2.FrameType.data,
-                      flags := Http2.FrameFlag.endStream,
-                      streamId := streamId
-                    }
-                  }
-                  match ← enqueueFrameAcknowledged connection frame with
-                  | .error status => pure (TunnelCloseStep.failed status)
-                  | .ok ticket =>
-                      let tunnel := { tunnel with sendClosed := true }
-                      set { state with tunnels := replaceTunnel state.tunnels tunnel }
-                      pure (TunnelCloseStep.sent ticket)
-  match step with
-  | .done => pure (.ok ())
-  | .failed status => pure (.error status)
-  | .sent ticket => awaitOutboundTicket ticket
-
-private def cancelTunnel (connection : Connection) (streamId : Nat) : Async Unit := do
-  connection.state.atomically do
-    let state ← get
-    match findTunnel? state.tunnels streamId with
-    | none => pure ()
-    | some tunnel =>
-        if tunnel.failure.isSome || (tunnel.sendClosed && tunnel.recvClosed) then
-          pure ()
-        else
-          let status := Status.cancelled "extended CONNECT tunnel cancelled locally"
-          let tunnel := failTunnelRecord status tunnel
-          set { state with tunnels := replaceTunnel state.tunnels tunnel }
-          match Http2.RstStream.frame streamId Http2.ErrorCode.cancel with
-          | .ok rst => enqueueFrame connection rst
-          | .error _ => pure ()
-  wake connection
-
-/-- Retire a stream whose open operation was interrupted before ownership of a
-public tunnel handle could be transferred to its caller. -/
-private def abandonOpeningTunnel (connection : Connection) (streamId : Nat) : IO Unit := do
-  connection.state.atomically do
-    let state ← get
-    match findTunnel? state.tunnels streamId with
-    | none => pure ()
-    | some tunnel =>
-        set { state with tunnels := removeTunnel state.tunnels streamId }
-        unless tunnel.sendClosed && tunnel.recvClosed do
-          match Http2.RstStream.frame streamId Http2.ErrorCode.cancel with
-          | .ok rst => enqueueFrame connection rst
-          | .error _ => pure ()
-  wake connection
-
-private inductive TunnelWaitStep where
-  | done
-  | failed (status : Status)
-  | wait (waiter : AsyncTask Unit)
-
-private partial def waitTunnel (connection : Connection) (streamId : Nat) :
-    Async (Except Status Unit) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    match findTunnel? state.tunnels streamId with
-    | none => pure (TunnelWaitStep.failed
-        (state.dead.getD (Status.internal "extended CONNECT tunnel is no longer active")))
-    | some tunnel =>
-        match tunnel.failure with
-        | some status =>
-            set { state with tunnels := removeTunnel state.tunnels streamId }
-            pure (TunnelWaitStep.failed status)
-        | none =>
-            if tunnel.sendClosed && tunnel.recvClosed then
-              set { state with tunnels := removeTunnel state.tunnels streamId }
-              pure TunnelWaitStep.done
-            else
-              let waiter ← connection.wakeup.wait
-              pure (TunnelWaitStep.wait waiter)
-  match step with
-  | .done => pure (.ok ())
-  | .failed status => pure (.error status)
-  | .wait waiter =>
-      awaitWaiter waiter
-      waitTunnel connection streamId
-
-private def makeTunnel (connection : Connection) (streamId : Nat) :
-    Http2.ExtendedConnect.Tunnel := {
-  sendBytesImpl := fun bytes => sendTunnelChunks connection streamId bytes 0
-  recvBytesImpl := recvTunnelLoop connection streamId
-  closeSendImpl := closeTunnelSend connection streamId
-  cancelImpl := cancelTunnel connection streamId
-  waitImpl := waitTunnel connection streamId
-}
-
-private inductive BeginTunnelStep where
-  | opened (streamId : Nat)
-  | wait
-  | failed (status : Status)
-
-private def awaitConnectionWakeOrCancel (connection : Connection)
-    (cancellation? : Option Std.CancellationToken) : Async Bool := do
-  match cancellation? with
-  | none =>
-      awaitWaiter (← connection.wakeup.wait)
-      pure false
-  | some cancellation =>
-      Selectable.one #[
-        Selectable.case connection.wakeup.selector fun _ => pure false,
-        Selectable.case cancellation.selector fun _ => pure true
-      ]
-
-private partial def beginExtendedConnect (connection : Connection) (metadata : Metadata)
-    (cancellation? : Option Std.CancellationToken) :
-    Async (Except Status Nat) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    if ← match cancellation? with
-        | none => pure false
-        | some cancellation => cancellation.isCancelled then
-      pure (BeginTunnelStep.failed
-        (Status.cancelled "extended CONNECT opening was cancelled"))
-    else match state.dead with
-    | some status => pure (BeginTunnelStep.failed status)
-    | none =>
-        match state.goAway with
-        | some _ => pure (BeginTunnelStep.failed
-            (Status.error .unavailable "connection is shutting down (GOAWAY)"))
-        | none =>
-            if !state.peerSettingsReceived then
-              pure BeginTunnelStep.wait
-            else if !state.peerExtendedConnect then
-              pure (BeginTunnelStep.failed
-                (Status.unimplemented "peer did not enable the extended CONNECT protocol"))
-            else if !peerStreamCapacityAvailable state then
-              pure BeginTunnelStep.wait
-            else
-              let streamId := state.nextStreamId
-              match Http2.Hpack.encodeHeaderBlock state.hpackEncode metadata with
-              | .error status => pure (BeginTunnelStep.failed status)
-              | .ok encoded =>
-                  let frames := headerBlockRequestFrames streamId encoded.1 state.maxFrameSize
-                  let record : TunnelRecord := {
-                    streamId := streamId,
-                    streamSendWindow := Int.ofNat state.initialStreamSendWindow
-                  }
-                  set {
-                    state with
-                    nextStreamId := streamId + 2,
-                    hpackEncode := encoded.2,
-                    tunnels := state.tunnels.push record
-                  }
-                  for frame in frames do enqueueFrame connection frame
-                  pure (BeginTunnelStep.opened streamId)
-  match step with
-  | .opened streamId => pure (.ok streamId)
-  | .failed status => pure (.error status)
-  | .wait =>
-      if ← awaitConnectionWakeOrCancel connection cancellation? then
-        pure (.error (Status.cancelled "extended CONNECT opening was cancelled"))
-      else
-        beginExtendedConnect connection metadata cancellation?
-
-private inductive ExtendedConnectCapabilityStep where
-  | ready (enabled : Bool)
-  | wait
-  | failed (status : Status)
-
-private partial def awaitExtendedConnectCapability (connection : Connection)
-    (cancellation? : Option Std.CancellationToken) : Async (Except Status Bool) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    if ← match cancellation? with
-        | none => pure false
-        | some cancellation => cancellation.isCancelled then
-      pure (ExtendedConnectCapabilityStep.failed
-        (Status.cancelled "extended CONNECT capability wait was cancelled"))
-    else match state.dead with
-    | some status => pure (ExtendedConnectCapabilityStep.failed status)
-    | none =>
-        if state.peerSettingsReceived then
-          pure (ExtendedConnectCapabilityStep.ready state.peerExtendedConnect)
-        else
-          pure ExtendedConnectCapabilityStep.wait
-  match step with
-  | .ready enabled => pure (.ok enabled)
-  | .failed status => pure (.error status)
-  | .wait =>
-      if ← awaitConnectionWakeOrCancel connection cancellation? then
-        pure (.error (Status.cancelled "extended CONNECT capability wait was cancelled"))
-      else
-        awaitExtendedConnectCapability connection cancellation?
-
-private inductive OpenTunnelStep where
-  | accepted (response : Http2.ExtendedConnect.Response)
-  | rejected (response : Http2.ExtendedConnect.Response)
-  | wait
-  | failed (status : Status)
-
-private partial def awaitExtendedConnectResponse (connection : Connection) (streamId : Nat)
-    (cancellation? : Option Std.CancellationToken) :
-    Async (Except Status Http2.ExtendedConnect.OpenResult) := do
-  let step ← connection.state.atomically do
-    let state ← get
-    match findTunnel? state.tunnels streamId with
-    | none => pure (OpenTunnelStep.failed
-        (state.dead.getD (Status.internal "extended CONNECT stream is no longer active")))
-    | some tunnel =>
-        match tunnel.failure with
-        | some status =>
-            set { state with tunnels := removeTunnel state.tunnels streamId }
-            pure (OpenTunnelStep.failed status)
-        | none =>
-            match tunnel.response with
-            | none =>
-                pure OpenTunnelStep.wait
-            | some response =>
-                if Http2.ExtendedConnect.isSuccess response then
-                  pure (OpenTunnelStep.accepted response)
-                else
-                  unless tunnel.sendClosed && tunnel.recvClosed do
-                    match Http2.RstStream.frame streamId Http2.ErrorCode.cancel with
-                    | .ok rst => enqueueFrame connection rst
-                    | .error _ => pure ()
-                  set { state with tunnels := removeTunnel state.tunnels streamId }
-                  pure (OpenTunnelStep.rejected response)
-  match step with
-  | .accepted response =>
-      pure (.ok (.accepted response (makeTunnel connection streamId)))
-  | .rejected response => pure (.ok (.rejected response))
-  | .failed status => pure (.error status)
-  | .wait =>
-      if ← awaitConnectionWakeOrCancel connection cancellation? then
-        abandonOpeningTunnel connection streamId
-        pure (.error (Status.cancelled "extended CONNECT opening was cancelled"))
-      else
-        awaitExtendedConnectResponse connection streamId cancellation?
-
-namespace Connection
-
-/-- Wait until the peer's initial SETTINGS has arrived and report whether it
-explicitly enabled RFC 8441 Extended CONNECT. Transport/protocol failure remains
-a typed `Status` and is never conflated with a valid SETTINGS block that omitted
-the capability. -/
-def peerExtendedConnectEnabled (connection : Client.Connection)
-    (cancellation? : Option Std.CancellationToken := none) :
-    Async (Except Status Bool) :=
-  awaitExtendedConnectCapability connection cancellation?
-
-/-- Open an RFC 8441 extended CONNECT stream after the peer has explicitly
-enabled it with SETTINGS_ENABLE_CONNECT_PROTOCOL. Cancelling the optional
-cooperative token retires any allocated stream with RST_STREAM before this
-operation returns. Forced task cancellation is not a cleanup boundary in
-`Std.Async`; callers that require bounded opening should use the token. -/
-def openExtendedConnect (connection : Client.Connection)
-    (request : Http2.ExtendedConnect.Request)
-    (cancellation? : Option Std.CancellationToken := none) :
-    Async (Except Status Http2.ExtendedConnect.OpenResult) := do
-  match Http2.ExtendedConnect.encodeRequest request with
-  | .error status => pure (.error status)
-  | .ok metadata =>
-      match ← beginExtendedConnect connection metadata cancellation? with
-      | .error status => pure (.error status)
-      | .ok streamId => awaitExtendedConnectResponse connection streamId cancellation?
-
-end Connection
+def close (connection : Connection) : Async Unit :=
+  closeConnection connection
 
 private inductive StartStep where
   | opened (call : Call)
@@ -1600,7 +969,7 @@ private partial def startLoop (connection : Connection) (path : String)
     match state.dead with
     | some status => pure (StartStep.failed status)
     | none =>
-      match state.goAway with
+      match state.protocol.peerGoAwayLastStream? with
       | some _ => pure (StartStep.failed
           (Status.error .unavailable "connection is shutting down (GOAWAY)"))
       | none =>
@@ -1608,24 +977,17 @@ private partial def startLoop (connection : Connection) (path : String)
             let waiter ← connection.wakeup.wait
             pure (StartStep.wait waiter)
           else
-            let streamId := state.nextStreamId
             let metadata := requestMetadata connection path options
-            match Http2.Hpack.encodeHeaderBlock state.hpackEncode metadata with
+            match ofHttp2 <| _root_.Http2.Connection.openStream state.protocol metadata with
             | .error status => pure (StartStep.failed status)
-            | .ok encoded =>
-                let frames := headerBlockRequestFrames streamId encoded.1 state.maxFrameSize
-                let record : CallRecord := {
-                  streamId := streamId,
-                  streamSendWindow := Int.ofNat state.initialStreamSendWindow
-                }
+            | .ok (protocol, streamId, frames) =>
+                let record : CallRecord := { streamId }
                 set {
                   state with
-                  nextStreamId := streamId + 2,
-                  hpackEncode := encoded.2,
+                  protocol
                   calls := state.calls.push record
                 }
-                for frame in frames do
-                  enqueueFrame connection frame
+                enqueueFrames connection frames
                 pure (StartStep.opened { connection := connection, streamId := streamId })
   match step with
   | .opened call => pure (.ok call)
@@ -1680,35 +1042,29 @@ private partial def sendChunks (call : Call) (payload : ByteArray) (offset : Nat
         | some record =>
             if record.failure.isSome || record.trailers.isSome then
               pure (SendStep.failed (earlyTerminalStatus record))
-            else if record.sendClosed then
-              pure (SendStep.failed (Status.internal "send after closeSend"))
             else
-              let streamAvailable := record.streamSendWindow.toNat
-              let available := Nat.min state.connectionSendWindow streamAvailable
-              if available == 0 then
-                let waiter ← call.connection.wakeup.wait
-                pure (SendStep.wait waiter)
-              else do
-                let sendSize := Nat.min (Nat.min available state.maxFrameSize)
-                  (payload.size - offset)
-                let chunk := payload.extract offset (offset + sendSize)
-                let frame : Http2.Frame := {
-                  header := {
-                    length := chunk.size,
-                    frameType := Http2.FrameType.data,
-                    streamId := call.streamId
-                  },
-                  payload := chunk
-                }
-                let record := { record with
-                  streamSendWindow := record.streamSendWindow - Int.ofNat sendSize }
-                enqueueFrame call.connection frame
-                set {
-                  state with
-                  connectionSendWindow := state.connectionSendWindow - sendSize,
-                  calls := replaceCall state.calls record
-                }
-                pure (SendStep.sent sendSize)
+              match _root_.Http2.Connection.stream? state.protocol call.streamId with
+              | none => pure (SendStep.failed
+                  (Status.internal "gRPC HTTP/2 stream is no longer active"))
+              | some stream =>
+                  if !stream.phase.localOpen then
+                    pure (SendStep.failed (Status.internal "send after closeSend"))
+                  else
+                    let available := _root_.Http2.Connection.outboundCredit?
+                      state.protocol call.streamId |>.getD 0
+                    if available == 0 then
+                      let waiter ← call.connection.wakeup.wait
+                      pure (SendStep.wait waiter)
+                    else
+                      let sendSize := Nat.min available (payload.size - offset)
+                      let chunk := payload.extract offset (offset + sendSize)
+                      match ofHttp2 <| _root_.Http2.Connection.sendData
+                          state.protocol call.streamId chunk with
+                      | .error status => pure (SendStep.failed status)
+                      | .ok (protocol, frames) =>
+                          set { state with protocol }
+                          enqueueFrames call.connection frames
+                          pure (SendStep.sent sendSize)
     match step with
     | .wait waiter => do
         awaitWaiter waiter
@@ -1740,21 +1096,20 @@ def closeSend (call : Call) : Async (Except Status Unit) := do
           match record.failure with
           | some status => pure (.error status)
           | none =>
-              if record.sendClosed then
-                pure (.ok ())
-              else
-                let frame : Http2.Frame := {
-                  header := {
-                    length := 0,
-                    frameType := Http2.FrameType.data,
-                    flags := Http2.FrameFlag.endStream,
-                    streamId := call.streamId
-                  }
-                }
-                let record := { record with sendClosed := true }
-                enqueueFrame call.connection frame
-                set { state with calls := replaceCall state.calls record }
-                pure (.ok ())
+              match _root_.Http2.Connection.stream? state.protocol call.streamId with
+              | none => pure (.error
+                  (Status.internal "gRPC HTTP/2 stream is no longer active"))
+              | some stream =>
+                  if !stream.phase.localOpen then
+                    pure (.ok ())
+                  else
+                    match ofHttp2 <| _root_.Http2.Connection.sendData
+                        state.protocol call.streamId ByteArray.empty true with
+                    | .error status => pure (.error status)
+                    | .ok (protocol, frames) =>
+                        set { state with protocol }
+                        enqueueFrames call.connection frames
+                        pure (.ok ())
 
 private inductive RecvStep where
   | message (data : ByteArray)
@@ -1769,32 +1124,38 @@ private partial def recvLoop (call : Call) : Async (Except Status (Option ByteAr
     | none =>
         pure (RecvStep.failed (state.dead.getD (Status.internal "gRPC call is no longer active")))
     | some record =>
-        match record.inbound[0]? with
-        | some data =>
-            let credit := record.pendingRecvCredits[0]?.getD 0
-            let terminal := record.failure.isSome || record.trailers.isSome
-            let record := {
-              record with
-              inbound := record.inbound.extract 1 record.inbound.size,
-              pendingRecvCredits :=
-                record.pendingRecvCredits.extract 1 record.pendingRecvCredits.size
-            }
+      match popInboundMessage? record with
+      | some popped =>
+          let data := popped.data
+          let credit := popped.wireCredit
+          let terminal := record.failure.isSome || record.trailers.isSome
+          let record := popped.call
+          if credit > 0 && !terminal then
+            match ofHttp2 <| _root_.Http2.Connection.acknowledgeData
+                state.protocol call.streamId credit with
+            | .error status =>
+                let record := failCallRecord status record
+                set { state with calls := replaceCall state.calls record }
+                pure (RecvStep.message data)
+            | .ok (protocol, frames) =>
+                set {
+                  state with
+                  protocol
+                  calls := replaceCall state.calls record
+                }
+                enqueueFrames call.connection frames
+                pure (RecvStep.message data)
+          else
             set { state with calls := replaceCall state.calls record }
-            (if credit > 0 && !terminal then
-              match Http2.WindowUpdate.frame call.streamId credit with
-              | .ok update => enqueueFrame call.connection update
-              | .error _ => pure ()
-            else
-              pure ())
             pure (RecvStep.message data)
-        | none =>
-            match record.failure with
-            | some status => pure (RecvStep.failed status)
-            | none =>
-                if record.trailers.isSome then
-                  pure RecvStep.done
-                else
-                  match state.dead with
+      | none =>
+          match record.failure with
+          | some status => pure (RecvStep.failed status)
+          | none =>
+              if record.trailers.isSome then
+                pure RecvStep.done
+              else
+                match state.dead with
                   | some status => pure (RecvStep.failed status)
                   | none =>
                       let waiter ← call.connection.wakeup.wait
@@ -1813,14 +1174,14 @@ def recv? (call : Call) : Async (Except Status (Option ByteArray)) :=
   recvLoop call
 
 private inductive FinishStep where
-  | finished (headers : Metadata) (trailers : Metadata)
+  | finished (headers : _root_.Http2.Headers) (trailers : _root_.Http2.Headers)
   | failed (status : Status)
   | wait (waiter : AsyncTask Unit)
 
 /-- Wait for the call's terminal state and remove it from the connection.
 Returns the server's gRPC status plus initial headers and trailers; transport
 failures (RST_STREAM, GOAWAY, connection loss) surface as the error case. -/
-partial def finish (call : Call) : Async (Except Status (Status × Metadata × Metadata)) := do
+partial def finish (call : Call) : Async (Except Status (Status × _root_.Http2.Headers × _root_.Http2.Headers)) := do
   let step ← call.connection.state.atomically do
     let state ← get
     match findCall? state.calls call.streamId with
@@ -1829,17 +1190,17 @@ partial def finish (call : Call) : Async (Except Status (Status × Metadata × M
     | some record =>
         match record.failure with
         | some status =>
-            set { state with calls := removeCall state.calls call.streamId }
+            set (← retireCallLocked call.connection state call.streamId)
             pure (FinishStep.failed status)
         | none =>
             match record.trailers with
             | some trailers =>
-                set { state with calls := removeCall state.calls call.streamId }
+                set (← retireCallLocked call.connection state call.streamId)
                 pure (FinishStep.finished record.headers trailers)
             | none =>
                 match state.dead with
                 | some status =>
-                    set { state with calls := removeCall state.calls call.streamId }
+                    set (← retireCallLocked call.connection state call.streamId)
                     pure (FinishStep.failed status)
                 | none =>
                     let waiter ← call.connection.wakeup.wait
@@ -1866,10 +1227,13 @@ def cancel (call : Call) : Async Unit := do
         else do
           let record := { record with
             failure := some (Status.cancelled "call cancelled locally") }
-          set { state with calls := replaceCall state.calls record }
-          match Http2.RstStream.frame call.streamId Http2.ErrorCode.cancel with
-          | .ok rst => enqueueFrame call.connection rst
-          | .error _ => pure ()
+          match _root_.Http2.Connection.resetStream
+              state.protocol call.streamId .cancel with
+          | .error _ =>
+              set { state with calls := replaceCall state.calls record }
+          | .ok (protocol, reset?) =>
+              set { state with protocol, calls := replaceCall state.calls record }
+              if let some reset := reset? then enqueueFrames call.connection #[reset]
   wake call.connection
 
 end Call
@@ -1921,7 +1285,7 @@ def callRaw (connection : Connection) (path : String) (requests : Array ByteArra
 
 /-- Unary call: exactly one request and one response message. -/
 def call (connection : Connection) (path : String) (request : ByteArray)
-    (options : CallOptions := {}) : Async (Except Status (Metadata × ByteArray)) := do
+    (options : CallOptions := {}) : Async (Except Status (_root_.Http2.Headers × ByteArray)) := do
   try
     let result ← callRaw connection path #[request] options
     if result.status.code != Code.ok then

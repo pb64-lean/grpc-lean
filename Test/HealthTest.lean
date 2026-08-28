@@ -29,8 +29,8 @@ def expectGrpcMError (action : GrpcM α) : IO Status := do
   | .ok _ => throw (IO.userError "expected gRPC status error")
   | .error status => pure status
 
-def requestHeadersForPath (path : String) : Metadata :=
-  Metadata.empty
+def requestHeadersForPath (path : String) : _root_.Http2.Headers :=
+  _root_.Http2.Headers.empty
     |>.insert ":method" "POST"
     |>.insert ":scheme" "http"
     |>.insert ":path" path
