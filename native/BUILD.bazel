@@ -2,7 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_lean//lean:defs.bzl", "lean_runtime_headers")
-load(":defs.bzl", "lean_generated_c_file")
+load("@rules_lean//lean:defs.bzl", "lean_generated_c_file")
 
 # Resolve headers from the consumer-selected Lean toolchain. The grpc-lean
 # module's own toolchain repository is development-only and is intentionally
