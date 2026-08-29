@@ -12,7 +12,7 @@ open Elab
 open Deriving
 open Meta hiding Context
 open Term hiding Context
-open Command hiding Context
+open Elab.Command hiding Context
 
 
 /--

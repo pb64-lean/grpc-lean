@@ -1905,7 +1905,7 @@ private def withCloseDriver
   · simpa [data] using state.initialization_generation_coherent
   · simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint
-  · simpa [data] using state.current_excludes_initializer_task
+  · exact state.current_excludes_initializer_task
   · simpa [data] using phaseCoherent
   · intro terminal
     apply state.terminal_nonaccepting
@@ -2054,7 +2054,7 @@ private def withModelSamePhase
   · simpa [data] using state.initialization_generation_coherent
   · simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint
-  · simpa [data] using state.current_excludes_initializer_task
+  · exact state.current_excludes_initializer_task
   · simpa [data, samePhase] using state.close_driver_phase_coherent
   · intro terminal accepting
     apply state.terminal_nonaccepting (by
@@ -2115,7 +2115,7 @@ private def beginClose (state : SharedState Resource) :
     (by simpa [data] using state.initialization_generation_coherent)
     (by simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint)
-    (by simpa [data] using state.current_excludes_initializer_task)
+    (by exact state.current_excludes_initializer_task)
     (by
       simpa [data, driver, transition] using
         beginClose_driver_phaseCoherent state.closeDriver state.model
@@ -2442,7 +2442,7 @@ private def publishPendingGeneration
     rw [generationIds] at member
     rcases List.mem_cons.mp member with same | previous
     · cases same
-      simpa [sameGeneration] using coherent
+      simpa [sameGeneration, InitializationState.generationCoherent] using coherent
     · exact state.generations_below candidate previous
   · simp [data, InitializationState.generationCoherent]
   · simp [data, InitializationState.taskDisjoint,
@@ -2490,7 +2490,7 @@ private def stagePendingGeneration
     rw [generationIds] at member
     rcases List.mem_cons.mp member with same | previous
     · cases same
-      simpa [sameGeneration] using coherent
+      simpa [sameGeneration, InitializationState.generationCoherent] using coherent
     · exact state.generations_below candidate previous
   · simp [data, InitializationState.generationCoherent]
   · simp [data, InitializationState.taskDisjoint,
@@ -2633,7 +2633,7 @@ private def SharedState.quarantineInitializationOwner
     (by simpa [data] using state.initialization_generation_coherent)
     (by simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint)
-    (by simpa [data] using state.current_excludes_initializer_task)
+    (by exact state.current_excludes_initializer_task)
     (by
       simpa [data, driver, transition] using
         SharedState.beginClose_driver_phaseCoherent state.closeDriver
@@ -2674,7 +2674,7 @@ private def SharedState.quarantineInitializationUncertainty
     (by simpa [data] using state.initialization_generation_coherent)
     (by simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint)
-    (by simpa [data] using state.current_excludes_initializer_task)
+    (by exact state.current_excludes_initializer_task)
     (by
       simpa [data, driver, transition] using
         SharedState.beginClose_driver_phaseCoherent state.closeDriver
@@ -2812,8 +2812,9 @@ private def release
                 exact owns.2
               cases driver : current.closeDriver <;>
                 simp_all [CloseDriverState.isNeedsOwner]
-            simpa [modeled, SharedState.withModelSamePhase, needs] using
-              CloseDriverState.Transition.lastReleaseInline) (by
+            show CloseDriverState.Transition current.closeDriver CloseDriverState.inline
+            rw [needs]
+            exact CloseDriverState.Transition.lastReleaseInline) (by
             have draining : next.phase = .draining := by
               simp [ownsClaimedClose, becameDrained] at owns
               exact owns.1.1
@@ -3788,7 +3789,7 @@ private def settleClosingSuccess
         simp only [InitializationState.taskDisjoint, task]
         intro member
         exact disjoint (generationSublist.subset member)
-  · simpa [data] using state.current_excludes_initializer_task
+  · exact state.current_excludes_initializer_task
   · simpa [data] using state.close_driver_phase_coherent
   · intro terminal phase
     apply state.terminal_nonaccepting
@@ -3863,7 +3864,7 @@ private def settleClosingFailure
           simp only [InitializationState.taskDisjoint, task]
           intro member
           exact disjoint (generationPermutation.mem_iff.mp member))
-    (by simpa [data] using state.current_excludes_initializer_task)
+    (by exact state.current_excludes_initializer_task)
     (by
       simpa [data, driver, transition] using
         SharedState.beginClose_driver_phaseCoherent state.closeDriver state.model
@@ -3957,7 +3958,7 @@ private def SharedState.publishClosed
   · simpa [data] using state.initialization_generation_coherent
   · simpa [data, SharedStateData.channelGenerationIds] using
       state.initialization_task_disjoint
-  · simpa [data] using state.current_excludes_initializer_task
+  · exact state.current_excludes_initializer_task
   · simpa [data, closedPhase] using driverClosed
   · intro _ accepting
     have : closed.phase = .accepting := by
@@ -3968,7 +3969,7 @@ private def SharedState.publishClosed
     exact ⟨closedActive, by simpa [data] using noCurrent,
       by simpa [data] using closingNil,
       by simpa [data] using retainedNil,
-      by simpa [data] using clean⟩
+      by exact clean⟩
 
 private def publishClosed
     (shared : ManagedChannel Resource) : IO (Except CloseError Unit) :=
@@ -4198,9 +4199,7 @@ private def startClaimedClose
                           failure initialization initializationSlot
                         have clearedDriver :
                             cleared.closeDriver = .startingJoining stored := by
-                          simpa [cleared,
-                            SharedState.clearFailedInitializationTask] using
-                            driverSlot
+                          exact driverSlot
                         set (cleared.inlineJoiningCloseDriver
                           stored clearedDriver)
                       else
@@ -5561,7 +5560,7 @@ private def supervisorSnapshotOfState
     · simpa [currentGeneration?] using drained.2.1
     · simpa [closingGenerations] using drained.2.2.1
     · simpa [retainedGenerations] using drained.2.2.2.1
-    · simpa [cleanupInventory] using drained.2.2.2.2
+    · exact drained.2.2.2.2
 
 /--
 Read the entire certified supervisor projection under one state-mutex

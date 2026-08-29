@@ -795,7 +795,7 @@ private theorem splitOnAux_comma_any (value : String)
       rw [String.splitOnAux]
       simp only [hend]
       have hget : current.get value == (0 : String.Pos.Raw).get "," := by
-        simpa using hcomma
+        simpa [show (0 : String.Pos.Raw).get "," = ',' from by decide] using hcomma
       simp only [hget, ↓reduceIte]
       have hseparatorEnd : ((0 : String.Pos.Raw).next ",").atEnd "," := by
         decide
@@ -816,7 +816,7 @@ private theorem splitOnAux_comma_any (value : String)
       rw [String.splitOnAux]
       simp only [hend]
       have hget : ¬(current.get value == (0 : String.Pos.Raw).get ",") := by
-        simpa using hcomma
+        simpa [show (0 : String.Pos.Raw).get "," = ',' from by decide] using hcomma
       simp only [hget]
       have hunoffset : current.unoffsetBy (0 : String.Pos.Raw) = current := by
         rfl
@@ -852,7 +852,7 @@ private theorem acceptedEncodings_reference_true :
   rw [← valueAcceptsGzipFused_eq_reference]
   simp +decide [valueAcceptsGzipFusedAux, gzipEncodingToken, gzipEncoding]
   right
-  simpa +decide [String.Pos.Raw.next] using gzip_trim
+  exact gzip_trim
 
 private def valueAcceptsGzipCandidate (value : String) : Bool :=
   if value == acceptedEncodings then
