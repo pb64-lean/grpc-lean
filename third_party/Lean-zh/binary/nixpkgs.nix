@@ -11,8 +11,8 @@ let
   # top-level Std module. This source revision includes the newer Std.Http
   # modules and builds them as part of the same compiler derivation, keeping
   # the compiler and .olean ABI aligned.
-  leanUpstreamStdRev = "24bef91f9a20a45f074729e869461d374687de1c";
-  leanUpstreamStdSrcSha256 = "1fsj6zws1amgnzw8nl14iqb0gbq2l8cq5vldixgr1c9awm7ybxvn";
+  leanUpstreamStdRev = "68218e876d2a38b1985b8590fff244a83c321783";
+  leanUpstreamStdSrcSha256 = "1vc4m817iws84c6lzrfa9wrahhv060w4ik32h2hcpj68rywhk7ms";
 
   leanUpstreamStdOverlay = final: prev:
     let
@@ -47,7 +47,7 @@ let
       '';
     in {
       lean4_upstream_std = prev.lean4.overrideAttrs (old: rec {
-        version = "4.31.0-pre-24bef91";
+        version = "4.31.0";
         src = prev.fetchFromGitHub {
           owner = "leanprover";
           repo = "lean4";
