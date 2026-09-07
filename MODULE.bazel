@@ -29,10 +29,10 @@ archive_override(
 bazel_dep(name = "http2-lean", version = "0.1.0", repo_name = "http2_lean")
 archive_override(
     module_name = "http2-lean",
-    integrity = "sha256-rVteydmJ4HoqzdoL+9VEJMXCfJ07r++od1ftyBsnypI=",
-    strip_prefix = "http2-lean-0.1.0",
+    integrity = "sha256-JkQPBLVdgICr3ZWYejr6iDQ1aYHHYS5VEFK9IOkgGeY=",
+    strip_prefix = "http2-lean-4dfaa5686ccdc3e90251d7146496a9708d2752d1",
     urls = [
-        "https://github.com/pb64-lean/http2-lean/archive/refs/tags/v0.1.0.tar.gz",
+        "https://github.com/pb64-lean/http2-lean/archive/4dfaa5686ccdc3e90251d7146496a9708d2752d1.tar.gz",
     ],
 )
 
