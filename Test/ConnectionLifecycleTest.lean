@@ -674,8 +674,20 @@ def testTlsShutdownCancelsStalledHandshakeSend : IO Unit := do
         let some owner := owners[0]?
           | throw (IO.userError "TLS handshake owner disappeared before shutdown")
         pure owner
-  -- Let the owner construct and enter the oversized server-flight send.
-  IO.sleep 3000
+  -- Observe the send itself rather than guessing how long constructing the
+  -- oversized certificate flight takes on a loaded runner. Reading one byte
+  -- leaves the multi-megabyte flight backpressured while proving that the owner
+  -- has entered its handshake-send task before we cancel it.
+  let firstByteTask ← IO.asTask ((client.recv? 1).block)
+  match ← awaitTaskWithin firstByteTask 30000 with
+  | some (some bytes) =>
+      expect (!bytes.isEmpty) "TLS server flight started with an empty read"
+  | some none =>
+      throw (IO.userError "TLS peer closed before sending its server flight")
+  | none =>
+      IO.cancel firstByteTask
+      try (client.shutdown).block catch _ => pure ()
+      throw (IO.userError "TLS server did not begin its oversized handshake flight")
 
   Grpc.Server.shutdown server
   let waitTask ← IO.asTask (Grpc.Server.wait server (drainTimeoutMs := some 10))
