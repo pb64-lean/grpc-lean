@@ -144,9 +144,17 @@ lean_library(
         "@http2_lean//:name_resolver",
         "@http2_lean//:tls_session",
         "@http2_lean//:trust_anchors",
+        "@http2_lean//:writer_budget",
         "@grpc_lean_protobuf//:protobuf",
         "@tls13_lean//TLS13:tls13",
     ],
+)
+
+lean_test(
+    name = "writer_lifecycle_test",
+    srcs = ["Test/WriterLifecycleTest.lean"],
+    deps = [":grpc_lean"],
+    size = "small",
 )
 
 lean_library(

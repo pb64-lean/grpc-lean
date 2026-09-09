@@ -8,6 +8,7 @@ public import Std.Sync.Channel
 public import Http2.CancellationToken
 public import Grpc.Http2.Connection
 public import Http2.Tls.Session
+public import Http2.WriterBudget
 
 public section
 
@@ -31,6 +32,7 @@ structure Config where
   }
   backlog : UInt32 := 1024
   readSize : UInt64 := 16384
+  writerLimits : _root_.Http2.WriterLimits := {}
   noDelay : Bool := true
   /-- Finite default keeps per-stream request bounds compositional at the
   connection level. Set explicitly to `none` only for a trusted deployment
@@ -102,6 +104,8 @@ backpressure. -/
 structure SocketWriter where
   outbound : Std.CloseableChannel ByteArray
   task : AsyncTask Unit
+  budget : _root_.Http2.WriterBudget
+  stopToken : Std.CancellationToken
 
 structure ActiveConnection where
   id : Nat
@@ -148,6 +152,8 @@ def anyIPv4 (port : UInt16) : SocketAddress :=
   ipv4Address 0 0 0 0 port
 
 private def validateConfig (config : Config) : IO Unit := do
+  unless config.writerLimits.maxBytes > 0 && config.writerLimits.maxItems > 0 do
+    throw (IO.userError "gRPC writer bounds must be positive")
   if config.readSize == 0 then
     throw (IO.userError "gRPC HTTP/2 readSize must be positive")
   let maximumSettingValue : Nat := 4294967295
@@ -239,33 +245,57 @@ private def closeConnectionSocket (client : TCP.Socket.Client) : Std.Async.Async
     pure ()
 
 private partial def socketWriterLoop (client : TCP.Socket.Client)
-    (outbound : Std.CloseableChannel ByteArray) (onError : IO.Error → IO Unit) :
+    (outbound : Std.CloseableChannel ByteArray) (budget : _root_.Http2.WriterBudget)
+    (onError : IO.Error → IO Unit) :
     Std.Async.Async Unit := do
   match ← await (← outbound.recv) with
   | none => pure ()
   | some bytes =>
-      try
-        client.send bytes
-        socketWriterLoop client outbound onError
-      catch err =>
+      let outcome ← try client.send bytes; pure (Except.ok ())
+        catch error => pure (Except.error error)
+      budget.release bytes.size
+      match outcome with
+      | .ok () => socketWriterLoop client outbound budget onError
+      | .error err =>
         -- Reject future enqueues and wake the connection owner.  The writer owns
         -- the socket send side, so no other task can make forward progress after
         -- this failure.
         discard <| outbound.close.toBaseIO
+        budget.close
+        for _ in [:budget.limits.maxItems] do
+          let some queued ← outbound.tryRecv | break
+          budget.release queued.size
         onError err
 
 private def startSocketWriter (client : TCP.Socket.Client)
+    (limits : _root_.Http2.WriterLimits) (stopToken : Std.CancellationToken)
     (onError : IO.Error → IO Unit := fun _ => pure ()) : IO SocketWriter := do
   let outbound ← Std.CloseableChannel.new
-  let task ← Std.Async.Async.toIO (socketWriterLoop client outbound onError)
-  pure { outbound := outbound, task := task }
+  let budget ← _root_.Http2.WriterBudget.create limits
+  let task ← Std.Async.Async.toIO (socketWriterLoop client outbound budget onError)
+  pure { outbound, task, budget, stopToken }
 
 /-- Non-blocking producer side of a plaintext connection writer. -/
 private def sendBytes (writer : SocketWriter) (bytes : ByteArray) : IO Unit := do
   unless bytes.isEmpty do
-    discard <| writer.outbound.send bytes
+    unless ← writer.budget.reserve bytes.size do
+      writer.budget.close
+      discard <| writer.outbound.close.toBaseIO
+      for _ in [:writer.budget.limits.maxItems] do
+        let some queued ← writer.outbound.tryRecv | break
+        writer.budget.release queued.size
+      -- Do not invoke onError here: producers may hold the protocol mutex and
+      -- its full cancellation callback re-enters that mutex. Wake its owner.
+      discard <| _root_.Http2.CancellationToken.cancel writer.stopToken (reason := .shutdown)
+      throw (IO.userError "gRPC server writer queue capacity exceeded")
+    match ← (Std.CloseableChannel.Sync.send writer.outbound bytes).toBaseIO with
+    | .ok () => pure ()
+    | .error _ =>
+      writer.budget.release bytes.size
+      throw (IO.userError "gRPC server writer closed")
 
 private def drainSocketWriter (writer : SocketWriter) : Std.Async.Async Unit := do
+  writer.budget.close
   discard <| writer.outbound.close.toBaseIO
   let drained ← Std.Async.Async.race
     (do
@@ -280,6 +310,9 @@ private def drainSocketWriter (writer : SocketWriter) : Std.Async.Async Unit := 
     -- the bounded socket shutdown below then makes the best available attempt
     -- to retire the libuv write side.
     IO.cancel writer.task
+  for _ in [:writer.budget.limits.maxItems] do
+    let some queued ← writer.outbound.tryRecv | break
+    writer.budget.release queued.size
 
 /-- Put teardown bytes on a connection's wire: through the plaintext FIFO writer
 for h2c, sealed through the record writer for TLS. -/
@@ -729,8 +762,8 @@ private def serveClientWithStateMutex (registry : Registry) (config : Config)
   let writerFailure ← IO.mkRef (none : Option IO.Error)
   let stopToken ← Std.CancellationToken.new
   let closeCause ← IO.mkRef (none : Option CloseCause)
-  let mut keepaliveTask? : Option (Task (Except IO.Error Unit)) := none
-  let writer ← startSocketWriter client fun err => do
+  let keepaliveTask ← IO.mkRef (none : Option (Task (Except IO.Error Unit)))
+  let writer ← startSocketWriter client config.writerLimits stopToken fun err => do
     writerFailure.set (some err)
     Connection.signalCancelActiveShared stateMutex
     discard <| _root_.Http2.CancellationToken.cancel stopToken
@@ -741,12 +774,12 @@ private def serveClientWithStateMutex (registry : Registry) (config : Config)
       client.noDelay
     let serverPreface ← initialConnectionWireBytes stateMutex
     sendBytes writer serverPreface
-    keepaliveTask? ← spawnKeepalive config (sendBytes writer)
-      stateMutex stopToken closeCause
+    keepaliveTask.set (← spawnKeepalive config (sendBytes writer)
+      stateMutex stopToken closeCause)
     let state ← serveClientLoop registry config client writer stateMutex stopToken
     discard <| _root_.Http2.CancellationToken.cancel stopToken
       (reason := Std.CancellationReason.shutdown)
-    if let some task := keepaliveTask? then
+    if let some task ← keepaliveTask.get then
       try Std.Async.Async.ofAsyncTask task catch _ => pure ()
     if let some cause ← closeCause.get then
       sendCauseGoAway (some writer) none stateMutex cause
@@ -757,7 +790,7 @@ private def serveClientWithStateMutex (registry : Registry) (config : Config)
   catch err =>
     discard <| _root_.Http2.CancellationToken.cancel stopToken
       (reason := Std.CancellationReason.shutdown)
-    if let some task := keepaliveTask? then
+    if let some task ← keepaliveTask.get then
       try Std.Async.Async.ofAsyncTask task catch _ => pure ()
     -- Setup can fail before the read loop reaches its normal owned-cancel
     -- path; retire the independently spawned deadline scheduler here too.
@@ -872,7 +905,7 @@ private def serveManagedClient (server : Server) (registry : Registry) (id : Nat
     (stopToken : Std.CancellationToken) (connection? : Option ActiveConnection)
     (closeCause : IO.Ref (Option CloseCause))
     (retained : IO.Promise Unit) : Std.Async.Async Unit := do
-  let mut keepaliveTask? := none
+  let keepaliveTask ← IO.mkRef (none : Option (Task (Except IO.Error Unit)))
   let runError? ← try
       -- The publication gate is part of the owned computation.  Even if its
       -- publisher fails, the catch below still reaches the one cleanup owner.
@@ -882,8 +915,8 @@ private def serveManagedClient (server : Server) (registry : Registry) (id : Nat
         client.noDelay
       let serverPreface ← initialConnectionWireBytes stateMutex
       sendBytes writer serverPreface
-      keepaliveTask? ← spawnKeepalive server.config (sendBytes writer)
-        stateMutex stopToken closeCause
+      keepaliveTask.set (← spawnKeepalive server.config (sendBytes writer)
+        stateMutex stopToken closeCause)
       discard <| serveManagedClientLoop registry server.config client writer stateMutex stopToken closeCause
       pure none
     catch err =>
@@ -892,7 +925,7 @@ private def serveManagedClient (server : Server) (registry : Registry) (id : Nat
       reportCloseCause closeCause (CloseCause.transportError (toString err))
       pure (some err)
   -- Exactly one path records, unregisters, drains, and retires this connection.
-  finishManagedClient server id client writer stateMutex stopToken connection? closeCause keepaliveTask?
+  finishManagedClient server id client writer stateMutex stopToken connection? closeCause (← keepaliveTask.get)
   match runError? with
   | none => pure ()
   | some err => throw err
@@ -905,7 +938,7 @@ private def spawnManagedClient (server : Server) (registry : Registry)
   let stopToken ← Std.CancellationToken.new
   let closeCause ← IO.mkRef (none : Option CloseCause)
   let tlsSession ← IO.mkRef (none : Option _root_.Http2.Tls.ServerSession)
-  let writer ← startSocketWriter client fun err => do
+  let writer ← startSocketWriter client server.config.writerLimits stopToken fun err => do
     reportCloseCause closeCause (CloseCause.transportError (toString err))
     Connection.signalCancelActiveShared stateMutex
     discard <| _root_.Http2.CancellationToken.cancel stopToken
@@ -1193,8 +1226,8 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
     (connection? : Option ActiveConnection) (closeCause : IO.Ref (Option CloseCause))
     (tlsSession : IO.Ref (Option _root_.Http2.Tls.ServerSession))
     (retained : IO.Promise Unit) : Std.Async.Async Unit := do
-  let mut writerWatchTask? : Option (Task (Except IO.Error Unit)) := none
-  let mut keepaliveTask? : Option (Task (Except IO.Error Unit)) := none
+  let writerWatchTask ← IO.mkRef (none : Option (Task (Except IO.Error Unit)))
+  let keepaliveTask ← IO.mkRef (none : Option (Task (Except IO.Error Unit)))
   let runError? ← try
       waitUntilConnectionTaskRetained retained
       installDeadlineScheduler stateMutex
@@ -1203,18 +1236,18 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       let serverConfig ← freshTlsServerConfig tlsConfig
       let (session, handshakeLeftover) ←
         _root_.Http2.Tls.ServerSession.establishWithLeftover client serverConfig
-        config.readSize (stopToken := some stopToken)
+        config.readSize (stopToken := some stopToken) (writerLimits := config.writerLimits)
       unless (← session.alpnSelected) == some "h2" do
         throw (IO.userError "gRPC TLS peer did not negotiate the h2 ALPN protocol")
       -- Publish the session before any byte of HTTP/2: from here on every
       -- teardown byte must be sealed instead of written plaintext.
       tlsSession.set (some session)
-      writerWatchTask? ← some <$> Std.Async.Async.toIO
-        (watchTlsWriterFailure session stateMutex stopToken closeCause)
+      writerWatchTask.set (some (← Std.Async.Async.toIO
+        (watchTlsWriterFailure session stateMutex stopToken closeCause)))
       let preface ← initialConnectionWireBytes stateMutex
       session.send preface
-      keepaliveTask? ← spawnKeepalive config (tlsServerSend session)
-        stateMutex stopToken closeCause
+      keepaliveTask.set (← spawnKeepalive config (tlsServerSend session)
+        stateMutex stopToken closeCause)
       -- A fast client's HTTP/2 preface can ride in the same transport chunk as
       -- its TLS Finished; those bytes were decrypted during the handshake and
       -- must reach the connection before the first socket read.
@@ -1233,7 +1266,7 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       pure (some err)
   discard <| _root_.Http2.CancellationToken.cancel stopToken
     (reason := Std.CancellationReason.shutdown)
-  match writerWatchTask? with
+  match ← writerWatchTask.get with
   | none => pure ()
   | some task =>
       try
@@ -1241,7 +1274,7 @@ private def serveManagedTlsClient (server : Server) (registry : Registry) (confi
       catch _ =>
         pure ()
   finishManagedTlsClient server id client (← tlsSession.get) stateMutex stopToken
-    connection? closeCause keepaliveTask?
+    connection? closeCause (← keepaliveTask.get)
   match runError? with
   | none => pure ()
   | some err => throw err

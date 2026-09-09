@@ -483,6 +483,32 @@ Verified scope:
   (Apache-2.0, `third_party/Lean-zh/`), grpc-proto's standard Health and
   Reflection schemas (Apache-2.0), and the Lean compiler/runtime.
 
+## Bounded transport writers
+
+Client and server `writerLimits` default to 8MiB and 1024 items, and reject zero
+limits before connecting/listening. Bounds include the item owned by the socket
+writer. Overflow is connection-fatal because HTTP/2/HPACK state may already have
+advanced. It wakes the reader/retirement owner without re-entering a protocol
+mutex from the producer; pending acknowledged callers receive errors promptly.
+Queued buffers are discarded on failure/forced retirement, while native
+in-flight ownership is not falsely reported as reclaimed.
+
+TLS charges ciphertext including record overhead; higher-level transports
+should split large application writes into acknowledged record-sized chunks.
+The pinned socket API cannot fully cancel an already-issued native send. The
+200ms cleanup windows bound Lean waits only, not kernel/libuv buffer lifetime.
+Tests use non-reading TCP peers to cover real writer stalls, bounded admission,
+overflow/close ACK settlement, and fail-closed configuration validation.
+
+Until sibling publication, validate the exact source graph with
+`bazel test //... --override_module=http2-lean=../http2-lean --override_module=tls13-lean=../tls13-lean --jobs=4`.
+Immutable archive pins are intentionally unchanged by this workspace-only step.
+The published `grpc-java` compatibility floor is 1.66.0: the transitive 1.62.2
+module extension references a protobuf javalite repository that no longer exists.
+This repairs strict full-graph evaluation without linking Java into Lean code.
+The matching Lake editor check is `lake --packages=lake-workspace.json build Grpc`;
+its explicit portable overrides do not modify the release manifest.
+
 ## License
 
 Apache-2.0. Vendored third-party code retains its own notices under

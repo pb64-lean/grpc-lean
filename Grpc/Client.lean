@@ -10,6 +10,7 @@ public import Http2.CancellationToken
 public import Http2.Client
 public import Http2.Connection
 public import Http2.Tls.Session
+public import Http2.WriterBudget
 public import Grpc.Protocol
 
 public section
@@ -68,6 +69,7 @@ structure Config where
   authority : String := "localhost"
   scheme : String := "http"
   readSize : UInt64 := 16384
+  writerLimits : _root_.Http2.WriterLimits := {}
   /-- Maximum uncompressed bytes accepted by one `Call.send`. -/
   maxSendMessageSize : Nat := defaultMaxMessageSize
   /--
@@ -165,7 +167,7 @@ private structure BackgroundTasks where
 /-- One FIFO item owned by the connection writer. -/
 structure OutboundWrite where
   bytes : ByteArray
-  private completion : Option (IO.Promise (Except IO.Error Unit)) := none
+  private completion : Option Nat := none
 
 structure Connection where
   socket : TCP.Socket.Client
@@ -175,6 +177,8 @@ structure Connection where
   happen while the state mutex is held (avoids stalling the reader and app calls
   behind a blocked write). Preserves frame order via FIFO with one consumer. -/
   outbound : Std.CloseableChannel OutboundWrite
+  writerBudget : _root_.Http2.WriterBudget
+  private completions : _root_.Http2.WriterCompletions
   /-- Signalled by the reader on any state change (window credit, message delivery,
   terminal state, death) to wake waiters in `send`/`recv?`/`finish` without polling. -/
   wakeup : Std.Notify
@@ -226,10 +230,29 @@ private def ofStatus (result : Except Status α) : IO α :=
   | .ok value => pure value
   | .error status => throw (IO.userError status.messageD)
 
-/-- Enqueue raw bytes for the writer task. Non-blocking (unbounded channel); the
-returned send task is ignored since ordering is guaranteed by the single writer. -/
+private def poisonWriter (connection : Connection) (error : IO.Error) : BaseIO Unit := do
+  connection.writerBudget.close
+  connection.completions.fail error
+  connection.writerFailure.set (some error)
+  discard <| connection.outbound.close.toBaseIO
+  for _ in [:connection.config.writerLimits.maxItems] do
+    let some request ← connection.outbound.tryRecv | break
+    connection.writerBudget.release request.bytes.size
+  discard <| _root_.Http2.CancellationToken.cancel connection.writerFailureToken
+    (reason := .shutdown)
+
+/-- Bounded non-blocking enqueue. Capacity exhaustion is connection-fatal:
+protocol/HPACK state may already have advanced, so silently dropping is unsafe. -/
 private def enqueueBytes (connection : Connection) (bytes : ByteArray) : BaseIO Unit := do
-  if bytes.isEmpty then pure () else discard <| connection.outbound.send { bytes := bytes }
+  unless bytes.isEmpty do
+    if ← connection.writerBudget.reserve bytes.size then
+      match ← (Std.CloseableChannel.Sync.send connection.outbound { bytes }).toBaseIO with
+      | .ok () => pure ()
+      | .error _ =>
+        connection.writerBudget.release bytes.size
+        poisonWriter connection (IO.userError "gRPC connection writer is closed")
+    else
+      poisonWriter connection (IO.userError "gRPC writer queue capacity exceeded")
 
 private def enqueueFrames (connection : Connection)
     (frames : Array _root_.Http2.Frame) : BaseIO Unit := do
@@ -242,7 +265,7 @@ private structure OutboundTicket where
   completion : IO.Promise (Except IO.Error Unit)
 
 /-- Enqueue bytes in FIFO order and return the exact writer completion ticket.
-The synchronous channel operation only performs unbounded queue admission; the
+The synchronous channel operation performs bounded queue admission; the
 ticket is resolved after the plaintext socket write or inner TLS record write. -/
 private def enqueueBytesAcknowledged (connection : Connection) (bytes : ByteArray) :
     IO (Except Status OutboundTicket) := do
@@ -251,15 +274,25 @@ private def enqueueBytesAcknowledged (connection : Connection) (bytes : ByteArra
     completion.resolve (.ok ())
     pure (.ok { completion := completion })
   else
+    unless ← connection.writerBudget.reserve bytes.size do
+      poisonWriter connection (IO.userError "gRPC writer queue capacity exceeded")
+      return .error (Status.resourceExhausted "gRPC writer queue capacity exceeded")
+    let id ← match ← connection.completions.register completion with
+      | .ok id => pure id
+      | .error error =>
+        connection.writerBudget.release bytes.size
+        return .error (Status.ofIOError error)
     let admitted ← (Std.CloseableChannel.Sync.send connection.outbound {
       bytes := bytes,
-      completion := some completion
+      completion := some id
     }).toBaseIO
     match admitted with
     | .ok () => pure (.ok { completion := completion })
     | .error _ =>
+        connection.writerBudget.release bytes.size
         let error := (← connection.writerFailure.get).getD
           (IO.userError "connection writer is closed")
+        poisonWriter connection error
         pure (.error (Status.ofIOError error))
 
 private def awaitOutboundTicket (ticket : OutboundTicket) : Async (Except Status Unit) := do
@@ -543,6 +576,14 @@ private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
 
 namespace TestSupport
 
+/-- Fault-injection seam over the real bounded queue and socket writer. -/
+def enqueueAcknowledged (connection : Connection) (bytes : ByteArray) :
+    IO (Except Status (IO.Promise (Except IO.Error Unit))) := do
+  return (← enqueueBytesAcknowledged connection bytes).map (·.completion)
+
+def pendingAcknowledgements (connection : Connection) : BaseIO Nat :=
+  connection.completions.pendingCount
+
 structure ResponseDataObservation where
   messageCount : Nat
   retainedDecodedBytes : Nat
@@ -660,8 +701,9 @@ private partial def failQueuedOutboundWrites (connection : Connection)
   match ← await (← connection.outbound.recv) with
   | none => pure ()
   | some request =>
+      connection.writerBudget.release request.bytes.size
       if let some completion := request.completion then
-        completion.resolve (.error error)
+        connection.completions.settle completion (.error error)
       failQueuedOutboundWrites connection error
 
 /-- Drain the outbound channel from one cooperative writer.  In particular the
@@ -671,25 +713,26 @@ private partial def writerLoop (connection : Connection) : Async Unit := do
   match ← await (← connection.outbound.recv) with
   | none => pure ()
   | some request =>
-      try
+      let outcome ← try
         match connection.tls with
         | some session => session.sendAcknowledged request.bytes
         | none => connection.socket.send request.bytes
+        pure (Except.ok ())
+      catch error => pure (Except.error error)
+      connection.writerBudget.release request.bytes.size
+      match outcome with
+      | .ok () =>
         if let some completion := request.completion then
-          completion.resolve (.ok ())
+          connection.completions.settle completion (.ok ())
         writerLoop connection
-      catch err =>
+      | .error err =>
         if let some completion := request.completion then
-          completion.resolve (.error err)
+          connection.completions.settle completion (.error err)
         -- Do not mutate connection state here.  Publishing through a sticky
         -- selector wakes the exact reader even while the peer keeps its write
         -- side open; that reader remains the sole failure/retirement owner.
-        if (← connection.writerFailure.get).isNone then
-          connection.writerFailure.set (some err)
-        discard <| connection.outbound.close.toBaseIO
+        poisonWriter connection err
         failQueuedOutboundWrites connection err
-        discard <| _root_.Http2.CancellationToken.cancel connection.writerFailureToken
-          (reason := Std.CancellationReason.shutdown)
 
 private def awaitBackgroundTask (task : AsyncTask Unit) : Async Unit := do
   retireTaskWithin task closeFlushTimeoutMs
@@ -707,10 +750,15 @@ private def joinBackgroundTasks (connection : Connection) : Async Unit := do
   | none => pure ()
 
 private def shutdownConnection (connection : Connection) : Async Unit := do
+  connection.writerBudget.close
+  connection.completions.fail (IO.userError "gRPC connection closed")
   failConnection connection (Status.cancelled "connection closed locally")
   discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
     (reason := Std.CancellationReason.shutdown)
   discard <| connection.outbound.close.toBaseIO
+  for _ in [:connection.config.writerLimits.maxItems] do
+    let some request ← connection.outbound.tryRecv | break
+    connection.writerBudget.release request.bytes.size
   match connection.tls with
   | some session =>
       -- The outer writer only seals and enqueues TLS records, so stop it and
@@ -812,6 +860,8 @@ private def startBackgroundTasks (connection : Connection)
 
 private def clientOpening (config : Config) : IO
     (_root_.Http2.Connection.State × ByteArray) := do
+  unless config.writerLimits.maxBytes > 0 && config.writerLimits.maxItems > 0 do
+    throw (IO.userError "HTTP/2 writer bounds must be positive")
   if config.readSize == 0 then
     throw (IO.userError "HTTP/2 client readSize must be positive")
   let initialWindowSize := clientInitialStreamWindow config
@@ -835,6 +885,8 @@ private def initializeConnection
       protocol := protocol
     },
     outbound := ← Std.CloseableChannel.new,
+    writerBudget := ← _root_.Http2.WriterBudget.create config.writerLimits,
+    completions := ← _root_.Http2.WriterCompletions.create,
     wakeup := ← Std.Notify.new,
     stopToken := ← Std.CancellationToken.new,
     writerFailure := ← IO.mkRef (none : Option IO.Error),
@@ -855,6 +907,7 @@ private def initializeConnection
     -- delay between spawning the reader and enqueuing here, so it appears only
     -- under load and only on some connections.
     enqueueBytes connection prefaceWire
+    if let some error ← connection.writerFailure.get then throw error
     -- TLS-handshake-leftover bytes (the server's 0.5-RTT SETTINGS riding behind
     -- its Finished flight) are handed to the reader, which processes them before
     -- its first socket read; enqueueing our preface first preserves §3.4 order.
@@ -912,6 +965,7 @@ private def transportConfig (config : Config) : _root_.Http2.Client.Config := {
   authority := config.authority
   scheme := config.scheme
   readSize := config.readSize
+  writerLimits := config.writerLimits
   initialWindowSize := clientInitialStreamWindow config
 }
 

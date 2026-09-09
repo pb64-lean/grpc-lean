@@ -1,0 +1,7 @@
+{
+  "version": "1.2.0",
+  "packages": [
+    { "name": "«tls13-lean»", "type": "path", "dir": "../tls13-lean", "inherited": false },
+    { "name": "«http2-lean»", "type": "path", "dir": "../http2-lean", "inherited": false }
+  ]
+}
