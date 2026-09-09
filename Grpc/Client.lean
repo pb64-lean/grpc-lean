@@ -756,21 +756,21 @@ private def shutdownConnection (connection : Connection) : Async Unit := do
   discard <| _root_.Http2.CancellationToken.cancel connection.stopToken
     (reason := Std.CancellationReason.shutdown)
   discard <| connection.outbound.close.toBaseIO
-  for _ in [:connection.config.writerLimits.maxItems] do
-    let some request ← connection.outbound.tryRecv | break
-    connection.writerBudget.release request.bytes.size
   match connection.tls with
   | some session =>
-      -- The outer writer only seals and enqueues TLS records, so stop it and
-      -- the reader before closing the TLS queue. `session.close` then drains
-      -- and joins the inner record writer before shutting down the socket.
+      -- Give the outer writer a bounded flush opportunity before closing the
+      -- TLS queue. Session close likewise attempts bounded record retirement;
+      -- a blocked native send can outlive cooperative cancellation.
       joinBackgroundTasks connection
       session.close
   | none =>
-      -- Interrupt a plaintext writer that may be blocked in a socket send,
-      -- then join both exact background handles.
+      -- Attempt write-side shutdown and bounded retirement of both retained
+      -- handles; native send interruption is not guaranteed by this runtime.
       shutdownSocket connection.socket
       joinBackgroundTasks connection
+  for _ in [:connection.config.writerLimits.maxItems] do
+    let some request ← connection.outbound.tryRecv | break
+    connection.writerBudget.release request.bytes.size
 
 private def closeConnection (connection : Connection) : Async Unit := do
   let owner ← connection.closeClaimed.atomically do
@@ -790,8 +790,8 @@ private def closeConnection (connection : Connection) : Async Unit := do
     | none => pure ()
 
 /-- Start the elected close owner without making the reader join itself. The
-spawned owner closes the outbound queue and transport, waits for this reader to
-return, and resolves the shared completion promise for every close caller. -/
+spawned owner closes the outbound queue and transport, attempts bounded task
+retirement, and resolves the shared completion promise for every close caller. -/
 private def requestTransportRetirement (connection : Connection) : IO Unit := do
   discard <| Async.toIO (closeConnection connection)
 
