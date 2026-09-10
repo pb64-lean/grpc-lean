@@ -29,10 +29,10 @@ archive_override(
 bazel_dep(name = "http2-lean", version = "0.1.0", repo_name = "http2_lean")
 archive_override(
     module_name = "http2-lean",
-    integrity = "sha256-JkQPBLVdgICr3ZWYejr6iDQ1aYHHYS5VEFK9IOkgGeY=",
-    strip_prefix = "http2-lean-4dfaa5686ccdc3e90251d7146496a9708d2752d1",
+    integrity = "sha256-GhJ4sgNpK6ny0QvhjfmcUx0nlb6uVogY8wJYkJp91Ng=",
+    strip_prefix = "http2-lean-6ab07dd24d35a2bcef1cdefadba4c2bd6dd640f7",
     urls = [
-        "https://github.com/pb64-lean/http2-lean/archive/4dfaa5686ccdc3e90251d7146496a9708d2752d1.tar.gz",
+        "https://github.com/pb64-lean/http2-lean/archive/6ab07dd24d35a2bcef1cdefadba4c2bd6dd640f7.tar.gz",
     ],
 )
 
@@ -74,9 +74,9 @@ local_path_override(
 bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
 archive_override(
     module_name = "tls13-lean",
-    integrity = "sha256-wInyKUe/AxXRSO2YaKwpqgbBU/ek9UG+eYPAeGvpe6c=",
-    strip_prefix = "tls13-lean-4fa14fe068d9ea17c85294a6a27c224b2de5cddb",
+    integrity = "sha256-vgargdfA7hhiIIaXP14okda2Zo4nFRLus1nPVTfRvsc=",
+    strip_prefix = "tls13-lean-0c61f21f3f0e46aa8789cd10f4e03871d1c002db",
     urls = [
-        "https://github.com/pb64-lean/tls13-lean/archive/4fa14fe068d9ea17c85294a6a27c224b2de5cddb.tar.gz",
+        "https://github.com/pb64-lean/tls13-lean/archive/0c61f21f3f0e46aa8789cd10f4e03871d1c002db.tar.gz",
     ],
 )

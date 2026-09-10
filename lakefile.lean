@@ -19,10 +19,10 @@ package «rules-lean-grpc» where
 
 require «tls13-lean» from git
   "https://github.com/pb64-lean/tls13-lean.git" @
-  "4fa14fe068d9ea17c85294a6a27c224b2de5cddb"
+  "0c61f21f3f0e46aa8789cd10f4e03871d1c002db"
 require «http2-lean» from git
   "https://github.com/pb64-lean/http2-lean.git" @
-  "82fc066025f3e5fdec54c836f4e9659c2f8176ab"
+  "6ab07dd24d35a2bcef1cdefadba4c2bd6dd640f7"
 
 /- Keep the editor's Lake module graph aligned with MODULE.bazel. Bazel remains
    the authoritative build system. -/

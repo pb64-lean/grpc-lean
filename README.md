@@ -500,14 +500,10 @@ The pinned socket API cannot fully cancel an already-issued native send. The
 Tests use non-reading TCP peers to cover real writer stalls, bounded admission,
 overflow/close ACK settlement, and fail-closed configuration validation.
 
-Until sibling publication, validate the exact source graph with
-`bazel test //... --override_module=http2-lean=../http2-lean --override_module=tls13-lean=../tls13-lean --jobs=4`.
-Immutable archive pins are intentionally unchanged by this workspace-only step.
-The published `grpc-java` compatibility floor is 1.66.0: the transitive 1.62.2
-module extension references a protobuf javalite repository that no longer exists.
-This repairs strict full-graph evaluation without linking Java into Lean code.
-The matching Lake editor check is `lake --packages=lake-workspace.json build Grpc`;
-its explicit portable overrides do not modify the release manifest.
+Validate the pinned dependency graph with
+`bazel test //... --lockfile_mode=error --jobs=4`.
+For an editor/source check, use `lake build Grpc`. To work against local sibling
+sources, use `lake --packages=lake-workspace.json build Grpc`.
 
 ## License
 
