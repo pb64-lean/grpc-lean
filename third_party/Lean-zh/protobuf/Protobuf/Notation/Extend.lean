@@ -1,6 +1,6 @@
 module
 
-public import Lean
+public meta import Lean
 public meta import Protobuf.Notation.Basic
 public import Protobuf.Notation.Message
 import Protobuf.Notation.Syntax

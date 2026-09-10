@@ -1,6 +1,6 @@
 module
 
-public import Lean
+public meta import Lean
 public meta import Protobuf.Notation.Basic
 import Protobuf.Encoding.Builder
 import Protobuf.Encoding.Unwire

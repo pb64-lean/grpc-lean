@@ -7,7 +7,7 @@ import Protobuf.Encoding.Unwire
 import Protobuf.Utils
 public meta import Protobuf.Notation.Basic
 public import Protobuf.Notation.Enum
-public import Lean
+public meta import Lean
 import Protobuf.Notation.Syntax
 
 public meta section

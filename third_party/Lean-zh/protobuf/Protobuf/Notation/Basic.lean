@@ -1,7 +1,7 @@
 module
 
-public import Lean
-import Protobuf.Utils
+public meta import Lean
+public meta import Protobuf.Utils
 import Protobuf.Notation.Syntax
 
 
@@ -40,7 +40,7 @@ When `wired_as_group` is true, the field is **always** wired in the delimited wa
 -/
 
 
-public section
+public meta section
 
 open Lean Meta Elab Term Command
 

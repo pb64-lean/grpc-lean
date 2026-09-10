@@ -1,6 +1,6 @@
 module
 
-public import Lean
+public meta import Lean
 public import Protobuf.Base64
 public meta import Protobuf.Versions
 
