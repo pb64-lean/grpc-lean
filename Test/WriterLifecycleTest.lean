@@ -11,6 +11,25 @@ private def failed (ack : IO.Promise (Except IO.Error Unit)) : IO Unit := do
   | some (.error _) => pure ()
   | _ => throw (IO.userError "failed gRPC write acknowledged as success")
 
+private partial def drainPeer (peer : TCP.Socket.Client) : Async Unit := do
+  match ← peer.recv? 65536 with
+  | none => pure ()
+  | some _ => drainPeer peer
+
+private def finishFixture (connection : Grpc.Client.Connection)
+    (peer : TCP.Socket.Client) : IO Unit := do
+  -- Bounded close may leave the intentionally stalled native send pending.
+  -- Reading through FIN releases it before the test process exits.
+  let draining ← Async.toIO (drainPeer peer)
+  for _ in [:5000] do
+    if (← IO.hasFinished draining) && (← Grpc.Client.backgroundTasksFinished connection) then break
+    IO.sleep 1
+  unless ← IO.hasFinished draining do
+    IO.cancel draining
+    throw (IO.userError "gRPC fixture peer did not reach EOF")
+  (Async.ofAsyncTask draining).block
+  check (← Grpc.Client.backgroundTasksFinished connection) "gRPC fixture retained background tasks"
+
 private def actualClient (overflow : Bool) : IO Unit := do
   let listener ← TCP.Socket.Server.mk
   listener.bind (Grpc.Server.loopback 0)
@@ -38,6 +57,7 @@ private def actualClient (overflow : Bool) : IO Unit := do
   let stats ← connection.writerBudget.snapshot
   check (stats.peakItems == 2 && stats.peakBytes ≤ 32 * 1024 * 1024) "gRPC writer exceeded limits"
   (Grpc.Client.close connection).block
+  finishFixture connection peer
   try peer.shutdown.block catch _ => pure ()
 
 def main : IO Unit := do
