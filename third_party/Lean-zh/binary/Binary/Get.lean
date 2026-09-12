@@ -193,18 +193,13 @@ private meta def generate_prim (le : Bool) (unsigned : Bool) (type : Lean.TSynta
     let d_offset ← `($(Lean.mkIdent `Decoder.offset) $d:ident)
     let d_data ← `($(Lean.mkIdent `Decoder.data) $d:ident)
     let d_data_size ← `($(Lean.mkIdent `ByteArray.size) ($(Lean.mkIdent `Decoder.data) $d:ident))
+    -- Assemble unsigned bytes at the destination width to avoid sign-extending
+    -- individual bytes into positions belonging to more significant bytes.
+    let uintType := if unsigned then type.getId.getString! else s!"U{type.getId.getString!}"
     let ns := List.range len
     let ts ← ns.mapM fun x => do
-      let y ←
-        if unsigned then
-          `($(Lean.mkIdent `ByteArray.get) $d_data ($d_offset + $(Lean.Syntax.mkNatLit x):num))
-        else
-          `($(Lean.mkIdent `ByteArray.get) $d_data ($d_offset + $(Lean.Syntax.mkNatLit x):num) |>.toInt8)
-      let y ←
-        if unsigned then
-          `($(Lean.mkIdent (Lean.Name.mkStr2 "UInt8" s!"to{type.getId.getString!}")) $y)
-        else
-          `($(Lean.mkIdent (Lean.Name.mkStr2 "Int8" s!"to{type.getId.getString!}")) $y)
+      let y ← `($(Lean.mkIdent `ByteArray.get) $d_data ($d_offset + $(Lean.Syntax.mkNatLit x):num))
+      let y ← `($(Lean.mkIdent (Lean.Name.mkStr2 "UInt8" s!"to{uintType}")) $y)
       let shift := if le then x * 8 else (len - 1 - x) * 8
       `($y <<< $(Lean.Syntax.mkNatLit shift):num)
     let combined ←
@@ -214,6 +209,10 @@ private meta def generate_prim (le : Bool) (unsigned : Bool) (type : Lean.TSynta
       | head :: tail => do
         tail.foldlM (init := head) fun (x : Lean.Term) y => do
           `($x ||| $y)
+    -- Interpret the completed bit pattern as signed exactly once.
+    let combined ←
+      if unsigned then pure combined
+      else `($(Lean.mkIdent (Lean.Name.mkStr2 uintType s!"to{type.getId.getString!}")) $combined)
     let code ← `(command|
       @[always_inline]
       scoped instance : Decode $type where

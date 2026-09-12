@@ -15,6 +15,13 @@ load("//:defs.bzl", "lean_proto_descriptor_library", "lean_proto_library")
 # packages can depend on the same fixture the in-repo TLS tests use.
 exports_files(glob(["Test/Fixtures/Tls/*"]))
 
+lean_test(
+    name = "binary_signed_decode_test",
+    srcs = ["Test/BinarySignedDecodeTest.lean"],
+    deps = ["@grpc_lean_protobuf_binary//:binary"],
+    size = "small",
+)
+
 proto_library(
     name = "recursive_struct_proto",
     srcs = ["Test/recursive_struct.proto"],
