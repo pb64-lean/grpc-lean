@@ -256,11 +256,17 @@ def main : IO Unit := do
   let cancelled ← match cancelled with
     | .ok call => pure call
     | .error status => throw (IO.userError s!"cancelled call start failed: {status.messageD}")
+  expectEq (← Async.block cancelled.cancelIfActive) true
+    "active local cancellation should report its atomic commit"
+  expectEq (← Async.block cancelled.cancelIfActive) false
+    "a repeated cancellation must not claim another terminal commit"
   Async.block cancelled.cancel
   expectStatusCode (← Async.block cancelled.recv?) .cancelled
     "locally cancelled receive"
   expectStatusCode (← Async.block cancelled.finish) .cancelled
     "locally cancelled finish"
+  expectEq (← Async.block cancelled.cancelIfActive) false
+    "a retired call must not claim a cancellation commit"
   match ← Async.block (Client.call client
       "/lean.example.proto.NoteService/Echo" payload2) with
   | .error status =>

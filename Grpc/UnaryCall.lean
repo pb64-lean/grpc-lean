@@ -3,6 +3,7 @@ module
 public import Grpc.Client
 public import Grpc.CallCredentials
 public import Grpc.Cancellation
+public import Grpc.Execution
 public import Grpc.ManagedChannel.Config
 public import Std.Async.Timer
 
@@ -18,9 +19,9 @@ caller-supplied per-call credentials seam, starts and retains the exact
 
 The `grpc-timeout` header is retained for peer-side enforcement, but is not
 trusted as a local deadline.  A local monotonic timer races the call owner.  If
-the timer wins, the same call is cancelled and its owner is joined before the
-deadline error is returned.  This makes returning from `unary` a cleanup
-acknowledgement suitable for releasing a shared channel-owner lease.
+local cancellation commits, the same call is cancelled and its owner is joined
+before an ordinary local error is returned. Already-terminal peer results keep
+their provenance; cleanup uncertainty is represented separately.
 -/
 
 namespace Grpc.UnaryCall
@@ -77,7 +78,7 @@ inductive Error where
   | requestEncoding
   /-- The local monotonic deadline won after the exact call was joined. -/
   | localDeadlineExceeded
-  /-- The supplied local owner cancellation won after the exact call was joined. -/
+  /-- Cancellation prevented admission, or the admitted exact owner was joined. -/
   | ownerCancelled
   /--
   The exact terminal status and, when unambiguous, the peer's decoded
@@ -126,6 +127,19 @@ structure Primitives (Handle : Type) where
       Async (Except Grpc.Status
         (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers))
   cancel : Handle → Async Unit
+  /-- Report the atomic local-cancellation commit, not whether a cancellation
+  request was merely attempted. A driver without origin evidence preserves
+  the owner's terminal RPC result instead of labelling it a local outcome. -/
+  cancelIfActive? : Option (Handle → Async Bool) := none
+
+/-- Invoke the driver's cancellation-origin operation when supplied. Without
+one, request ordinary cancellation and preserve terminal RPC provenance. -/
+def Primitives.cancelIfActive (primitives : Primitives Handle) (call : Handle) : Async Bool := do
+  match primitives.cancelIfActive? with
+  | some cancel => cancel call
+  | none =>
+      primitives.cancel call
+      pure false
 
 /--
 One armed deadline and its idempotent resource cleanup.  `disarm` matters when
@@ -178,18 +192,16 @@ private def grpcPrimitives : Primitives Grpc.Client.Call where
   recv? := Grpc.Client.Call.recv?
   finish := Grpc.Client.Call.finish
   cancel := Grpc.Client.Call.cancel
+  cancelIfActive? := some Grpc.Client.Call.cancelIfActive
 
 private def cardinalityStatus (count : String) : Grpc.Status :=
   Grpc.Status.internal s!"expected exactly one response message, got {count}"
 
 /--
-Exact status installed by the `Grpc.Client.Call.cancel` linearization when
-the call was still active.  This byte-equality sentinel is intra-repo
-lockstep coupling: it must match the status `Grpc.Client` installs
-byte-for-byte, so an edit to either definition must change the other.  A
-different status observed after `cancel` was already terminal peer/transport
-evidence and must not be rewritten as local deadline or owner-cancellation
-provenance.
+Exact status installed by the `Grpc.Client.Call.cancelIfActive` linearization
+when the call was still active. This must match the status `Grpc.Client`
+installs byte-for-byte. Matching text alone is never local-origin evidence:
+classification also requires that cancellation's actual atomic commit.
 -/
 private def locallyCancelledStatus : Grpc.Status :=
   Grpc.Status.cancelled "call cancelled locally"
@@ -230,99 +242,381 @@ private def rpcErrorAfterFinish
         .rpc status
   | .error _ => .rpc status
 
-private def cancelAndFinish
-    (primitives : Primitives Handle)
-    (call : Handle) : Async Unit := do
-  primitives.cancel call
-  discard <| primitives.finish call
+namespace Ownership
 
-private def failAfterCancel
-    (primitives : Primitives Handle)
-    (call : Handle)
-    (status : Grpc.Status) : Async (Except Error ByteArray) := do
-  primitives.cancel call
-  let finishResult ← primitives.finish call
-  pure (.error (rpcErrorAfterFinish status finishResult))
+variable {Handle : Type}
 
-private def failAfterTerminal
-    (primitives : Primitives Handle)
-    (call : Handle)
-    (status : Grpc.Status) : Async (Except Error ByteArray) := do
-  let finishResult ← primitives.finish call
-  pure (.error (rpcErrorAfterFinish status finishResult))
+/-- Primitive invocations name the exact call they operate on. -/
+inductive Command (Handle : Type) where
+  | send (call : Handle) (request : ByteArray)
+  | closeSend (call : Handle)
+  | receive (call : Handle)
+  | finish (call : Handle)
+  | cancel (call : Handle)
 
-private def settleNoResponse
-    (primitives : Primitives Handle)
-    (call : Handle) : Async (Except Error ByteArray) := do
-  match ← primitives.finish call with
-  | .error status => pure (.error (.rpc status))
-  | .ok (status, _, trailers) =>
-      if status.isOk then
-        pure (.error (.rpc (cardinalityStatus "0")))
-      else
-        pure (.error (rpcErrorFromTerminal status trailers))
+@[expose] def Command.Return : Command Handle → Type
+  | .send _ _ | .closeSend _ => Except Grpc.Status Unit
+  | .receive _ => Except Grpc.Status (Option ByteArray)
+  | .finish _ => Except Grpc.Status
+      (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers)
+  | .cancel _ => Unit
 
-private def settleOneResponse
-    (primitives : Primitives Handle)
-    (call : Handle)
-    (response : ByteArray) : Async (Except Error ByteArray) := do
-  match ← primitives.finish call with
-  | .error status => pure (.error (.rpc status))
-  | .ok (status, _, trailers) =>
-      if status.isOk then
-        pure (.ok response)
-      else
-        pure (.error (rpcErrorFromTerminal status trailers))
+@[expose] def Outcome (command : Command Handle) : Type := Except IO.Error command.Return
 
-private def settleMultipleResponses
-    (primitives : Primitives Handle)
-    (call : Handle) : Async (Except Error ByteArray) := do
-  primitives.cancel call
-  match ← primitives.finish call with
-  | .ok (status, _, trailers) =>
-      if status.isOk then
-        pure (.error (.rpc (cardinalityStatus "at least 2")))
-      else
-        pure (.error (rpcErrorFromTerminal status trailers))
-  | .error _ =>
-      -- Cancellation makes this the usual production branch.  The semantic
-      -- error remains the unary response-cardinality violation.
-      pure (.error (.rpc (cardinalityStatus "at least 2")))
+abbrev Program (Handle : Type) :=
+  Execution.Program (Command Handle) Outcome (Except Error ByteArray)
+
+/-- Recovery acknowledges terminal cleanup only after cancel and finish both
+return; an exception from either recovery primitive retains uncertainty. -/
+def recover (call : Handle) : Program Handle :=
+  .call (.cancel call) fun
+    | .error _ => .done (.error .cleanupUncertain)
+    | .ok () => .call (.finish call) fun
+        | .error _ => .done (.error .cleanupUncertain)
+        | .ok _ => .done (.error .actionFailed)
+
+def failAfterTerminal (call : Handle) (status : Grpc.Status) : Program Handle :=
+  .call (.finish call) fun
+    | .error _ => recover call
+    | .ok result => .done (.error (rpcErrorAfterFinish status result))
+
+def failAfterCancel (call : Handle) (status : Grpc.Status) : Program Handle :=
+  .call (.cancel call) fun
+    | .error _ => recover call
+    | .ok () => failAfterTerminal call status
+
+def settleNoResponse (call : Handle) : Program Handle :=
+  .call (.finish call) fun
+    | .error _ => recover call
+    | .ok (.error status) => .done (.error (.rpc status))
+    | .ok (.ok (status, _, trailers)) =>
+        if status.isOk then .done (.error (.rpc (cardinalityStatus "0")))
+        else .done (.error (rpcErrorFromTerminal status trailers))
+
+def settleOneResponse (call : Handle) (response : ByteArray) : Program Handle :=
+  .call (.finish call) fun
+    | .error _ => recover call
+    | .ok (.error status) => .done (.error (.rpc status))
+    | .ok (.ok (status, _, trailers)) =>
+        if status.isOk then .done (.ok response)
+        else .done (.error (rpcErrorFromTerminal status trailers))
+
+def settleMultipleResponses (call : Handle) : Program Handle :=
+  .call (.cancel call) fun
+    | .error _ => recover call
+    | .ok () => .call (.finish call) fun
+        | .error _ => recover call
+        | .ok (.error _) => .done (.error (.rpc (cardinalityStatus "at least 2")))
+        | .ok (.ok (status, _, trailers)) =>
+            if status.isOk then .done (.error (.rpc (cardinalityStatus "at least 2")))
+            else .done (.error (rpcErrorFromTerminal status trailers))
+
+/-- The production unary owner's complete finite control flow. Exceptions
+and gRPC failures are distinct outcomes at every primitive boundary. -/
+def program (call : Handle) (request : ByteArray) : Program Handle :=
+  .call (.send call request) fun
+    | .error _ => recover call
+    | .ok (.error status) => failAfterCancel call status
+    | .ok (.ok ()) => .call (.closeSend call) fun
+        | .error _ => recover call
+        | .ok (.error status) => failAfterTerminal call status
+        | .ok (.ok ()) => .call (.receive call) fun
+            | .error _ => recover call
+            | .ok (.error status) => failAfterTerminal call status
+            | .ok (.ok none) => settleNoResponse call
+            | .ok (.ok (some response)) => .call (.receive call) fun
+                | .error _ => recover call
+                | .ok (.error status) => failAfterTerminal call status
+                | .ok (.ok none) => settleOneResponse call response
+                | .ok (.ok (some _)) => settleMultipleResponses call
+
+private theorem recover_no_success
+    (executed : Execution.Executes (recover call) trace (.ok response)) : False := by
+  obtain ⟨cancelled, tail, rfl, hcancel⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases cancelled with
+  | error error => cases hcancel
+  | ok value =>
+      cases value
+      obtain ⟨finished, rest, rfl, hfinish⟩ := Execution.executes_call_iff _ _ |>.mp hcancel
+      cases finished <;> cases hfinish
+
+private theorem failAfterTerminal_no_success
+    (executed : Execution.Executes (failAfterTerminal call status) trace (.ok response)) : False := by
+  obtain ⟨finished, tail, rfl, next⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases finished with
+  | error error => exact recover_no_success next
+  | ok result => cases next
+
+private theorem failAfterCancel_no_success
+    (executed : Execution.Executes (failAfterCancel call status) trace (.ok response)) : False := by
+  obtain ⟨cancelled, tail, rfl, next⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases cancelled with
+  | error error => exact recover_no_success next
+  | ok value => exact failAfterTerminal_no_success next
+
+private theorem settleNoResponse_no_success
+    (executed : Execution.Executes (settleNoResponse call) trace (.ok response)) : False := by
+  obtain ⟨finished, tail, rfl, next⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases finished with
+  | error error => exact recover_no_success next
+  | ok result =>
+      cases result with
+      | error status => cases next
+      | ok terminal =>
+          rcases terminal with ⟨status, headers, trailers⟩
+          simp only at next
+          split at next <;> cases next
+
+private theorem settleMultipleResponses_no_success
+    (executed : Execution.Executes (settleMultipleResponses call) trace (.ok response)) : False := by
+  obtain ⟨cancelled, tail, rfl, hcancel⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases cancelled with
+  | error error => exact recover_no_success hcancel
+  | ok value =>
+      cases value
+      obtain ⟨finished, rest, rfl, hfinish⟩ := Execution.executes_call_iff _ _ |>.mp hcancel
+      cases finished with
+      | error error => exact recover_no_success hfinish
+      | ok result =>
+          cases result with
+          | error status => cases hfinish
+          | ok terminal =>
+              rcases terminal with ⟨status, headers, trailers⟩
+              simp only at hfinish
+              split at hfinish <;> cases hfinish
+
+private theorem settleOneResponse_success
+    (executed : Execution.Executes (settleOneResponse call response) trace (.ok returned)) :
+    ∃ status headers trailers, status.isOk = true ∧ returned = response ∧
+      trace = [⟨.finish call, .ok (.ok (status, headers, trailers))⟩] := by
+  obtain ⟨finished, tail, rfl, next⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases finished with
+  | error error => exact False.elim (recover_no_success next)
+  | ok result =>
+      cases result with
+      | error status => cases next
+      | ok terminal =>
+          rcases terminal with ⟨status, headers, trailers⟩
+          simp only at next
+          split at next
+          next successful =>
+            obtain ⟨rfl, equal⟩ := Execution.executes_done_iff.mp next
+            exact ⟨status, headers, trailers, successful, Except.ok.inj equal, rfl⟩
+          next => cases next
+
+/-- A successful unary owner has exactly one received message followed by
+end-of-messages and a successful terminal status, all on the same call. -/
+theorem success_trace
+    {Handle : Type} {call : Handle} {request response : ByteArray}
+    {trace : List (Execution.Event (Command Handle) Outcome)}
+    (executed : Execution.Executes (program call request) trace (.ok response)) :
+    ∃ status headers trailers, status.isOk = true ∧
+      trace = [
+        ⟨.send call request, .ok (.ok ())⟩,
+        ⟨.closeSend call, .ok (.ok ())⟩,
+        ⟨.receive call, .ok (.ok (some response))⟩,
+        ⟨.receive call, .ok (.ok none)⟩,
+        ⟨.finish call, .ok (.ok (status, headers, trailers))⟩] := by
+  obtain ⟨sent, tail, rfl, hsend⟩ := Execution.executes_call_iff _ _ |>.mp executed
+  cases sent with
+  | error error => exact False.elim (recover_no_success hsend)
+  | ok result =>
+      cases result with
+      | error status => exact False.elim (failAfterCancel_no_success hsend)
+      | ok value =>
+          cases value
+          obtain ⟨closed, afterClose, rfl, hclose⟩ := Execution.executes_call_iff _ _ |>.mp hsend
+          cases closed with
+          | error error => exact False.elim (recover_no_success hclose)
+          | ok result =>
+              cases result with
+              | error status => exact False.elim (failAfterTerminal_no_success hclose)
+              | ok value =>
+                  cases value
+                  obtain ⟨received, afterFirst, rfl, hfirst⟩ := Execution.executes_call_iff _ _ |>.mp hclose
+                  cases received with
+                  | error error => exact False.elim (recover_no_success hfirst)
+                  | ok result =>
+                      cases result with
+                      | error status => exact False.elim (failAfterTerminal_no_success hfirst)
+                      | ok first =>
+                          cases first with
+                          | none => exact False.elim (settleNoResponse_no_success hfirst)
+                          | some bytes =>
+                              obtain ⟨secondResult, afterSecond, rfl, hsecond⟩ :=
+                                Execution.executes_call_iff _ _ |>.mp hfirst
+                              cases secondResult with
+                              | error error => exact False.elim (recover_no_success hsecond)
+                              | ok result =>
+                                  cases result with
+                                  | error status => exact False.elim (failAfterTerminal_no_success hsecond)
+                                  | ok second =>
+                                      cases second with
+                                      | some bytes => exact False.elim (settleMultipleResponses_no_success hsecond)
+                                      | none =>
+                                          obtain ⟨status, headers, trailers, success, rfl, rfl⟩ :=
+                                            settleOneResponse_success hsecond
+                                          exact ⟨status, headers, trailers, success, rfl⟩
+
+private inductive NeedsFinish (call : Handle) : Program Handle → Prop where
+  | uncertain : NeedsFinish call (.done (.error .cleanupUncertain))
+  | finish {next : Outcome (.finish call) → Program Handle}
+      (onException : ∀ error, NeedsFinish call (next (.error error))) :
+      NeedsFinish call (.call (.finish call) next)
+  | step {command : Command Handle} {next : Outcome command → Program Handle}
+      (following : ∀ outcome, NeedsFinish call (next outcome)) :
+      NeedsFinish call (.call command next)
+
+private theorem NeedsFinish.acknowledged {call : Handle} {p : Program Handle}
+    (discipline : NeedsFinish call p)
+    (executed : Execution.Executes p trace result)
+    (certain : result ≠ .error .cleanupUncertain) :
+    ∃ terminal, (⟨.finish call, .ok terminal⟩ : Execution.Event (Command Handle) Outcome) ∈ trace := by
+  induction discipline generalizing trace result with
+  | uncertain =>
+      cases executed
+      exact False.elim (certain rfl)
+  | finish onException ih =>
+      obtain ⟨outcome, tail, rfl, continuation⟩ := Execution.executes_call_iff _ _ |>.mp executed
+      cases outcome with
+      | error error =>
+          obtain ⟨terminal, member⟩ := ih error continuation certain
+          exact ⟨terminal, List.mem_cons_of_mem _ member⟩
+      | ok terminal => exact ⟨terminal, List.mem_cons_self⟩
+  | step following ih =>
+      obtain ⟨outcome, tail, rfl, continuation⟩ := Execution.executes_call_iff _ _ |>.mp executed
+      obtain ⟨terminal, member⟩ := ih outcome continuation certain
+      exact ⟨terminal, List.mem_cons_of_mem _ member⟩
+
+private theorem recover_needsFinish (call : Handle) : NeedsFinish call (recover call) := by
+  apply NeedsFinish.step
+  intro outcome
+  cases outcome with
+  | error error => exact .uncertain
+  | ok value => exact .finish (fun _ => .uncertain)
+
+private theorem failAfterTerminal_needsFinish (call : Handle) (status : Grpc.Status) :
+    NeedsFinish call (failAfterTerminal call status) :=
+  .finish (fun _ => recover_needsFinish call)
+
+private theorem failAfterCancel_needsFinish (call : Handle) (status : Grpc.Status) :
+    NeedsFinish call (failAfterCancel call status) := by
+  apply NeedsFinish.step
+  intro outcome
+  cases outcome with
+  | error error => exact recover_needsFinish call
+  | ok value => exact failAfterTerminal_needsFinish call status
+
+private theorem settleMultipleResponses_needsFinish (call : Handle) :
+    NeedsFinish call (settleMultipleResponses call) := by
+  apply NeedsFinish.step
+  intro outcome
+  cases outcome with
+  | error error => exact recover_needsFinish call
+  | ok value => exact .finish (fun _ => recover_needsFinish call)
+
+private theorem program_needsFinish (call : Handle) (request : ByteArray) :
+    NeedsFinish call (program call request) := by
+  apply NeedsFinish.step
+  intro sent
+  cases sent with
+  | error error => exact recover_needsFinish call
+  | ok result =>
+      cases result with
+      | error status => exact failAfterCancel_needsFinish call status
+      | ok value =>
+          apply NeedsFinish.step
+          intro closed
+          cases closed with
+          | error error => exact recover_needsFinish call
+          | ok result =>
+              cases result with
+              | error status => exact failAfterTerminal_needsFinish call status
+              | ok value =>
+                  apply NeedsFinish.step
+                  intro received
+                  cases received with
+                  | error error => exact recover_needsFinish call
+                  | ok result =>
+                      cases result with
+                      | error status => exact failAfterTerminal_needsFinish call status
+                      | ok first =>
+                          cases first with
+                          | none => exact .finish (fun _ => recover_needsFinish call)
+                          | some bytes =>
+                              apply NeedsFinish.step
+                              intro received
+                              cases received with
+                              | error error => exact recover_needsFinish call
+                              | ok result =>
+                                  cases result with
+                                  | error status => exact failAfterTerminal_needsFinish call status
+                                  | ok second =>
+                                      cases second with
+                                      | none => exact .finish (fun _ => recover_needsFinish call)
+                                      | some _ => exact settleMultipleResponses_needsFinish call
+
+/-- Every completed owner result that acknowledges cleanup contains a returned
+finish operation on its exact call. A returned gRPC error still acknowledges
+finish; a thrown cleanup exception may instead yield `cleanupUncertain`. -/
+theorem terminal_acknowledged {Handle : Type} {call : Handle} {request : ByteArray}
+    {trace : List (Execution.Event (Command Handle) Outcome)} {result : Except Error ByteArray}
+    (executed : Execution.Executes (program call request) trace result)
+    (certain : result ≠ .error .cleanupUncertain) :
+    ∃ terminal, (⟨.finish call, .ok terminal⟩ : Execution.Event (Command Handle) Outcome) ∈ trace :=
+  (program_needsFinish call request).acknowledged executed certain
+
+private theorem program_no_local_result (call : Handle) (request : ByteArray) :
+    (program call request).ReturnsOnly (fun result =>
+      result ≠ .error .ownerCancelled ∧ result ≠ .error .localDeadlineExceeded) := by
+  simp only [program, recover, failAfterCancel, failAfterTerminal,
+    settleNoResponse, settleOneResponse, settleMultipleResponses,
+    Execution.Program.ReturnsOnly]
+  repeat first
+    | intro outcome; cases outcome
+    | split
+    | constructor
+    | simp_all [rpcErrorAfterFinish, rpcErrorFromTerminal]
+
+/-- Local cancellation provenance is selected only by the outer invocation
+owner; the primitive owner cannot invent either ordinary local outcome. -/
+theorem no_local_result
+    (executed : Execution.Executes (program call request) trace result) :
+    result ≠ .error .ownerCancelled ∧ result ≠ .error .localDeadlineExceeded :=
+  Execution.returnsOnly_result
+    (post := fun value => value ≠ .error .ownerCancelled ∧ value ≠ .error .localDeadlineExceeded)
+    (program_no_local_result call request) executed
+
+/-- A completion returned by interpreting the actual primitive-owner program.
+The certificate is erased; the value is the owner's ordinary result. -/
+@[expose] def Completion (call : Handle) (request : ByteArray) :=
+  { result : Except Error ByteArray //
+    ∃ trace, Execution.Executes (program call request) trace result }
+
+private def invoke (primitives : Primitives Handle)
+    (command : Command Handle) : Async (Outcome command) := do
+  try
+    match command with
+    | .send call request => pure (.ok (← primitives.send call request))
+    | .closeSend call => pure (.ok (← primitives.closeSend call))
+    | .receive call => pure (.ok (← primitives.recv? call))
+    | .finish call => pure (.ok (← primitives.finish call))
+    | .cancel call => pure (.ok (← primitives.cancel call))
+  catch error => pure (.error error)
+
+end Ownership
 
 /--
 Own one exact call through send, half-close, receive, and terminal cleanup.
-No branch returns while the call can still be registered with its connection.
+Every result except `cleanupUncertain` contains a returned exact-call finish.
 -/
 private def ownUnaryCall
     (primitives : Primitives Handle)
     (call : Handle)
-    (request : ByteArray) : Async (Except Error ByteArray) := do
-  try
-    match ← primitives.send call request with
-    | .error status => failAfterCancel primitives call status
-    | .ok () =>
-        match ← primitives.closeSend call with
-        | .error status => failAfterTerminal primitives call status
-        | .ok () =>
-            match ← primitives.recv? call with
-            | .error status => failAfterTerminal primitives call status
-            | .ok none => settleNoResponse primitives call
-            | .ok (some response) =>
-                match ← primitives.recv? call with
-                | .error status => failAfterTerminal primitives call status
-                | .ok none => settleOneResponse primitives call response
-                | .ok (some _) => settleMultipleResponses primitives call
-  catch _ =>
-    -- Preserve the ownership rule even if an injected primitive raises an IO
-    -- error rather than returning a gRPC status.  An exception from cleanup
-    -- is a distinct containment result; it must poison the shared connection.
-    try
-      cancelAndFinish primitives call
-      pure (.error .actionFailed)
-    catch _ =>
-      pure (.error .cleanupUncertain)
+    (request : ByteArray) : Async (Ownership.Completion call request) :=
+  (Ownership.program call request).interpret (Ownership.invoke primitives)
 
-private inductive OwnerRace (α : Type) where
+inductive OwnerRace (α : Type) where
   | completed (value : α)
   | expired
   | cancelled
@@ -360,113 +654,160 @@ private def decodeOwnedResult
       | .ok decoded => .ok decoded
       | .error _ => .error .responseDecoding
 
+private theorem decodeOwnedResult_not_local {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (localError : Error)
+    (isLocal : localError = .ownerCancelled ∨ localError = .localDeadlineExceeded) :
+    decodeOwnedResult decode completion.val ≠ .error localError := by
+  obtain ⟨trace, executed⟩ := completion.property
+  have ordinary := Ownership.no_local_result executed
+  cases result : completion.val with
+  | error error =>
+      rcases isLocal with rfl | rfl
+      · simpa [decodeOwnedResult, result] using ordinary.1
+      · simpa [decodeOwnedResult, result] using ordinary.2
+  | ok bytes =>
+      rcases isLocal with rfl | rfl <;> cases decoded : decode bytes <;>
+        simp [decodeOwnedResult, result, decoded]
+
+private theorem decodeOwnedResult_success {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) {response : Response}
+    (success : decodeOwnedResult decode completion.val = .ok response) :
+    ∃ bytes, completion.val = .ok bytes ∧ decode bytes = .ok response := by
+  cases result : completion.val with
+  | error error => simp [decodeOwnedResult, result] at success
+  | ok bytes =>
+      cases decoded : decode bytes with
+      | error error => simp [decodeOwnedResult, result, decoded] at success
+      | ok value =>
+          simp only [decodeOwnedResult, result, decoded, Except.ok.injEq] at success
+          exact ⟨bytes, rfl, success ▸ decoded⟩
+
 /--
-Classify the exact owner result after this adapter requested local
-cancellation.  `Grpc.Client.Call.cancel` installs only
-`locallyCancelledStatus` — intra-repo lockstep coupling on that exact byte
-string; every other terminal result predates (or won) that cancellation
-linearization and retains its original provenance.
+Classify the exact owner result after the adapter requested cancellation.
+Local provenance requires both the actual atomic cancellation commit and its
+terminal status. Peer-controlled status text alone cannot establish origin;
+other terminal results retain their original provenance.
 -/
-private def resultAfterLocalCancellation
+private def resultAfterLocalCancellation {call : Handle} {request : ByteArray}
+    (committed : Bool)
     (localResult : Error)
     (decode : ByteArray → Except δ Response) :
-    Option (Except Error ByteArray) → Except Error Response
+    Option (Ownership.Completion call request) → Except Error Response
   | none => .error .cleanupUncertain
-  | some (.error (.rpc status statusDetails)) =>
-      if status == locallyCancelledStatus && statusDetails.isNone then
-        .error localResult
-      else
-        .error (.rpc status statusDetails)
-  | some result => decodeOwnedResult decode result
+  | some completion =>
+      match completion.val with
+      | .error (.rpc status statusDetails) =>
+          if committed && status == locallyCancelledStatus && statusDetails.isNone then
+            .error localResult
+          else
+            .error (.rpc status statusDetails)
+      | result => decodeOwnedResult decode result
+
+private theorem resultAfterLocalCancellation_false {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (localError : Error) :
+    resultAfterLocalCancellation false localError decode (some completion) =
+      decodeOwnedResult decode completion.val := by
+  cases result : completion.val with
+  | ok bytes => simp [resultAfterLocalCancellation, result]
+  | error error => cases error <;> simp [resultAfterLocalCancellation, decodeOwnedResult, result]
+
+private theorem local_result_requires_commit {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (requested observed : Error)
+    (isLocal : observed = .ownerCancelled ∨ observed = .localDeadlineExceeded)
+    (committed : Bool)
+    (result : resultAfterLocalCancellation committed requested decode (some completion) =
+      .error observed) : committed = true := by
+  cases committed
+  · rw [resultAfterLocalCancellation_false] at result
+    exact False.elim (decodeOwnedResult_not_local completion decode observed isLocal result)
+  · rfl
+
+private theorem local_result_owner_certain {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (requested observed : Error)
+    (isLocal : observed = .ownerCancelled ∨ observed = .localDeadlineExceeded)
+    (committed : Bool)
+    (result : resultAfterLocalCancellation committed requested decode (some completion) =
+      .error observed) : completion.val ≠ .error .cleanupUncertain := by
+  intro uncertain
+  simp only [resultAfterLocalCancellation, uncertain, decodeOwnedResult, Except.error.injEq] at result
+  rcases isLocal with rfl | rfl <;> contradiction
+
+private theorem resultAfterLocalCancellation_success {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) {response : Response}
+    (committed : Bool) (localError : Error)
+    (success : resultAfterLocalCancellation committed localError decode (some completion) =
+      .ok response) :
+    ∃ bytes, completion.val = .ok bytes ∧ decode bytes = .ok response := by
+  cases result : completion.val with
+  | error error =>
+      cases error <;>
+        simp_all [resultAfterLocalCancellation, decodeOwnedResult] <;>
+        split at success <;> contradiction
+  | ok bytes =>
+      have decoded : decodeOwnedResult decode completion.val = .ok response := by
+        simpa [resultAfterLocalCancellation, result] using success
+      simpa [result] using decodeOwnedResult_success completion decode decoded
+
+private theorem resultAfterLocalCancellation_success_iff {call : Handle} {request : ByteArray}
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (response : Response)
+    (committed : Bool) (localError : Error) :
+    resultAfterLocalCancellation committed localError decode (some completion) = .ok response ↔
+      decodeOwnedResult decode completion.val = .ok response := by
+  cases result : completion.val with
+  | ok bytes => simp [resultAfterLocalCancellation, result]
+  | error error =>
+      cases error <;> simp [resultAfterLocalCancellation, decodeOwnedResult, result]
+      split <;> simp
 
 /--
-Transport-injected unary lifecycle with a call-start permit.
-
-Encoding happens before the permit is claimed.  The permit is therefore the
-linearization point at which an absolute outer invocation owner authorizes a
-transport call, and it returns the exact remaining local budget.  Returning
-`none` proves that cancellation or expiry won before transport admission.
-The injected start action deliberately captures no public call options.
+Post-admission operations for the exact call and its exact owner task. The
+production interpreter and the checked finite program share this control flow.
 -/
-def unaryWithCancellationAndPermit
-    (deadlineDriver : DeadlineDriver)
-    (cancellation : Option Cancellation)
-    (permit : Async (Option Nat))
-    (start : Nat → Async (Except Grpc.Status Handle))
-    (primitives : Primitives Handle)
-    (encode : Request → Except ε ByteArray)
-    (decode : ByteArray → Except δ Response)
-    (request : Request) :
-    Async (Except Error Response) := do
-  let encoded ← match encode request with
-    | .ok encoded => pure encoded
-    | .error _ =>
-        match cancellation with
-        | some cancellation =>
-            if ← cancellation.isCancelled then
-              return .error .ownerCancelled
-        | none => pure ()
-        return .error .requestEncoding
+private structure OwnedRuntime (m : Type → Type) (Handle : Type) where
+  disarm : ArmedDeadline → m Unit
+  spawn : (call : Handle) → (request : ByteArray) → m (AsyncTask (Ownership.Completion call request))
+  cancel : Handle → m Unit
+  cancelIfActive : Handle → m Bool
+  finish : Handle → m (Except Grpc.Status
+    (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers))
+  race : {call : Handle} → {request : ByteArray} →
+    AsyncTask (Ownership.Completion call request) → ArmedDeadline → Option Cancellation →
+    m (OwnerRace (Ownership.Completion call request))
+  completed : {call : Handle} → {request : ByteArray} →
+    AsyncTask (Ownership.Completion call request) → m (Option (Ownership.Completion call request))
+  join : {call : Handle} → {request : ByteArray} →
+    AsyncTask (Ownership.Completion call request) → m (Ownership.Completion call request)
 
-  -- Avoid claiming transport admission for a signal already known terminal.
-  -- The permit performs the authoritative atomic check immediately below.
-  match cancellation with
-  | some cancellation =>
-      if ← cancellation.isCancelled then
-        return .error .ownerCancelled
-  | none => pure ()
-  let some remainingMilliseconds ← permit
-    | return .error .ownerCancelled
-  if remainingMilliseconds == 0 then
-    return .error .ownerCancelled
-
-  -- The absolute outer owner has already charged encoding and setup.  This
-  -- exact-call timer owns only the remaining interval returned by the permit.
-  let armedDeadline ← deadlineDriver.arm remainingMilliseconds
-  -- For the standalone relative-deadline adapter, this final active-state
-  -- read is the cooperative start-admission linearization: cancellation that
-  -- follows it is concurrent and will cancel/join the admitted call. Shared
-  -- channels additionally linearize their owner token with the absolute gate
-  -- before this inner signal is checked.
-  match cancellation with
-  | some cancellation =>
-      if ← cancellation.isCancelled then
-        armedDeadline.disarm
-        return .error .ownerCancelled
-  | none => pure ()
-  let startResult ←
+private def ownedInvocation [Monad m] [MonadExceptOf IO.Error m]
+    (runtime : OwnedRuntime m Handle) (call : Handle) (encoded : ByteArray)
+    (armedDeadline : ArmedDeadline) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) : m (Except Error Response) := do
+  let scheduled : Except Error (AsyncTask (Ownership.Completion call encoded)) ←
     try
-      start remainingMilliseconds
-    catch error =>
-      try
-        armedDeadline.disarm
-      catch _ =>
-        pure ()
-      throw error
-  let call ← match startResult with
-    | .ok call => pure call
-    | .error status =>
-        armedDeadline.disarm
-        return .error (.rpc status)
-
-  let scheduled : Except Error (AsyncTask (Except Error ByteArray)) ←
-    try
-      pure (Except.ok (← async (ownUnaryCall primitives call encoded)) :
-        Except Error (AsyncTask (Except Error ByteArray)))
+      pure (Except.ok (← runtime.spawn call encoded) :
+        Except Error (AsyncTask (Ownership.Completion call encoded)))
     catch _ =>
       try
-        cancelAndFinish primitives call
+        runtime.cancel call
+        discard <| runtime.finish call
         pure (Except.error .actionFailed :
-          Except Error (AsyncTask (Except Error ByteArray)))
+          Except Error (AsyncTask (Ownership.Completion call encoded)))
       catch _ =>
         pure (Except.error .cleanupUncertain :
-          Except Error (AsyncTask (Except Error ByteArray)))
+          Except Error (AsyncTask (Ownership.Completion call encoded)))
   let owner ← match scheduled with
     | .ok owner => pure owner
     | .error cleanup =>
         let disarmFailed ←
           try
-            armedDeadline.disarm
+            runtime.disarm armedDeadline
             pure false
           catch _ =>
             pure true
@@ -476,33 +817,33 @@ def unaryWithCancellationAndPermit
           throw (IO.userError "RPC deadline cleanup failed")
         else
           return .error cleanup
-  let raced : Except Error (OwnerRace (Except Error ByteArray)) ←
+  let raced : Except Error (OwnerRace (Ownership.Completion call encoded)) ←
     try
       pure (Except.ok
-        (← raceOwner owner armedDeadline.selector cancellation) :
-        Except Error (OwnerRace (Except Error ByteArray)))
+        (← runtime.race owner armedDeadline cancellation) :
+        Except Error (OwnerRace (Ownership.Completion call encoded)))
     catch error =>
       let disarmFailure : Option IO.Error ←
         try
-          armedDeadline.disarm
+          runtime.disarm armedDeadline
           pure none
         catch disarmError =>
           pure (some disarmError)
       -- A selector/registration failure is outside the call owner. Cancel and
       -- join that exact owner before propagating it across the channel lease.
       try
-        primitives.cancel call
+        runtime.cancel call
       catch _ =>
         pure ()
-      let joined : Option (Except Error ByteArray) ←
+      let joined : Option (Ownership.Completion call encoded) ←
         try
-          some <$> await owner
+          some <$> runtime.join owner
         catch _ =>
           pure none
       match joined with
-      | none | some (.error .cleanupUncertain) =>
+      | none | some ⟨.error .cleanupUncertain, _⟩ =>
           pure (Except.error .cleanupUncertain :
-            Except Error (OwnerRace (Except Error ByteArray)))
+            Except Error (OwnerRace (Ownership.Completion call encoded)))
       | some _ =>
           match disarmFailure with
           | some disarmError => throw disarmError
@@ -514,42 +855,39 @@ def unaryWithCancellationAndPermit
   | .completed result =>
       -- The call owner has already acknowledged terminal cleanup, so a
       -- disarm failure cannot let transport use escape its channel lease.
-      armedDeadline.disarm
-      pure (decodeOwnedResult decode result)
+      runtime.disarm armedDeadline
+      pure (decodeOwnedResult decode result.val)
   | .expired =>
       -- Preserve a timer cleanup failure, but never let it skip exact-call
       -- cancellation and the owner join below.
       let disarmFailure : Option IO.Error ←
         try
-          armedDeadline.disarm
+          runtime.disarm armedDeadline
           pure none
         catch error =>
           pure (some error)
       -- Fair selection may choose the deadline even when the exact owner has
       -- concurrently become terminal. Preserve that completed result before
       -- requesting cancellation; it is stronger evidence than selector order.
-      let completed : Option (Except Error ByteArray) ←
+      let completed : Option (Ownership.Completion call encoded) ←
         try
-          finishedOwner? owner
+          runtime.completed owner
         catch _ =>
           pure none
       let result ← match completed with
-        | some completed => pure (decodeOwnedResult decode completed)
+        | some completed => pure (decodeOwnedResult decode completed.val)
         | none => do
             -- Cancel the exact call and join its owner. `ownUnaryCall` cannot
             -- finish before `Call.finish`, so this await is the cleanup
             -- acknowledgement.
-            try
-              primitives.cancel call
-            catch _ =>
-              pure ()
-            let joined : Option (Except Error ByteArray) ←
+            let committed ← try runtime.cancelIfActive call catch _ => pure false
+            let joined : Option (Ownership.Completion call encoded) ←
               try
-                some <$> await owner
+                some <$> runtime.join owner
               catch _ =>
                 pure none
             pure (resultAfterLocalCancellation
-              .localDeadlineExceeded decode joined)
+              committed .localDeadlineExceeded decode joined)
       match result with
       | .error .cleanupUncertain => pure (.error .cleanupUncertain)
       | .error .actionFailed => pure (.error .actionFailed)
@@ -560,28 +898,25 @@ def unaryWithCancellationAndPermit
   | .cancelled =>
       let disarmFailure : Option IO.Error ←
         try
-          armedDeadline.disarm
+          runtime.disarm armedDeadline
           pure none
         catch error =>
           pure (some error)
-      let completed : Option (Except Error ByteArray) ←
+      let completed : Option (Ownership.Completion call encoded) ←
         try
-          finishedOwner? owner
+          runtime.completed owner
         catch _ =>
           pure none
       let result ← match completed with
-        | some completed => pure (decodeOwnedResult decode completed)
+        | some completed => pure (decodeOwnedResult decode completed.val)
         | none => do
-            try
-              primitives.cancel call
-            catch _ =>
-              pure ()
-            let joined : Option (Except Error ByteArray) ←
+            let committed ← try runtime.cancelIfActive call catch _ => pure false
+            let joined : Option (Ownership.Completion call encoded) ←
               try
-                some <$> await owner
+                some <$> runtime.join owner
               catch _ =>
                 pure none
-            pure (resultAfterLocalCancellation .ownerCancelled decode joined)
+            pure (resultAfterLocalCancellation committed .ownerCancelled decode joined)
       match result with
       | .error .cleanupUncertain => pure (.error .cleanupUncertain)
       | .error .actionFailed => pure (.error .actionFailed)
@@ -589,6 +924,446 @@ def unaryWithCancellationAndPermit
           match disarmFailure with
           | some error => throw error
           | none => pure result
+
+namespace Lifecycle
+
+namespace Owned
+
+inductive Command (Handle : Type) where
+  | disarm (deadline : ArmedDeadline)
+  | spawn (call : Handle) (request : ByteArray)
+  | cancel (call : Handle)
+  | cancelIfActive (call : Handle)
+  | finish (call : Handle)
+  | race (call : Handle) (request : ByteArray)
+      (owner : AsyncTask (Ownership.Completion call request))
+      (deadline : ArmedDeadline) (cancellation : Option Cancellation)
+  | completed (call : Handle) (request : ByteArray)
+      (owner : AsyncTask (Ownership.Completion call request))
+  | join (call : Handle) (request : ByteArray)
+      (owner : AsyncTask (Ownership.Completion call request))
+
+@[expose] def Command.Return : Command Handle → Type
+  | .disarm _ | .cancel _ => Unit
+  | .cancelIfActive _ => Bool
+  | .spawn call request => AsyncTask (Ownership.Completion call request)
+  | .finish _ => Except Grpc.Status
+      (Grpc.Status × _root_.Http2.Headers × _root_.Http2.Headers)
+  | .race call request _ _ _ => OwnerRace (Ownership.Completion call request)
+  | .completed call request _ => Option (Ownership.Completion call request)
+  | .join call request _ => Ownership.Completion call request
+
+@[expose] def Outcome (command : Command Handle) : Type := Except IO.Error command.Return
+
+abbrev Program (Handle α : Type) := Execution.Program (Command Handle) Outcome α
+private abbrev M (Handle α : Type) := ExceptT IO.Error (Program Handle) α
+
+private def perform (command : Command Handle) : M Handle command.Return :=
+  ExceptT.mk (.call command .done)
+
+private def runtime : OwnedRuntime (M Handle) Handle where
+  disarm deadline := perform (.disarm deadline)
+  spawn call request := perform (.spawn call request)
+  cancel call := perform (.cancel call)
+  cancelIfActive call := perform (.cancelIfActive call)
+  finish call := perform (.finish call)
+  race := fun {call} {request} owner deadline cancellation =>
+    perform (.race call request owner deadline cancellation)
+  completed := fun {call} {request} owner => perform (.completed call request owner)
+  join := fun {call} {request} owner => perform (.join call request owner)
+
+/-- Post-start execution has no start instruction. It owns the existing call
+through task startup, selection, joining, timer cleanup, and caught exceptions. -/
+def program (call : Handle) (request : ByteArray) (deadline : ArmedDeadline)
+    (cancellation : Option Cancellation) (decode : ByteArray → Except δ Response) :
+    Program Handle (Except IO.Error (Except Error Response)) :=
+  (ownedInvocation runtime call request deadline cancellation decode).run
+
+/-- Evidence names both the spawned task and the join of that same task. The
+local origin comes from a normally returned atomic cancellation commit. -/
+def CancelledAndJoined (call : Handle) (request : ByteArray)
+    (trace : List (Execution.Event (Command Handle) Outcome)) : Prop :=
+  ∃ owner completion,
+    (⟨.spawn call request, .ok owner⟩ : Execution.Event (Command Handle) Outcome) ∈ trace ∧
+    (⟨.cancelIfActive call, .ok true⟩ : Execution.Event (Command Handle) Outcome) ∈ trace ∧
+    (⟨.join call request owner, .ok completion⟩ : Execution.Event (Command Handle) Outcome) ∈ trace ∧
+    completion.val ≠ .error .cleanupUncertain
+
+private theorem cancelledAndJoined_of_result
+    {Handle : Type} {call : Handle} {request : ByteArray}
+    {trace : List (Execution.Event (Command Handle) Outcome)}
+    (owner : AsyncTask (Ownership.Completion call request))
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (requested observed : Error)
+    (isLocal : observed = .ownerCancelled ∨ observed = .localDeadlineExceeded)
+    (committed : Bool)
+    (result : resultAfterLocalCancellation committed requested decode (some completion) =
+      .error observed)
+    (spawned : (⟨.spawn call request, .ok owner⟩ : Execution.Event (Command Handle) Outcome) ∈ trace)
+    (cancelled : committed = true →
+      (⟨.cancelIfActive call, .ok true⟩ : Execution.Event (Command Handle) Outcome) ∈ trace)
+    (joined : (⟨.join call request owner, .ok completion⟩ : Execution.Event (Command Handle) Outcome) ∈ trace) :
+    CancelledAndJoined call request trace :=
+  ⟨owner, completion, spawned,
+    cancelled (local_result_requires_commit completion decode requested observed isLocal committed result),
+    joined, local_result_owner_certain completion decode requested observed isLocal committed result⟩
+
+set_option maxHeartbeats 2000000 in
+private theorem program_local_checked (call : Handle) (request : ByteArray)
+    (deadline : ArmedDeadline) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (localError : Error)
+    (isLocal : localError = .ownerCancelled ∨ localError = .localDeadlineExceeded) :
+    (program call request deadline cancellation decode).TraceChecks
+      (fun trace result => result = .ok (.error localError) →
+        CancelledAndJoined call request trace) [] := by
+  simp only [program, ownedInvocation, runtime, perform, ExceptT.run, ExceptT.mk,
+    bind, ExceptT.bind, ExceptT.bindCont, pure, ExceptT.pure, tryCatch, tryCatchThe,
+    MonadExceptOf.tryCatch, ExceptT.tryCatch, throw, throwThe, MonadExceptOf.throw,
+    Execution.Program.bind]
+  repeat' first
+    | solve | simp_all [Execution.Program.TraceChecks, ExceptT.bindCont,
+        Execution.Program.bind, CancelledAndJoined, pure, bind, Functor.map, ExceptT.map]
+    | solve
+      | intro impossible
+        exact False.elim (decodeOwnedResult_not_local _ decode localError isLocal impossible)
+    | solve | rcases isLocal with rfl | rfl <;> simp_all
+    | intro outcome; cases outcome
+    | split
+    | simp_all [Execution.Program.TraceChecks, ExceptT.bindCont, Execution.Program.bind,
+        pure, bind, Functor.map, ExceptT.map]
+  all_goals
+    intro returned
+    apply cancelledAndJoined_of_result _ _ decode _ localError isLocal _ returned
+    · exact List.Mem.head _
+    · intro committed; simp_all
+    · simp_all
+
+/-- Once a call is admitted, an ordinary local cancellation/deadline result
+requires an actual cancellation commit and a successful join of the exact
+task spawned for that same call and encoded request. A thrown join cannot
+produce this result. Terminal-result precedence is defined by that commit,
+not by the selector wake order or peer-controlled status text. -/
+theorem local_result_cancelled_and_joined
+    {Handle Response δ : Type} {call : Handle} {request : ByteArray}
+    {deadline : ArmedDeadline} {cancellation : Option Cancellation}
+    {decode : ByteArray → Except δ Response} {localError : Error}
+    {trace : List (Execution.Event (Command Handle) Outcome)}
+    (isLocal : localError = .ownerCancelled ∨ localError = .localDeadlineExceeded)
+    (executed : Execution.Executes (program call request deadline cancellation decode)
+      trace (.ok (.error localError))) : CancelledAndJoined call request trace := by
+  have checked := Execution.traceChecks_result
+    (program_local_checked call request deadline cancellation decode localError isLocal) executed
+  exact checked rfl
+
+def OwnerReturned {call : Handle} {request : ByteArray}
+    (owner : AsyncTask (Ownership.Completion call request))
+    (deadline : ArmedDeadline) (cancellation : Option Cancellation)
+    (completion : Ownership.Completion call request)
+    (trace : List (Execution.Event (Command Handle) Outcome)) : Prop :=
+  (⟨.race call request owner deadline cancellation, .ok (.completed completion)⟩ :
+    Execution.Event (Command Handle) Outcome) ∈ trace ∨
+  (⟨.completed call request owner, .ok (some completion)⟩ :
+    Execution.Event (Command Handle) Outcome) ∈ trace ∨
+  (⟨.join call request owner, .ok completion⟩ :
+    Execution.Event (Command Handle) Outcome) ∈ trace
+
+def SuccessfulOwner (call : Handle) (request : ByteArray) (deadline : ArmedDeadline)
+    (cancellation : Option Cancellation) (decode : ByteArray → Except δ Response)
+    (response : Response) (trace : List (Execution.Event (Command Handle) Outcome)) : Prop :=
+  ∃ owner completion bytes,
+    (⟨.spawn call request, .ok owner⟩ : Execution.Event (Command Handle) Outcome) ∈ trace ∧
+    OwnerReturned owner deadline cancellation completion trace ∧
+    completion.val = .ok bytes ∧ decode bytes = .ok response
+
+private theorem successfulOwner_of_result
+    {Handle : Type} {call : Handle} {request : ByteArray}
+    {deadline : ArmedDeadline} {cancellation : Option Cancellation}
+    {trace : List (Execution.Event (Command Handle) Outcome)}
+    (owner : AsyncTask (Ownership.Completion call request))
+    (completion : Ownership.Completion call request)
+    (decode : ByteArray → Except δ Response) (response : Response)
+    (success : decodeOwnedResult decode completion.val = .ok response)
+    (spawned : (⟨.spawn call request, .ok owner⟩ : Execution.Event (Command Handle) Outcome) ∈ trace)
+    (observed : OwnerReturned owner deadline cancellation completion trace) :
+    SuccessfulOwner call request deadline cancellation decode response trace := by
+  obtain ⟨bytes, owned, decoded⟩ := decodeOwnedResult_success completion decode success
+  exact ⟨owner, completion, bytes, spawned, observed, owned, decoded⟩
+
+set_option maxHeartbeats 2000000 in
+private theorem program_success_checked (call : Handle) (request : ByteArray)
+    (deadline : ArmedDeadline) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (response : Response) :
+    (program call request deadline cancellation decode).TraceChecks
+      (fun trace result => result = .ok (.ok response) →
+        SuccessfulOwner call request deadline cancellation decode response trace) [] := by
+  simp only [program, ownedInvocation, runtime, perform, ExceptT.run, ExceptT.mk,
+    bind, ExceptT.bind, ExceptT.bindCont, pure, ExceptT.pure, tryCatch, tryCatchThe,
+    MonadExceptOf.tryCatch, ExceptT.tryCatch, throw, throwThe, MonadExceptOf.throw,
+    Execution.Program.bind]
+  repeat' first
+    | solve | simp_all [Execution.Program.TraceChecks, ExceptT.bindCont,
+        Execution.Program.bind, pure, bind, Functor.map, ExceptT.map]
+    | intro outcome; cases outcome
+    | split
+    | simp_all [Execution.Program.TraceChecks, ExceptT.bindCont, Execution.Program.bind,
+        pure, bind, Functor.map, ExceptT.map]
+  all_goals
+    intro returned
+    try simp only [resultAfterLocalCancellation_success_iff] at returned
+    apply successfulOwner_of_result _ _ decode response returned
+    · exact List.Mem.head _
+    · simp [OwnerReturned]
+
+/-- A decoded success is the exact successful output of the task spawned for
+this call/request. Its primitive certificate supplies one response, successful
+terminal status, and terminal finish before decoding. -/
+theorem success_has_exact_owner
+    {Handle Response δ : Type} {call : Handle} {request : ByteArray}
+    {deadline : ArmedDeadline} {cancellation : Option Cancellation}
+    {decode : ByteArray → Except δ Response} {response : Response}
+    {trace : List (Execution.Event (Command Handle) Outcome)}
+    (executed : Execution.Executes (program call request deadline cancellation decode)
+      trace (.ok (.ok response))) :
+    SuccessfulOwner call request deadline cancellation decode response trace := by
+  have checked := Execution.traceChecks_result
+    (program_success_checked call request deadline cancellation decode response) executed
+  exact checked rfl
+
+@[expose] def Completion (call : Handle) (request : ByteArray) (deadline : ArmedDeadline)
+    (cancellation : Option Cancellation) (decode : ByteArray → Except δ Response) :=
+  { result : Except Error Response // ∃ trace,
+    Execution.Executes (program call request deadline cancellation decode) trace (.ok result) }
+
+private def invoke (primitives : Primitives Handle)
+    (command : Command Handle) : Async (Outcome command) := do
+  try
+    match command with
+    | .disarm deadline => pure (.ok (← deadline.disarm))
+    | .spawn call request => pure (.ok (← async (ownUnaryCall primitives call request)))
+    | .cancel call => pure (.ok (← primitives.cancel call))
+    | .cancelIfActive call => pure (.ok (← primitives.cancelIfActive call))
+    | .finish call => pure (.ok (← primitives.finish call))
+    | .race _ _ owner deadline cancellation =>
+        pure (.ok (← raceOwner owner deadline.selector cancellation))
+    | .completed _ _ owner => pure (.ok (← finishedOwner? owner))
+    | .join _ _ owner => pure (.ok (← await owner))
+  catch error => pure (.error error)
+
+private def run (primitives : Primitives Handle) (call : Handle) (request : ByteArray)
+    (deadline : ArmedDeadline) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) :
+    Async (Completion call request deadline cancellation decode) := do
+  let completion ← (program call request deadline cancellation decode).interpret (invoke primitives)
+  match completion with
+  | ⟨.ok result, proof⟩ => pure ⟨result, proof⟩
+  | ⟨.error error, _⟩ => throw error
+
+end Owned
+
+inductive Command (Handle : Type) where
+  | isCancelled (cancellation : Cancellation)
+  | permit
+  | arm (milliseconds : Nat)
+  | disarm (deadline : ArmedDeadline)
+  | start (milliseconds : Nat)
+  | settle (call : Handle) (request : ByteArray) (deadline : ArmedDeadline)
+
+@[expose] def Command.Return (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) : Command Handle → Type
+  | .isCancelled _ => Bool
+  | .permit => Option Nat
+  | .arm _ => ArmedDeadline
+  | .disarm _ => Unit
+  | .start _ => Except Grpc.Status Handle
+  | .settle call request deadline => Owned.Completion call request deadline cancellation decode
+
+@[expose] def Outcome (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (command : Command Handle) : Type :=
+  Except IO.Error (command.Return cancellation decode)
+
+abbrev Program (Handle : Type) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (α : Type) :=
+  Execution.Program (Command Handle) (Outcome cancellation decode) α
+
+private abbrev ResultProgram (Handle : Type) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) :=
+  Program Handle cancellation decode (Except IO.Error (Except Error Response))
+
+private def checkCancellation (cancellation : Option Cancellation)
+    (onCancelled next : ResultProgram Handle cancellation decode) :
+    ResultProgram Handle cancellation decode :=
+  match cancellation with
+  | none => next
+  | some token => .call (.isCancelled token) fun
+      | .error error => .done (.error error)
+      | .ok true => onCancelled
+      | .ok false => next
+
+private def startProgram (Handle : Type) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (request : ByteArray)
+    (milliseconds : Nat) (deadline : ArmedDeadline) : ResultProgram Handle cancellation decode :=
+  .call (.start milliseconds) fun
+    | .error error => .call (.disarm deadline) fun _ => .done (.error error)
+    | .ok (.error status) => .call (.disarm deadline) fun
+        | .error error => .done (.error error)
+        | .ok () => .done (.ok (.error (.rpc status)))
+    | .ok (.ok call) => .call (.settle call request deadline) fun
+        | .error error => .done (.error error)
+        | .ok completion => .done (.ok completion.val)
+
+private def armProgram (Handle : Type) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (request : ByteArray)
+    (milliseconds : Nat) : ResultProgram Handle cancellation decode :=
+  .call (.arm milliseconds) fun
+    | .error error => .done (.error error)
+    | .ok deadline => checkCancellation cancellation
+        (.call (.disarm deadline) fun
+          | .error error => .done (.error error)
+          | .ok () => .done (.ok (.error .ownerCancelled)))
+        (startProgram Handle cancellation decode request milliseconds deadline)
+
+private def claimProgram (Handle : Type) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (request : ByteArray) :
+    ResultProgram Handle cancellation decode :=
+  .call .permit fun
+    | .error error => .done (.error error)
+    | .ok none | .ok (some 0) => .done (.ok (.error .ownerCancelled))
+    | .ok (some (milliseconds + 1)) =>
+        armProgram Handle cancellation decode request (milliseconds + 1)
+
+/-- Admission performs at most one transport start and then transfers that
+exact call to the certified post-start program. -/
+def program (Handle : Type) (cancellation : Option Cancellation)
+    (encode : Request → Except ε ByteArray)
+    (decode : ByteArray → Except δ Response) (request : Request) :
+    Program Handle cancellation decode (Except IO.Error (Except Error Response)) :=
+  match encode request with
+  | .error _ => checkCancellation cancellation
+      (.done (.ok (.error .ownerCancelled))) (.done (.ok (.error .requestEncoding)))
+  | .ok encoded => checkCancellation cancellation
+      (.done (.ok (.error .ownerCancelled)))
+      (claimProgram Handle cancellation decode encoded)
+
+def Command.startCost : Command Handle → Nat
+  | .start _ => 1
+  | _ => 0
+
+private theorem program_startBound (cancellation : Option Cancellation)
+    (encode : Request → Except ε ByteArray)
+    (decode : ByteArray → Except δ Response) (request : Request) :
+    (program Handle cancellation encode decode request).CostBound Command.startCost 1 := by
+  cases cancellation <;>
+    simp only [program, checkCancellation, claimProgram, armProgram, startProgram]
+  repeat' first
+    | solve | simp_all [Execution.Program.CostBound, Command.startCost]
+    | intro outcome; cases outcome
+    | split
+    | constructor
+    | simp_all [Execution.Program.CostBound, Command.startCost]
+
+/-- Every completed admission trace invokes the supplied transport starter at
+most once. The post-start instruction set has no start operation. -/
+theorem starts_at_most_once
+    {Handle Request Response ε δ : Type} {cancellation : Option Cancellation}
+    {encode : Request → Except ε ByteArray} {decode : ByteArray → Except δ Response}
+    {request : Request}
+    {trace : List (Execution.Event (Command Handle) (Outcome cancellation decode))}
+    {result : Except IO.Error (Except Error Response)}
+    (executed : Execution.Executes
+      (program Handle cancellation encode decode request) trace result) :
+    (trace.map fun event => event.command.startCost).sum ≤ 1 :=
+  Execution.costBound_trace (program_startBound cancellation encode decode request) executed
+
+/-- The same no-replay bound holds before completion, including invocations
+whose primitive or owner task never returns. -/
+theorem starts_at_most_once_prefix
+    {Handle Request Response ε δ : Type} {cancellation : Option Cancellation}
+    {encode : Request → Except ε ByteArray} {decode : ByteArray → Except δ Response}
+    {request : Request}
+    {before : List (Execution.Event (Command Handle) (Outcome cancellation decode))}
+    {command : Command Handle}
+    (invoked : Execution.Invokes
+      (program Handle cancellation encode decode request) before command) :
+    (before.map fun event => event.command.startCost).sum + command.startCost ≤ 1 :=
+  Execution.costBound_invokes (program_startBound cancellation encode decode request) invoked
+
+/-- An admitted ordinary return retains the post-start certificate for the
+same handle returned by the actual start instruction. -/
+def AdmittedReturn (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response)
+    (trace : List (Execution.Event (Command Handle) (Outcome cancellation decode)))
+    (result : Except Error Response) : Prop :=
+  ∀ milliseconds (call : Handle),
+    (⟨.start milliseconds, .ok (.ok call)⟩ :
+      Execution.Event (Command Handle) (Outcome cancellation decode)) ∈ trace →
+    ∃ bytes deadline, ∃ (completion : Owned.Completion call bytes deadline cancellation decode),
+      (⟨.settle call bytes deadline, .ok completion⟩ :
+        Execution.Event (Command Handle) (Outcome cancellation decode)) ∈ trace ∧
+      result = completion.val
+
+set_option maxHeartbeats 2000000 in
+private theorem program_admittedReturn (cancellation : Option Cancellation)
+    (encode : Request → Except ε ByteArray) (decode : ByteArray → Except δ Response)
+    (request : Request) :
+    (program Handle cancellation encode decode request).TraceChecks
+      (fun trace result => ∀ value, result = .ok value → AdmittedReturn cancellation decode trace value)
+      [] := by
+  cases cancellation <;>
+    simp only [program, checkCancellation, claimProgram, armProgram, startProgram]
+  repeat' first
+    | solve | simp_all [Execution.Program.TraceChecks, AdmittedReturn, heq_eq_eq]
+    | apply Execution.traceChecks_call; intro outcome; cases outcome
+    | split
+    | simp_all [Execution.Program.TraceChecks]
+
+  all_goals simp_all [AdmittedReturn, heq_eq_eq]
+  all_goals
+    intro milliseconds call sameMilliseconds returned
+    have same := eq_of_heq returned
+    cases same <;>
+      exact ⟨_, _, _, ⟨⟨rfl, rfl, rfl⟩, .rfl⟩, rfl⟩
+
+theorem admitted_return_has_exact_completion
+    {Handle Request Response ε δ : Type} {cancellation : Option Cancellation}
+    {encode : Request → Except ε ByteArray} {decode : ByteArray → Except δ Response}
+    {request : Request} {result : Except Error Response}
+    {trace : List (Execution.Event (Command Handle) (Outcome cancellation decode))}
+    (executed : Execution.Executes (program Handle cancellation encode decode request)
+      trace (.ok result)) : AdmittedReturn cancellation decode trace result := by
+  have checked := Execution.traceChecks_result
+    (program_admittedReturn cancellation encode decode request) executed
+  exact checked result rfl
+
+private def invoke (deadlineDriver : DeadlineDriver) (cancellation : Option Cancellation)
+    (decode : ByteArray → Except δ Response) (permit : Async (Option Nat))
+    (start : Nat → Async (Except Grpc.Status Handle)) (primitives : Primitives Handle)
+    (command : Command Handle) : Async (Outcome cancellation decode command) := do
+  try
+    match command with
+    | .isCancelled token => pure (.ok (← token.isCancelled))
+    | .permit => pure (.ok (← permit))
+    | .arm milliseconds => pure (.ok (← deadlineDriver.arm milliseconds))
+    | .disarm deadline => pure (.ok (← deadline.disarm))
+    | .start milliseconds => pure (.ok (← start milliseconds))
+    | .settle call request deadline =>
+        pure (.ok (← Owned.run primitives call request deadline cancellation decode))
+  catch error => pure (.error error)
+
+end Lifecycle
+
+/-- Execute the certified invocation program with the production asynchronous
+operations. The evidence is erased; public results and exceptions are retained. -/
+def unaryWithCancellationAndPermit
+    (deadlineDriver : DeadlineDriver) (cancellation : Option Cancellation)
+    (permit : Async (Option Nat)) (start : Nat → Async (Except Grpc.Status Handle))
+    (primitives : Primitives Handle) (encode : Request → Except ε ByteArray)
+    (decode : ByteArray → Except δ Response) (request : Request) :
+    Async (Except Error Response) := do
+  let completion ← (Lifecycle.program Handle cancellation encode decode request).interpret
+    (Lifecycle.invoke deadlineDriver cancellation decode permit start primitives)
+  match completion.val with
+  | .ok result => pure result
+  | .error error => throw error
 
 /--
 Transport-injected unary lifecycle used by deterministic tests.  Its permit

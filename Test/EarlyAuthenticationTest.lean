@@ -102,6 +102,8 @@ def authenticatedRegistry (authorizerCalls handlerCalls : IO.Ref Nat) : Registry
         match entry with
         | { shape := .unary, .. } =>
             pure (.accept fun request => do
+              unless request.metadata == metadata do
+                throw (Status.internal "dispatch changed authorized metadata")
               handlerCalls.modify (fun calls => calls + 1)
               pure {
                 data := request.data.push (UInt8.ofNat resolvedSession)
@@ -126,6 +128,8 @@ def pureAuthenticatedRegistry (handlerCalls : IO.Ref Nat) : Registry :=
           match entry with
           | { shape := .unary, .. } =>
               .accept fun request => do
+                unless request.metadata == requestMetadata do
+                  throw (Status.internal "dispatch changed authorized metadata")
                 handlerCalls.modify (fun calls => calls + 1)
                 pure {
                   data := request.data.push (UInt8.ofNat resolvedSession)
@@ -187,11 +191,13 @@ def readyState : Grpc.Http2.Connection.State :=
     }
   }
 
-def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
+def testOwnedConnectionAuthenticatesAtHeaders (purePolicy : Bool := false) : IO Unit := do
   let rejectedAuthorizerCalls ← IO.mkRef 0
   let rejectedHandlerCalls ← IO.mkRef 0
   let rejectedRegistry :=
-    authenticatedRegistry rejectedAuthorizerCalls rejectedHandlerCalls
+    if purePolicy then pureAuthenticatedRegistry rejectedHandlerCalls
+    else authenticatedRegistry rejectedAuthorizerCalls rejectedHandlerCalls
+  let expectedAuthorizerCalls := if purePolicy then 0 else 1
   let rejectedState ← Std.Mutex.new readyState
   let rejectedFrames ← IO.mkRef (#[] : Array _root_.Http2.Frame)
   let emitRejected (frames : Array _root_.Http2.Frame) : IO Unit :=
@@ -204,7 +210,7 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
       Grpc.Http2.Connection.processBytesSharedWithOwned
         rejectedRegistry rejectedState headerWire emitRejected)
       "reject unauthenticated request headers"
-    expect ((← rejectedAuthorizerCalls.get) == 1)
+    expect ((← rejectedAuthorizerCalls.get) == expectedAuthorizerCalls)
       "request-header authorizer did not run exactly once at END_HEADERS"
     expect ((← rejectedHandlerCalls.get) == 0)
       "unauthenticated headers entered the RPC handler"
@@ -221,7 +227,7 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
       Grpc.Http2.Connection.processBytesSharedWithOwned
         rejectedRegistry rejectedState bodyWire emitRejected)
       "drain rejected request body"
-    expect ((← rejectedAuthorizerCalls.get) == 1)
+    expect ((← rejectedAuthorizerCalls.get) == expectedAuthorizerCalls)
       "draining rejected DATA repeated request authorization"
     expect ((← rejectedHandlerCalls.get) == 0)
       "rejected request DATA reached the RPC handler"
@@ -235,7 +241,8 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
   let acceptedAuthorizerCalls ← IO.mkRef 0
   let acceptedHandlerCalls ← IO.mkRef 0
   let acceptedRegistry :=
-    authenticatedRegistry acceptedAuthorizerCalls acceptedHandlerCalls
+    if purePolicy then pureAuthenticatedRegistry acceptedHandlerCalls
+    else authenticatedRegistry acceptedAuthorizerCalls acceptedHandlerCalls
   let acceptedState ← Std.Mutex.new readyState
   let acceptedFrames ← IO.mkRef (#[] : Array _root_.Http2.Frame)
   let emitAccepted (frames : Array _root_.Http2.Frame) : IO Unit :=
@@ -248,7 +255,7 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
       Grpc.Http2.Connection.processBytesSharedWithOwned
         acceptedRegistry acceptedState headerWire emitAccepted)
       "authorize request headers"
-    expect ((← acceptedAuthorizerCalls.get) == 1)
+    expect ((← acceptedAuthorizerCalls.get) == expectedAuthorizerCalls)
       "accepted request was not authorized exactly once"
     expect ((← acceptedHandlerCalls.get) == 0)
       "accepted headers entered the handler before request DATA"
@@ -266,7 +273,7 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
         frame.header.frameType == .headers
           && _root_.Http2.FrameFlag.has frame.header.flags
             _root_.Http2.FrameFlag.endStream
-    expect ((← acceptedAuthorizerCalls.get) == 1)
+    expect ((← acceptedAuthorizerCalls.get) == expectedAuthorizerCalls)
       "authenticated dispatch repeated header authorization"
     expect ((← acceptedHandlerCalls.get) == 1)
       "authenticated dispatch did not use the captured handler capability"
@@ -279,9 +286,47 @@ def testOwnedConnectionAuthenticatesAtHeaders : IO Unit := do
     discard <| Std.Async.Async.block <|
       Grpc.Http2.Connection.cancelActiveSharedOwned acceptedState
 
+/-- An authorization callback may return acceptance after its stream owner has
+been cancelled; the managed commit must not publish that capability. -/
+def testLateAuthorizationCannotDispatch : IO Unit := do
+  let started ← IO.mkRef false
+  let release ← IO.mkRef false
+  let handlerCalls ← IO.mkRef 0
+  let registry := (Registry.empty.registerUnary method fun request => do
+      handlerCalls.modify (· + 1)
+      pure { data := request.data, status := Status.ok }).withRequestHeaderAuthorizer
+    fun entry _ => do
+      started.set true
+      waitUntil "authorization release timed out" 5000 release.get
+      pure (.accept entry.handler)
+  let state ← Std.Mutex.new readyState
+  let emitted ← IO.mkRef (#[] : Array _root_.Http2.Frame)
+  let emit (frames : Array _root_.Http2.Frame) : IO Unit :=
+    emitted.modify (·.append frames)
+  let headerWire ← expectOk (_root_.Http2.Frame.encode (← headersFrame none))
+    "encode delayed authorization headers"
+  let owner ← Std.Async.Async.toIO <|
+    Grpc.Http2.Connection.processBytesSharedWithOwned registry state headerWire emit
+  try
+    waitUntil "authorization did not start" 1000 started.get
+    Grpc.Http2.Connection.signalCancelActiveShared state
+    release.set true
+    discard <| expectOk (← Std.Async.Async.block <| Std.Async.Async.ofAsyncTask owner)
+      "finish cancelled authorization"
+    expect ((← handlerCalls.get) == 0) "late authorization invoked a handler"
+    expect (← state.atomically do
+      pure ((← get).streams.all (fun stream => stream.authorization.isNone)))
+      "late authorization committed a dispatch capability"
+  finally
+    release.set true
+    discard <| Std.Async.Async.block <|
+      Grpc.Http2.Connection.cancelActiveSharedOwned state
+
 end Test.EarlyAuthentication
 
 def main : IO Unit := do
   Test.EarlyAuthentication.testAuthorizerInstallersAreLastWins
   Test.EarlyAuthentication.testOwnedConnectionAuthenticatesAtHeaders
+  Test.EarlyAuthentication.testOwnedConnectionAuthenticatesAtHeaders true
+  Test.EarlyAuthentication.testLateAuthorizationCannotDispatch
   IO.println "gRPC early-authentication tests passed"

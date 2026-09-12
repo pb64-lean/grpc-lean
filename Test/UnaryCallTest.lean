@@ -387,6 +387,10 @@ private def timeoutPrimitives : Primitives TimeoutCall where
   cancel := fun call => do
     record call.events "cancel"
     call.cancelled.resolve ()
+  cancelIfActive? := some fun call => do
+    record call.events "cancel"
+    call.cancelled.resolve ()
+    pure true
 
 private def testTimeoutCancelsAndJoinsCleanup : IO Unit := do
   let events ← IO.mkRef #[]
@@ -521,10 +525,7 @@ private def testDeadlineWinnerPreservesCompletedOwner : IO Unit := do
   expect (responseEvents.back? == some "finish")
     "completed response was returned before exact finish"
 
-  -- A completed peer cancellation remains exact RPC evidence. The byte-equal
-  -- `Grpc.Client` local-cancel sentinel is intentionally covered only where this
-  -- adapter really issued cancel: without a lower-level cancel disposition,
-  -- those two sources cannot be distinguished after the fact.
+  -- A completed peer cancellation remains exact RPC evidence.
   let peerStatus := Grpc.Status.cancelled "peer completed cancellation"
   let statusCall ← completionRaceCall (some peerStatus)
   let statusResult ← Async.block <| unaryWith RpcDeadline.default
@@ -542,6 +543,7 @@ private def testDeadlineWinnerPreservesCompletedOwner : IO Unit := do
 private inductive PostCancelOutcome where
   | response (value : ByteArray)
   | status (value : Grpc.Status)
+  | trailers (status : Grpc.Status)
   | actionFailed
   | cleanupUncertain
 
@@ -573,6 +575,7 @@ private def postCancelPrimitives : Primitives PostCancelCall where
     | .response value =>
         if receive == 0 then pure (.ok (some value)) else pure (.ok none)
     | .status status => pure (.error status)
+    | .trailers _ => pure (.ok none)
     | .actionFailed | .cleanupUncertain =>
         throw (IO.userError "injected post-cancel receive failure")
   finish := fun call => do
@@ -603,8 +606,11 @@ private def runPostCancel
     receives := ← IO.mkRef 0
     cancels := ← IO.mkRef 0
     outcome
-    finishResult := .ok
-      (Grpc.Status.ok, _root_.Http2.Headers.empty, _root_.Http2.Headers.empty)
+    finishResult := match outcome with
+      | .trailers status => .ok (status, _root_.Http2.Headers.empty,
+          #[_root_.Http2.Header.of "grpc-status" (toString status.code.toNat),
+            _root_.Http2.Header.of "grpc-message" (Grpc.Percent.encode status.messageD)])
+      | _ => .ok (Grpc.Status.ok, _root_.Http2.Headers.empty, _root_.Http2.Headers.empty)
   }
   let deadlineDriver : DeadlineDriver := {
     arm := fun _ => pure {
@@ -623,6 +629,7 @@ private def runPostCancel
 private def testPostCancelOwnerEvidenceDominatesLocalDeadline : IO Unit := do
   for status in #[
       Grpc.Status.cancelled "peer cancelled concurrently",
+      Grpc.Status.cancelled "call cancelled locally",
       Grpc.Status.deadlineExceeded "peer deadline won concurrently",
       Grpc.Status.error .unavailable "connection failed concurrently"] do
     let (result, events) ← runPostCancel (.status status)
@@ -673,6 +680,19 @@ private def testPostCancelOwnerEvidenceDominatesLocalDeadline : IO Unit := do
   | .error .cleanupUncertain => pure ()
   | other =>
       fail s!"deadline disarm failure rewrote cleanup uncertainty: {repr other}"
+
+private def testPeerLocalSentinelBeforeOwnerCompletion : IO Unit := do
+  -- The peer's terminal trailers are fixed before the owner's receive is
+  -- released. Deadline selection attempts cancellation while that task is
+  -- still blocked; the fixture reports no local terminal-state commit.
+  let (result, events) ← runPostCancel (.trailers locallyCancelledStatus)
+  match result with
+  | .error (.rpc status none) =>
+      expect (status == locallyCancelledStatus)
+        "peer-controlled local-cancel text was relabelled as local cancellation"
+  | other => fail s!"peer sentinel race returned {repr other}"
+  expect (events.contains "cancel" && events.back? == some "finish")
+    "peer sentinel race did not join its exact terminal owner"
 
 private def testPostCancelPreservesPeerStatusDetails : IO Unit := do
   let events ← IO.mkRef #[]
@@ -1039,6 +1059,7 @@ def run : IO Unit := do
   testExternalCancellationCancelsAndJoinsCleanup
   testDeadlineWinnerPreservesCompletedOwner
   testPostCancelOwnerEvidenceDominatesLocalDeadline
+  testPeerLocalSentinelBeforeOwnerCompletion
   testPostCancelPreservesPeerStatusDetails
   testTimeoutDisarmFailureStillJoinsCleanup
   testSelectorFailureCancelsAndJoinsCleanup

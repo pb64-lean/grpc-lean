@@ -1,6 +1,7 @@
 module
 
 public import Grpc.Protocol
+public import Grpc.Execution
 import Std.Async.Timer
 
 public section
@@ -304,7 +305,8 @@ def usesEffectfulRequestHeaderResolution (registry : Registry)
   registry.customRequestHeaderAuthorizer ||
     entry.requestHeaderHandlerResolver.isEffectful
 
-private def interceptHandler (registry : Registry) (entry : MethodEntry)
+/-- Apply the registered shape-preserving wrappers to an accepted handler. -/
+def interceptHandler (registry : Registry) (entry : MethodEntry)
     (handler : Handler entry.shape) : Handler entry.shape :=
   registry.handlerInterceptors.foldl (fun handler interceptor =>
     interceptor entry handler) handler
@@ -342,22 +344,110 @@ def pureRequestHeaderAuthorizerFor? (registry : Registry) (entry : MethodEntry) 
         | .ok handler => registry.authorizePureResolvedHandler entry metadata handler
     | .effectful _ => none
 
+namespace Authorization
+
+inductive Command (entry : MethodEntry) where
+  | resolve (metadata : _root_.Http2.Headers)
+  | authorize (metadata : _root_.Http2.Headers) (resolved : Handler entry.shape)
+
+@[expose] def Command.Return (entry : MethodEntry) : Command entry → Type
+  | .resolve _ => Handler entry.shape
+  | .authorize _ _ => AuthorizationResult entry
+
+@[expose] def Outcome {entry : MethodEntry} (command : Command entry) :=
+  Except Status (command.Return entry)
+
+/-- This finite program is the managed header-authorization implementation.
+Both bounded-pure and effectful callbacks use the same ordered decisions. -/
+def program (registry : Registry) (entry : MethodEntry) (metadata : _root_.Http2.Headers) :
+    Execution.Program (Command entry) Outcome (Except Status (AuthorizationResult entry)) :=
+  .call (.resolve metadata) fun
+    | .error status => .done (.error status)
+    | .ok resolved => .call (.authorize metadata resolved) fun
+        | .error status => .done (.error status)
+        | .ok (.reject status) => .done (.ok (.reject status))
+        | .ok (.accept selected) =>
+            .done (.ok (.accept (registry.interceptHandler entry selected)))
+
+/-- Acceptance requires a successful actual resolver result followed by the
+global authorizer's acceptance of that resolved handler. Interceptors wrap
+exactly the accepted handler, and do not authorize a rejected request. -/
+theorem acceptance_trace {registry : Registry} {entry : MethodEntry}
+    {metadata : _root_.Http2.Headers}
+    {trace : List (Execution.Event (Command entry) Outcome)}
+    {handler : Handler entry.shape}
+    (executed : Execution.Executes (program registry entry metadata) trace (.ok (.accept handler))) :
+    ∃ resolved selected, handler = interceptHandler registry entry selected ∧
+      trace = [⟨.resolve metadata, .ok resolved⟩,
+        ⟨.authorize metadata resolved, .ok (.accept selected)⟩] := by
+  cases executed with
+  | call executed =>
+      rename_i outcome
+      cases outcome with
+      | error status => cases executed
+      | ok resolved =>
+          cases executed with
+          | call executed =>
+              rename_i outcome
+              cases outcome with
+              | error status => cases executed
+              | ok decision =>
+                  cases decision with
+                  | reject status => cases executed
+                  | accept selected =>
+                      cases executed
+                      exact ⟨resolved, selected, rfl, rfl⟩
+
+@[expose] def Decision (registry : Registry) (entry : MethodEntry)
+    (metadata : _root_.Http2.Headers) :=
+  { decision : AuthorizationResult entry // ∃ trace,
+    Execution.Executes (program registry entry metadata) trace (.ok decision) }
+
+/-- An accepted handler with its exact request-header decision evidence. -/
+structure Acceptance (registry : Registry) (entry : MethodEntry)
+    (metadata : _root_.Http2.Headers) where
+  handler : Handler entry.shape
+  accepted : ∃ trace, Execution.Executes (program registry entry metadata)
+    trace (.ok (.accept handler))
+
+@[expose] def Acceptance.selectedEntry (acceptance : Acceptance registry entry metadata) : MethodEntry :=
+  { entry with handler := acceptance.handler, requestHeaderHandlerResolver := .registered }
+
+private def invoke (registry : Registry) (entry : MethodEntry)
+    (command : Command entry) : IO (Outcome command) :=
+  match command with
+  | .resolve metadata =>
+      match entry.requestHeaderHandlerResolver with
+      | .registered => pure (.ok entry.handler)
+      | .pure resolve => pure (resolve metadata)
+      | .effectful resolve => (resolve metadata).run
+  | .authorize metadata resolved =>
+      do
+        match ← (registry.requestHeaderAuthorizer
+            { entry with handler := resolved, requestHeaderHandlerResolver := .registered }
+            metadata).run with
+        | .error status => pure (.error status)
+        | .ok (.reject status) => pure (.ok (.reject status))
+        | .ok (.accept selected) => pure (.ok (.accept selected))
+
+end Authorization
+
+/-- The returned decision carries erased evidence of actual callback outcomes.
+Callback exceptions and rejected resolutions do not create an acceptance. -/
+def authorizeRequestHeadersCertified (registry : Registry) (entry : MethodEntry)
+    (metadata : _root_.Http2.Headers) : GrpcM (Authorization.Decision registry entry metadata) :=
+  ExceptT.mk do
+    let completion ← (Authorization.program registry entry metadata).interpret
+      (Authorization.invoke registry entry)
+    match completion with
+    | ⟨.error status, _⟩ => pure (.error status)
+    | ⟨.ok decision, evidence⟩ => pure (.ok ⟨decision, evidence⟩)
+
 /-- Run method-local handler resolution, the installed registry-global
 authorizer, and effective-handler interceptors, in that order. -/
 def authorizeRequestHeaders (registry : Registry) (entry : MethodEntry)
     (metadata : _root_.Http2.Headers) : GrpcM (AuthorizationResult entry) := do
-  let handler ← match entry.requestHeaderHandlerResolver with
-    | .registered => pure entry.handler
-    | .pure resolve => GrpcM.ofExcept (resolve metadata)
-    | .effectful resolve => resolve metadata
-  let resolvedEntry := {
-    entry with
-    handler := handler
-    requestHeaderHandlerResolver := .registered
-  }
-  match ← registry.requestHeaderAuthorizer resolvedEntry metadata with
-  | .reject status => pure (.reject status)
-  | .accept handler => pure (.accept (registry.interceptHandler entry handler))
+  pure (← registry.authorizeRequestHeadersCertified entry metadata).val
 
 /-- Append a method entry.  Lookup is first-match-wins, so an entry never
 shadows an earlier registration of the same name. -/

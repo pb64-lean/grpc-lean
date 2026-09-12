@@ -429,8 +429,9 @@ by `.bazelignore`.
 
 ## Assurance and trusted boundary
 
-No end-to-end formal-verification claim is made for this repository: nothing
-is proved about the socket-facing I/O, concurrency, or the server loop.
+No end-to-end formal-verification claim is made for the socket-facing I/O or
+server loop. The finite authorization and unary ownership programs below are
+also their production implementations, interpreted with actual effect results.
 
 Everything claimed below is checked mechanically, not by review. `bazel test
 //:grpc_assurance` audits the compiled `Environment` while the test binary is
@@ -467,9 +468,34 @@ Verified scope:
     message and its wire prefix fit in the configured receive window before
     credit-on-consume replenishment is required.
 
-  Not proved here: the `IO` halves of request authorization and dispatch, and
-  everything above the pure
-  gRPC codecs and transition functions.
+- **Managed execution contracts**: `Registry.Authorization.acceptance_trace`
+  requires resolver success followed by global authorization of the same
+  metadata and exact selected handler. `Authorization.committed_authorized`
+  and `dispatch_enter_requires_authorization` in `Grpc.Http2.Connection` carry
+  that result through ticket/metadata-checked atomic commit and publication to
+  the actual handler-entry gate. `Authorization.Invocation.authorized` binds
+  the production dispatch runner to that exact handler and metadata; its inputs
+  cannot substitute either. Pure and effectful policies share this path.
+  Direct dispatch APIs and caller-fabricated connection state are outside this
+  managed-origin guarantee; resolver/authorizer effects are not handler events.
+  `UnaryCall.Ownership.success_trace` and `terminal_acknowledged` certify the
+  exact primitive call. `Lifecycle` bounds start/replay; its `Owned` contracts
+  tie successful decoding and ordinary local cancellation to the task actually
+  spawned for that call. Local cancellation requires `Call.cancelIfActive`'s
+  atomic commit, never status text alone, and joining that exact owner.
+
+  These safety contracts assume atomic mutex operations, faithful primitive
+  results, promise/task identity and joins, non-reused managed stream IDs, and
+  monotonic deadline/admission drivers. A normal `Primitives.finish` return,
+  including an error status, must acknowledge terminal transport ownership.
+  A failed task spawn must not leave a live owner without a returned handle.
+  A cancellation-origin callback may report `true` only for its actual local
+  terminal-state commit; the default reports no such evidence. The gate's
+  uncancelled read is handler admission; later cancellation races admitted
+  work. Erased execution evidence is constructed from actual callback outcomes;
+  it does not prove the OS, networking primitives, policy soundness, or fairness.
+  Nonterminating callbacks produce no completion. Eventual cleanup additionally
+  needs cooperative completion/fairness, not a hard native cancellation bound.
 - **C in the trusted computing base**: the only first-party C here is the zlib
   shim (`Zlib/shim/zlib_shim.c`, with an explicit output-size bound), which is
   what `//:grpc_assurance` confirms by allowing `@[extern]` only in

@@ -1276,18 +1276,38 @@ partial def finish (call : Call) : Async (Except Status (Status × _root_.Http2.
       awaitWaiter waiter
       finish call
 
-/-- Cancel the call locally and reset the stream on the server. -/
-def cancel (call : Call) : Async Unit := do
-  call.connection.state.atomically do
+/-- The local-cancellation transition is available only before either a
+failure or peer trailers have committed. Used under the connection mutex. -/
+def cancelRecord? (record : CallRecord) : Option CallRecord :=
+  if record.failure.isSome || record.trailers.isSome then none
+  else some { record with failure := some (Status.cancelled "call cancelled locally") }
+
+theorem cancelRecord?_committed {record next : CallRecord}
+    (committed : cancelRecord? record = some next) :
+    record.failure = none ∧ record.trailers = none ∧
+      next.streamId = record.streamId ∧
+      next.failure = some (Status.cancelled "call cancelled locally") := by
+  unfold cancelRecord? at committed
+  split at committed
+  · contradiction
+  · rename_i active
+    have active : record.failure = none ∧ record.trailers = none := by
+      cases hf : record.failure <;> cases ht : record.trailers <;> simp_all
+    cases Option.some.inj committed
+    exact ⟨active.1, active.2, rfl, rfl⟩
+
+/-- Cancel the exact still-active call and report whether this invocation
+committed local cancellation. Peer-terminal and retired calls return `false`;
+status text is not cancellation-origin evidence. -/
+def cancelIfActive (call : Call) : Async Bool := do
+  let committed ← call.connection.state.atomically do
     let state ← get
     match findCall? state.calls call.streamId with
-    | none => pure ()
+    | none => pure false
     | some record =>
-        if record.failure.isSome || record.trailers.isSome then
-          pure ()
-        else do
-          let record := { record with
-            failure := some (Status.cancelled "call cancelled locally") }
+        match cancelRecord? record with
+        | none => pure false
+        | some record => do
           match _root_.Http2.Connection.resetStream
               state.protocol call.streamId .cancel with
           | .error _ =>
@@ -1295,7 +1315,13 @@ def cancel (call : Call) : Async Unit := do
           | .ok (protocol, reset?) =>
               set { state with protocol, calls := replaceCall state.calls record }
               if let some reset := reset? then enqueueFrames call.connection #[reset]
+          pure true
   wake call.connection
+  pure committed
+
+/-- Cancel the call locally and reset the stream on the server. -/
+def cancel (call : Call) : Async Unit := do
+  discard <| cancelIfActive call
 
 end Call
 

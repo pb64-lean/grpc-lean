@@ -285,6 +285,215 @@ def shutdown (scheduler : DeadlineScheduler) : Std.Async.Async Unit := do
 
 end DeadlineScheduler
 
+namespace Authorization
+
+/-- The managed request selected before running any header callbacks. -/
+structure Context where
+  streamId : Nat
+  ticket : Nat
+  registry : Registry
+  entry : MethodEntry
+  metadata : _root_.Http2.Headers
+
+/-- Observations made together under the connection mutex at authorization
+commit. Ticket equality prevents an old callback from authorizing a new owner. -/
+structure CommitObservation where
+  closing : Bool
+  owned : Bool
+  cancelled : Bool
+  streamTicket : Option Nat
+  metadata : Option _root_.Http2.Headers
+
+@[expose] def CommitObservation.Allows (context : Context) (observation : CommitObservation) : Prop :=
+  observation.closing = false ∧ observation.owned = true ∧ observation.cancelled = false ∧
+    observation.streamTicket = some context.ticket ∧ observation.metadata = some context.metadata
+
+instance (context : Context) (observation : CommitObservation) :
+    Decidable (observation.Allows context) := by
+  exact inferInstanceAs (Decidable (observation.closing = false ∧ observation.owned = true ∧
+    observation.cancelled = false ∧ observation.streamTicket = some context.ticket ∧
+    observation.metadata = some context.metadata))
+
+/-- Production retains the accepted object and the guarded atomic commit
+together. Arbitrary caller-created state is not a managed request origin. -/
+structure Committed where
+  context : Context
+  acceptance : Registry.Authorization.Acceptance context.registry context.entry context.metadata
+  observation : CommitObservation
+  allowed : observation.Allows context
+
+def commit? (context : Context)
+    (acceptance : Registry.Authorization.Acceptance context.registry context.entry context.metadata)
+    (observation : CommitObservation) : Option Committed :=
+  if allowed : observation.Allows context then some ⟨context, acceptance, observation, allowed⟩
+  else none
+
+/-- A managed authorization commit proves the exact metadata, selected handler,
+and live ownership checks, independently of callback and OS termination. -/
+theorem committed_authorized (committed : Committed) :
+    committed.observation.Allows committed.context ∧
+      ∃ trace resolved selected,
+        Execution.Executes
+          (Registry.Authorization.program committed.context.registry committed.context.entry
+            committed.context.metadata) trace (.ok (.accept committed.acceptance.handler)) ∧
+        committed.acceptance.handler =
+          committed.context.registry.interceptHandler committed.context.entry selected ∧
+        trace = [⟨.resolve committed.context.metadata, .ok resolved⟩,
+          ⟨.authorize committed.context.metadata resolved, .ok (.accept selected)⟩] := by
+  obtain ⟨trace, accepted⟩ := committed.acceptance.accepted
+  obtain ⟨resolved, selected, handler, order⟩ := Registry.Authorization.acceptance_trace accepted
+  exact ⟨committed.allowed, trace, resolved, selected, accepted, handler, order⟩
+
+/-- The pending publication token was still owned when the exact handler task
+was installed. Stream identifiers are not reused by the managed HTTP/2 driver. -/
+structure Publication (committed : Committed) where
+  closing : Bool
+  ownsPublication : Bool
+  allowed : closing = false ∧ ownsPublication = true
+
+def publication? (committed : Committed) (closing owned : Bool) :
+    Option (Publication committed) :=
+  if allowed : closing = false ∧ owned = true then some ⟨closing, owned, allowed⟩ else none
+
+/-- Admission observed after publication, before entering managed dispatch. -/
+structure Admission (committed : Committed) where
+  publication : Publication committed
+  cancelled : Bool
+  notCancelled : cancelled = false
+  handler : Handler committed.context.entry.shape
+  selected : handler = committed.acceptance.handler
+
+inductive DispatchCommand (committed : Committed) where
+  | awaitPublication
+  | readCancelled
+  | enter (admission : Admission committed)
+
+@[expose] def DispatchCommand.Return (committed : Committed) : DispatchCommand committed → Type
+  | .awaitPublication => Option (Publication committed)
+  | .readCancelled => Bool
+  | .enter _ => Unit
+
+/-- The publication gate is itself executed before the managed handler code.
+An absent publication or an observed cancellation never enters that code. -/
+def dispatchProgram (committed : Committed) :
+    Execution.Program (DispatchCommand committed) (DispatchCommand.Return committed) Unit :=
+  .call .awaitPublication fun
+    | none => .done ()
+    | some publication => .call .readCancelled fun
+        | true => .done ()
+        | false => .call (.enter ⟨publication, false, rfl, committed.acceptance.handler, rfl⟩)
+            fun _ => .done ()
+
+/-- Handler code can be entered only after this exact authorized task was
+published and its cancellation flag was read as false. This is a prefix
+theorem: it does not assume that application code returns or terminates. -/
+theorem dispatch_enter_requires_authorization {committed : Committed}
+    {admission : Admission committed}
+    {before : List (Execution.Event (DispatchCommand committed) (DispatchCommand.Return committed))}
+    (invoked : Execution.Invokes (dispatchProgram committed) before (.enter admission)) :
+    before = [⟨.awaitPublication, some admission.publication⟩, ⟨.readCancelled, false⟩] ∧
+      admission.handler = committed.acceptance.handler ∧
+      admission.publication.closing = false ∧ admission.publication.ownsPublication = true ∧
+      committed.observation.Allows committed.context ∧
+      ∃ trace, Execution.Executes
+        (Registry.Authorization.program committed.context.registry committed.context.entry
+          committed.context.metadata) trace (.ok (.accept committed.acceptance.handler)) := by
+  cases invoked with
+  | step invoked =>
+      rename_i outcome
+      cases outcome with
+      | none => cases invoked
+      | some observed =>
+          cases invoked with
+          | step invoked =>
+              rename_i cancelled
+              cases cancelled with
+              | true => cases invoked
+              | false =>
+                  cases invoked with
+                  | here =>
+                      exact ⟨rfl, rfl, observed.allowed.1, observed.allowed.2,
+                        committed.allowed, committed.acceptance.accepted⟩
+                  | step invoked => cases invoked
+
+private def runGated (committed : Committed)
+    (registered : IO.Promise (Option (Publication committed))) (cancelled : IO.Ref Bool)
+    (action : Admission committed → Std.Async.Async Unit) : Std.Async.Async Unit :=
+  (dispatchProgram committed).interpretWith (fun command => do
+    match command with
+    | .awaitPublication =>
+        Std.Async.Async.ofAsyncTask <| registered.result?.map (sync := true) fun
+          | some published => .ok published
+          | none => .error (IO.userError "dispatch registration gate was dropped")
+    | .readCancelled => cancelled.get
+    | .enter admission => action admission) (fun value _ => value)
+
+/-- Body-side arguments contain no independently supplied handler or metadata. -/
+inductive InvocationInput where
+  | aggregate (body : ByteArray) (preflight : Headers.RequestPreflight)
+      (deadline : Option Nat) (runtime : Option DeadlineRuntime)
+  | stream (messages : MessageStream ByteArray) (preflight : Headers.RequestPreflight)
+      (deadline : Option Nat) (runtime : Option DeadlineRuntime)
+
+/-- The only managed dispatch command handed to the production runner. -/
+structure Invocation where
+  committed : Committed
+  admission : Admission committed
+  input : InvocationInput
+
+def Invocation.entry (invocation : Invocation) : MethodEntry :=
+  { invocation.committed.context.entry with
+    handler := invocation.admission.handler, requestHeaderHandlerResolver := .registered }
+
+def Invocation.metadata (invocation : Invocation) : _root_.Http2.Headers :=
+  invocation.committed.context.metadata
+
+/-- Execute the selected existing dispatch operation directly. The command
+cannot supply a replacement policy, metadata block, or application handler. -/
+def Invocation.run (invocation : Invocation) : Std.Async.Async (Except Status Transport.ManagedResponse) := do
+  let registry := invocation.committed.context.registry
+  match invocation.input with
+  | .aggregate body preflight deadline runtime =>
+      Transport.dispatchManagedRequestWithAsync registry {
+        streamId := invocation.committed.context.streamId,
+        metadata := invocation.metadata, body, deadline
+      } invocation.entry preflight runtime
+  | .stream messages preflight deadline runtime =>
+      match invocation.entry with
+      | { shape := .clientStreamingStream, handler, .. } =>
+          match ← registry.dispatchManagedClientStreamingMessageStreamAsync
+              invocation.metadata messages preflight handler deadline runtime with
+          | .error status => pure (.error status)
+          | .ok response => pure (.ok (.unary response))
+      | { shape := .bidirectionalStreamingStream, handler, .. } =>
+          match ← registry.dispatchManagedBidirectionalStreamingMessageStreamAsync
+              invocation.metadata messages preflight handler deadline runtime with
+          | .error status => pure (.error status)
+          | .ok (response, deadline) => pure (.ok (.streaming response deadline))
+      | _ => pure (.error (Status.internal "authorized handler does not consume a request stream"))
+
+/-- Every invocation accepted by the production dispatch runner carries its
+exact authorized handler and metadata, successful commit, and live admission. -/
+theorem Invocation.authorized (invocation : Invocation) :
+    invocation.entry = invocation.committed.acceptance.selectedEntry ∧
+    invocation.metadata = invocation.committed.context.metadata ∧
+    invocation.committed.observation.Allows invocation.committed.context ∧
+    invocation.admission.publication.closing = false ∧
+    invocation.admission.publication.ownsPublication = true ∧
+    invocation.admission.cancelled = false ∧
+    ∃ trace, Execution.Executes
+      (Registry.Authorization.program invocation.committed.context.registry
+        invocation.committed.context.entry invocation.metadata)
+      trace (.ok (.accept invocation.admission.handler)) := by
+  have selected := invocation.admission.selected
+  refine ⟨?_, rfl, invocation.committed.allowed,
+    invocation.admission.publication.allowed.1, invocation.admission.publication.allowed.2,
+    invocation.admission.notCancelled, ?_⟩
+  · simp [Invocation.entry, Registry.Authorization.Acceptance.selectedEntry, selected]
+  · simpa [Invocation.metadata, selected] using invocation.committed.acceptance.accepted
+
+end Authorization
+
 structure StreamState where
   streamId : Nat
   /-- Aggregate request body bytes retained for handlers that do not consume a
@@ -301,10 +510,12 @@ structure StreamState where
   requestMetadata : Option _root_.Http2.Headers := none
   /-- Validated header facts parsed once when END_HEADERS completed. -/
   requestPreflight : Option Headers.RequestPreflight := none
-  /-- The registry entry accepted by request-header authorization at
-  END_HEADERS.  `none` means the header block has not been authorized, so the
-  stream must not dispatch. -/
+  /-- Compatibility observation of the accepted entry. Managed dispatch uses
+  the private acceptance/commit receipt, not caller-supplied entries. -/
   authorizedEntry? : Option MethodEntry := none
+  /-- Managed allocation identity; caller-constructed states carry no managed-origin claim. -/
+  authorizationTicket : Option Nat := none
+  authorization : Option Authorization.Committed := none
   /-- Monotonic arrival time of the frame that completed the header block. -/
   endHeadersReceivedAt : Option Nat := none
   /-- Absolute request deadline captured when END_HEADERS was received. -/
@@ -344,6 +555,7 @@ cancellation flag and exact child handle here lets shutdown signal it without
 waiting for arbitrary user IO to release that mutex. -/
 structure ActiveAuthorization where
   streamId : Nat
+  private ticket : Nat := 0
   cancelled : IO.Ref Bool
   private deadlineChild : IO.Ref (Option DeadlineChild)
 
@@ -414,6 +626,8 @@ structure State where
   activeRequestStreams : Array ActiveRequestStream := #[]
   activeDispatches : Array ActiveDispatch := #[]
   activeAuthorizations : Array ActiveAuthorization := #[]
+  /-- Monotonic allocation counter within a managed connection. -/
+  nextAuthorizationTicket : Nat := 0
   /-- Requests detached from inbound buffering whose gated handler task has not
   yet been published in `activeDispatches`.  This is an ownership token, not
   merely a diagnostic: graceful drain must count it, and a concurrent stream
@@ -640,6 +854,7 @@ structure DetachedDispatch where
   request : Transport.ManagedRequest
   entry : MethodEntry
   preflight : Headers.RequestPreflight
+  private authorization : Option Authorization.Committed := none
   private deadlineScheduler : Option DeadlineScheduler := none
 
 /-- The dispatch family for a request whose body is fed to the handler
@@ -658,6 +873,7 @@ structure RequestStreamingDispatch where
   /-- Absolute request deadline captured at END_HEADERS. -/
   deadline : Option Nat := none
   private deadlineScheduler : Option DeadlineScheduler := none
+  private authorization : Option Authorization.Committed := none
 
 structure RequestStreamFeed where
   producer : MessageStream.Producer ByteArray
@@ -705,12 +921,11 @@ private def protocolDispatchForStream (state : State) (streamId : Nat) :
   let stream ← match findStream? state.streams streamId with
     | some stream => pure stream
     | none => throw (Status.internal s!"unknown HTTP/2 stream {streamId}")
-  let entry ← match stream.authorizedEntry? with
-    | some entry => pure entry
+  let authorization ← match stream.authorization with
+    | some authorization => pure authorization
     | none => throw (Status.internal "request dispatch attempted before header authorization")
-  let metadata ← match stream.requestMetadata with
-    | some metadata => pure metadata
-    | none => throw (Status.internal "authorized request metadata was not retained")
+  let entry := authorization.acceptance.selectedEntry
+  let metadata := authorization.context.metadata
   let preflight ← match stream.requestPreflight with
     | some preflight => pure preflight
     | none => throw (Status.internal "authorized request preflight was not retained")
@@ -730,6 +945,7 @@ private def protocolDispatchForStream (state : State) (streamId : Nat) :
         closeImmediately := stream.peerEnded,
         deadline := stream.deadline,
         deadlineScheduler := state.deadlineScheduler
+        authorization := some authorization
       })
   | none =>
       if stream.peerEnded then
@@ -750,6 +966,7 @@ private def protocolDispatchForStream (state : State) (streamId : Nat) :
           entry := entry,
           preflight := preflight,
           deadlineScheduler := state.deadlineScheduler
+          authorization := some authorization
         }, none)
       else
         pure (state, none, none)
@@ -1141,7 +1358,8 @@ private def joinDeadlineChildRef?
 
 private def runPendingAuthorization (registry : Registry)
     (authorization : PendingAuthorization) :
-    Std.Async.Async (Except Status MethodEntry) := do
+    Std.Async.Async (Except Status
+      (Registry.Authorization.Acceptance registry authorization.entry authorization.metadata)) := do
   if ← authorization.active.cancelled.get then
     pure (.error (Status.cancelled "request authorization cancelled"))
   else
@@ -1158,12 +1376,12 @@ private def runPendingAuthorization (registry : Registry)
               pure unregister
           }
           Registry.runWithDeadlineUntilAsync authorization.deadline
-            (registry.authorizeRequestHeaders authorization.entry authorization.metadata)
+            (registry.authorizeRequestHeadersCertified authorization.entry authorization.metadata)
             (some runtime)
       | none => do
           let task ← IO.asTask do
             try
-              registry.authorizeRequestHeaders authorization.entry authorization.metadata |>.run
+              registry.authorizeRequestHeadersCertified authorization.entry authorization.metadata |>.run
             catch error =>
               pure (.error (Status.ofIOError error))
           let join : Std.Async.Async Unit := do
@@ -1186,13 +1404,8 @@ private def runPendingAuthorization (registry : Registry)
           pure result
     match result with
     | .error status => pure (.error status)
-    | .ok (.reject status) => pure (.error status)
-    | .ok (.accept handler) =>
-        pure (.ok {
-          authorization.entry with
-          handler := handler
-          requestHeaderHandlerResolver := .registered
-        })
+    | .ok ⟨.reject status, _⟩ => pure (.error status)
+    | .ok ⟨.accept handler, accepted⟩ => pure (.ok ⟨handler, accepted⟩)
 
 /-- Commit an authorization result against current connection state.  The
 outbound HPACK encoder is intentionally read only now—not when the callback
@@ -1227,6 +1440,7 @@ private def prepareProtocolAuthorization (registry : Registry) (state : State)
       let deadlineChild ← IO.mkRef (none : Option DeadlineChild)
       let active : ActiveAuthorization := {
         streamId := streamId,
+        ticket := state.nextAuthorizationTicket,
         cancelled := cancelled,
         deadlineChild := deadlineChild
       }
@@ -1234,6 +1448,7 @@ private def prepareProtocolAuthorization (registry : Registry) (state : State)
         streamId := streamId,
         peerEnded := endStream,
         requestMetadata := some metadata,
+        authorizationTicket := some state.nextAuthorizationTicket,
         requestPreflight := some preflight,
         endHeadersReceivedAt := some receivedAt,
         deadline := deadline
@@ -1252,16 +1467,20 @@ private def prepareProtocolAuthorization (registry : Registry) (state : State)
         state with
         streams := replaceStream state.streams stream,
         activeAuthorizations := state.activeAuthorizations.push active
+        nextAuthorizationTicket := state.nextAuthorizationTicket + 1
       }, { pendingAuthorization := some authorization }))
 
 private def commitProtocolAuthorization (stateMutex : Std.Mutex State)
-    (authorization : PendingAuthorization) (decision : Except Status MethodEntry) :
+    (authorization : PendingAuthorization) {registry : Registry}
+    (decision : Except Status
+      (Registry.Authorization.Acceptance registry authorization.entry authorization.metadata)) :
     IO (Except Status SharedFrameResult) := do
   stateMutex.atomically do
     let state ← get
     let owned := state.activeAuthorizations.any fun active =>
-      active.streamId == authorization.streamId
-    if state.closing || !owned || (← authorization.active.cancelled.get) then
+      active.streamId == authorization.streamId && active.ticket == authorization.active.ticket
+    let cancelled ← authorization.active.cancelled.get
+    if state.closing || !owned || cancelled then
       pure (.ok {})
     else
       let state := {
@@ -1287,8 +1506,20 @@ private def commitProtocolAuthorization (stateMutex : Std.Mutex State)
                   | .ok (state, emitted) =>
                       set state
                       pure (.ok { emitted := emitted })
-          | .ok entry =>
-              let stream := { stream with authorizedEntry? := some entry }
+          | .ok acceptance =>
+              let context : Authorization.Context := {
+                streamId := authorization.streamId, ticket := authorization.active.ticket,
+                registry, entry := authorization.entry, metadata := authorization.metadata
+              }
+              let observation : Authorization.CommitObservation := {
+                closing := state.closing, owned, cancelled,
+                streamTicket := stream.authorizationTicket, metadata := stream.requestMetadata
+              }
+              let some committed := Authorization.commit? context acceptance observation
+                | set state; pure (.ok {})
+              let stream := { stream with
+                authorizedEntry? := some acceptance.selectedEntry,
+                authorization := some committed }
               let state := { state with streams := replaceStream state.streams stream }
               match protocolDispatchForStream state authorization.streamId with
               | .error status => pure (.error status)
@@ -1375,16 +1606,6 @@ private def feedRequestStream (feed : RequestStreamFeed) : IO (Except Status Uni
       else
         pure (.ok ())
 
-/-- Wait for the dispatch to be registered in connection state before running the
-handler. Resolved immediately after the spawn site's registration, so the wait is
-momentary; a promise (instead of a poll loop) avoids adding latency to every RPC. -/
-private def waitUntilDispatchRegistered
-    (registered : IO.Promise Unit) : Std.Async.Async Unit :=
-  Std.Async.Async.ofAsyncTask <|
-    registered.result?.map (sync := true) fun
-      | some () => .ok ()
-      | none => .error (IO.userError "dispatch registration gate was dropped")
-
 private def abortStreamShared (stateMutex : Std.Mutex State) (emit : Array _root_.Http2.Frame -> IO Unit)
     (streamId : Nat) (code : _root_.Http2.ErrorCode) : IO Unit := do
   let reset? ← stateMutex.atomically do
@@ -1421,10 +1642,17 @@ private def abortStreamSharedUnlessCancelled (cancelled : IO.Ref Bool)
 in `activeDispatches`.  Scheduler callbacks run outside that task, so only the
 task's own retirement (or connection teardown, which retains its handle) may
 remove this ownership record. -/
-private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex State)
+private def spawnDetachedDispatch (_registry : Registry) (stateMutex : Std.Mutex State)
     (emit : Array _root_.Http2.Frame -> IO Unit) (detached : DetachedDispatch) : Std.Async.Async Unit := do
+  let some authorization := detached.authorization | return
+  let registry := authorization.context.registry
+  let detached := { detached with
+    entry := authorization.acceptance.selectedEntry,
+    request := { detached.request with
+      streamId := authorization.context.streamId,
+      metadata := authorization.context.metadata } }
   let cancelled ← IO.mkRef false
-  let registered ← IO.Promise.new
+  let registered : IO.Promise (Option (Authorization.Publication authorization)) ← IO.Promise.new
   let deadlineChild? ←
     if detached.request.deadline.isSome then
       some <$> IO.mkRef (none : Option DeadlineChild)
@@ -1475,13 +1703,12 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
     let gzip := registry.enableResponseCompression && detached.preflight.clientAcceptsGzip
     emitStreamingResponseShared registry stateMutex emit detached.request.streamId
       { response with messages := stream } gzip deadline deadlineRuntime?
-  let task ← Std.Async.Async.toIO do
-    waitUntilDispatchRegistered registered
-    if ← cancelled.get then
-      pure ()
-    else try
-      let result ← Transport.dispatchManagedRequestWithAsync registry detached.request
-        detached.entry detached.preflight deadlineRuntime?
+  let task ← Std.Async.Async.toIO <| Authorization.runGated authorization registered cancelled fun admission => do
+    try
+      let result ← Authorization.Invocation.run {
+        committed := authorization, admission,
+        input := .aggregate detached.request.body detached.preflight
+          detached.request.deadline deadlineRuntime? }
       let result ← match result with
         | .error status => emitUnary { status := status, data := ByteArray.empty }
         | .ok (.unary response) => emitUnary response
@@ -1529,10 +1756,11 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
       pendingDispatchPublications := removeStreamId
         state.pendingDispatchPublications detached.request.streamId
     }
-    if state.closing || !ownsPublication then
+    match Authorization.publication? authorization state.closing ownsPublication with
+    | none =>
       set state
-      pure false
-    else
+      pure none
+    | some publication =>
       set {
         state with
         activeDispatches := state.activeDispatches.push {
@@ -1544,14 +1772,14 @@ private def spawnDetachedDispatch (registry : Registry) (stateMutex : Std.Mutex 
           deadlineChild := deadlineChild?
         }
       }
-      pure true
-  unless published do
+      pure (some publication)
+  unless published.isSome do
     -- Cancellation won the publication race.  The task is still behind its
     -- gate, so retire the exact handle before arbitrary handler IO can start.
     cancelled.set true
     IO.cancel task
-  registered.resolve ()
-  unless published do
+  registered.resolve published
+  unless published.isSome do
     try
       discard <| Std.Async.Async.ofAsyncTask task
     catch _ =>
@@ -1621,16 +1849,22 @@ private def protocolCreditingRequestStream (stateMutex : Std.Mutex State)
     cancel := inner.cancel
   }
 
-private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : Std.Mutex State)
+private def spawnRequestStreamingDispatch (_registry : Registry) (stateMutex : Std.Mutex State)
     (emit : Array _root_.Http2.Frame -> IO Unit) (dispatch : RequestStreamingDispatch) :
     Std.Async.Async (Except Status Unit) := do
+  let some authorization := dispatch.authorization | return .ok ()
+  let registry := authorization.context.registry
+  let some kind := requestStreamingKind? authorization.acceptance.selectedEntry
+    | return .error (Status.internal "authorized handler does not consume a request stream")
+  let dispatch := { dispatch with
+    streamId := authorization.context.streamId, metadata := authorization.context.metadata, kind }
   let producer ← match ← runGrpcPipe with
     | .ok producer => pure producer
     | .error status => return .error status
   let rawRequestStream := protocolCreditingRequestStream stateMutex emit dispatch.streamId producer.stream
   let acceptsGzip := dispatch.preflight.clientAcceptsGzip
   let cancelled ← IO.mkRef false
-  let registered ← IO.Promise.new
+  let registered : IO.Promise (Option (Authorization.Publication authorization)) ← IO.Promise.new
   let deadlineChild? ←
     if dispatch.deadline.isSome then
       some <$> IO.mkRef (none : Option DeadlineChild)
@@ -1705,11 +1939,8 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
     messages := { recv? := pure none },
     status := status
   }
-  let task ← Std.Async.Async.toIO do
-    waitUntilDispatchRegistered registered
-    if ← cancelled.get then
-      pure ()
-    else try
+  let task ← Std.Async.Async.toIO <| Authorization.runGated authorization registered cancelled fun admission => do
+    try
       match dispatch.requestError with
       | some status =>
           let encoded ← match dispatch.kind with
@@ -1725,40 +1956,24 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
               abortStreamSharedUnlessCancelled cancelled stateMutex emit
                 dispatch.streamId _root_.Http2.ErrorCode.internalError
       | none =>
-          match dispatch.kind with
-          | .clientStreaming handler =>
-              let result ← registry.dispatchManagedClientStreamingMessageStreamAsync
-                dispatch.metadata requestStream dispatch.preflight handler dispatch.deadline
-                deadlineRuntime?
-              let encoded ← match result with
-                | .ok response => encodeUnary response
-                | .error status => encodeUnary { status := status, data := ByteArray.empty }
-              match encoded with
-              | .ok () => finish true
-              | .error _status =>
-                  cancelResponseStreamRef responseStreamCancel
-                  finish false
-                  abortStreamSharedUnlessCancelled cancelled stateMutex emit
-                    dispatch.streamId _root_.Http2.ErrorCode.internalError
-          | .bidirectionalStreaming handler =>
-              let result ← registry.dispatchManagedBidirectionalStreamingMessageStreamAsync
-                dispatch.metadata requestStream dispatch.preflight handler dispatch.deadline
-                deadlineRuntime?
-              let encoded ← match result with
-                | .ok (response, deadline) => encodeStreaming response deadline
-                | .error status =>
-                    -- Preserve the expired handler child in `deadlineChild`
-                    -- until `finish` queues trailers and joins that exact
-                    -- generation.  The synthetic terminal stream itself has
-                    -- no work that needs another deadline race.
+          let result ← Authorization.Invocation.run {
+            committed := authorization, admission,
+            input := .stream requestStream dispatch.preflight dispatch.deadline deadlineRuntime? }
+          let encoded ← match result with
+            | .ok (.unary response) => encodeUnary response
+            | .ok (.streaming response deadline) => encodeStreaming response deadline
+            | .error status =>
+                match dispatch.kind with
+                | .clientStreaming _ => encodeUnary { status := status, data := ByteArray.empty }
+                | .bidirectionalStreaming _ =>
                     encodeStreaming (emptyStreamingResponse status) none
-              match encoded with
-              | .ok () => finish true
-              | .error _status =>
-                  cancelResponseStreamRef responseStreamCancel
-                  finish false
-                  abortStreamSharedUnlessCancelled cancelled stateMutex emit
-                    dispatch.streamId _root_.Http2.ErrorCode.internalError
+          match encoded with
+          | .ok () => finish true
+          | .error _status =>
+              cancelResponseStreamRef responseStreamCancel
+              finish false
+              abortStreamSharedUnlessCancelled cancelled stateMutex emit
+                dispatch.streamId _root_.Http2.ErrorCode.internalError
     catch _ =>
       cancelResponseStreamRef responseStreamCancel
       finish false
@@ -1773,10 +1988,11 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
       pendingDispatchPublications := removeStreamId
         state.pendingDispatchPublications dispatch.streamId
     }
-    if state.closing || !ownsPublication then
+    match Authorization.publication? authorization state.closing ownsPublication with
+    | none =>
       set state
-      pure false
-    else
+      pure none
+    | some publication =>
       let activeDispatch : ActiveDispatch := {
         streamId := dispatch.streamId,
         task := task,
@@ -1799,12 +2015,12 @@ private def spawnRequestStreamingDispatch (registry : Registry) (stateMutex : St
         activeDispatches := state.activeDispatches.push activeDispatch,
         activeRequestStreams := activeRequestStreams
       }
-      pure true
-  unless published do
+      pure (some publication)
+  unless published.isSome do
     cancelled.set true
     IO.cancel task
-  registered.resolve ()
-  unless published do
+  registered.resolve published
+  unless published.isSome do
     try
       discard <| Std.Async.Async.ofAsyncTask task
     catch _ =>
